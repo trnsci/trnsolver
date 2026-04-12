@@ -29,8 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - NKI Jacobi rotation kernel scaffold in `trnsolver/nki/dispatch.py` with
   auto/pytorch/nki backend selection. PyTorch fallback active until
   on-hardware validation lands.
-- SCF demo (`examples/scf_eigen.py`) for the Janesko/TCU quantum-chemistry
-  use case: build Fock → solve `FC = SCε` → density → convergence loop.
+- SCF demo (`examples/scf_eigen.py`) for the quantum-chemistry use case:
+  build Fock → solve `FC = SCε` → density → convergence loop.
 - pytest test suite covering eigen, factorization, and iterative solvers
   on CPU.
 - mkdocs-material site, GitHub Actions CI/docs/publish workflows, Terraform

@@ -4,7 +4,7 @@ Linear solvers and eigendecomposition for AWS Trainium via NKI.
 
 Eigenvalue problems, matrix factorizations, and iterative solvers for scientific computing on Trainium. The Jacobi eigensolver is the primary NKI acceleration target — each Givens rotation maps to a 2-row matmul on the Tensor Engine.
 
-Part of the **trn-\*** scientific computing suite by [Playground Logic](https://playgroundlogic.co).
+Part of the trnsci scientific computing suite ([github.com/trnsci](https://github.com/trnsci)).
 
 ## Install
 
@@ -74,7 +74,7 @@ Demonstrates the self-consistent field iteration: build Fock matrix → solve ge
 - [x] Cholesky, LU, QR factorizations
 - [x] Direct and SPD solvers
 - [x] CG and GMRES iterative solvers
-- [x] SCF example (Janesko/TCU use case)
+- [x] SCF example (quantum chemistry use case)
 - [ ] NKI Jacobi rotation kernel validation
 - [ ] Newton-Schulz A^{-1/2} via trnblas GEMM
 - [ ] Benchmarks vs LAPACK/cuSOLVER
@@ -83,10 +83,10 @@ Demonstrates the self-consistent field iteration: build Fock matrix → solve ge
 
 | Project | What |
 |---------|------|
-| [trnfft](https://github.com/scttfrdmn/trnfft) | FFT + complex ops (Williamson/OSU) |
-| [trnblas](https://github.com/scttfrdmn/trnblas) | BLAS operations (Janesko/TCU) |
+| [trnfft](https://github.com/trnsci/trnfft) | FFT + complex ops |
+| [trnblas](https://github.com/trnsci/trnblas) | BLAS operations |
 | trnsolver | This repo |
 
 ## License
 
-Apache 2.0 — Playground Logic LLC
+Apache 2.0 — Copyright 2026 Scott Friedman

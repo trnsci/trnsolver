@@ -16,7 +16,7 @@ Each high-level operation in `eigen` / `factor` / `iterative` checks the active 
 
 ## SCF → solver mapping
 
-The headline use case is the SCF iteration for quantum chemistry (Janesko/TCU). At each SCF step:
+The headline use case is the SCF iteration for quantum chemistry. At each SCF step:
 
 | SCF step | Math | trnsolver call |
 |----------|------|----------------|

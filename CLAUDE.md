@@ -1,18 +1,17 @@
 # trnsolver
 
 Linear solvers and eigendecomposition for AWS Trainium via NKI.
-Part of the trn-* scientific computing suite by Playground Logic.
+Part of the trnsci scientific computing suite.
 
 ## What This Is
 
 Eigenvalue problems, matrix factorizations, and iterative solvers targeting
 Trainium's Tensor Engine. Complements trnblas (BLAS) and trnfft (FFT).
 
-**Primary use case:** SCF eigenvalue problem for quantum chemistry with
-Prof. Ben Janesko at TCU. The SCF iteration solves FC = SCε at each step —
-a generalized symmetric eigenvalue problem reduced to standard form via
-Cholesky of the overlap matrix S. This feeds into DF-MP2 (trnblas) for
-the correlation energy.
+**Primary use case:** SCF eigenvalue problem for quantum chemistry. The SCF
+iteration solves FC = SCε at each step — a generalized symmetric eigenvalue
+problem reduced to standard form via Cholesky of the overlap matrix S. This
+feeds into DF-MP2 (trnblas) for the correlation energy.
 
 ## Architecture
 
@@ -32,7 +31,7 @@ trnsolver/
 │   ├── test_factor.py       # Cholesky, LU, QR, solve tests
 │   └── test_iterative.py    # CG, GMRES convergence tests
 ├── examples/
-│   └── scf_eigen.py         # SCF iteration demo (Janesko use case)
+│   └── scf_eigen.py         # SCF iteration demo (quantum chemistry)
 ├── pyproject.toml
 ├── README.md
 ├── LICENSE                  # Apache 2.0
@@ -98,9 +97,9 @@ python examples/scf_eigen.py --demo
 ## Naming Convention
 
 Sibling repos in the trn-* suite:
-- `trnfft` — FFT + complex ops (https://github.com/scttfrdmn/trnfft)
-- `trnblas` — BLAS operations (https://github.com/scttfrdmn/trnblas)
+- `trnfft` — FFT + complex ops (https://github.com/trnsci/trnfft)
+- `trnblas` — BLAS operations (https://github.com/trnsci/trnblas)
 - `trnsolver` — Linear solvers, eigendecomposition (this repo)
 - `trnrand` — Random number generation (planned)
 
-All repos: Python/NKI, Apache 2.0, Playground Logic.
+All repos: Python/NKI, Apache 2.0.
