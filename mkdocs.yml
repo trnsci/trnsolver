@@ -1,0 +1,34 @@
+site_name: trnsolver
+site_description: Linear solvers and eigendecomposition for AWS Trainium via NKI
+site_url: https://scttfrdmn.github.io/trnsolver/
+repo_url: https://github.com/scttfrdmn/trnsolver
+repo_name: scttfrdmn/trnsolver
+
+theme:
+  name: material
+  palette:
+    scheme: default
+    primary: indigo
+  features:
+    - content.code.copy
+    - navigation.sections
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Quickstart: quickstart.md
+  - API Reference:
+      - Eigensolvers: api/eigen.md
+      - Factorizations: api/factor.md
+      - Iterative Solvers: api/iterative.md
+      - NKI Backend: api/nki.md
+  - Architecture: architecture.md
+  - Deployment:
+      - AWS Setup for Neuron CI: aws_setup.md
+
+markdown_extensions:
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - admonition
+  - toc:
+      permalink: true

@@ -1,0 +1,62 @@
+"""Test iterative solvers."""
+
+import pytest
+import torch
+import numpy as np
+import trnsolver
+
+
+class TestCG:
+
+    def test_identity(self):
+        A = torch.eye(4)
+        b = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        x, iters, res = trnsolver.cg(A, b)
+        np.testing.assert_allclose(x.numpy(), b.numpy(), atol=1e-5)
+        assert iters <= 4
+
+    def test_spd(self, spd_matrix):
+        n = 32
+        A = spd_matrix(n)
+        b = torch.randn(n)
+        x, iters, res = trnsolver.cg(A, b, tol=1e-6)
+        residual = A @ x - b
+        np.testing.assert_allclose(residual.numpy(), np.zeros(n), atol=1e-4)
+        assert res < 1e-5
+
+    def test_callable_matvec(self, spd_matrix):
+        n = 16
+        A = spd_matrix(n)
+        b = torch.randn(n)
+        matvec = lambda x: torch.mv(A, x)
+        x, iters, res = trnsolver.cg(matvec, b)
+        residual = A @ x - b
+        np.testing.assert_allclose(residual.numpy(), np.zeros(n), atol=1e-4)
+
+    def test_with_initial_guess(self, spd_matrix):
+        n = 16
+        A = spd_matrix(n)
+        x_true = torch.randn(n)
+        b = A @ x_true
+        # Start close to solution
+        x0 = x_true + 0.01 * torch.randn(n)
+        x, iters, res = trnsolver.cg(A, b, x0=x0)
+        np.testing.assert_allclose(x.numpy(), x_true.numpy(), atol=1e-3)
+
+
+class TestGMRES:
+
+    def test_identity(self):
+        A = torch.eye(4)
+        b = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        x, iters, res = trnsolver.gmres(A, b)
+        np.testing.assert_allclose(x.numpy(), b.numpy(), atol=1e-5)
+
+    def test_nonsymmetric(self, random_matrix):
+        n = 16
+        # Make well-conditioned nonsymmetric matrix
+        A = random_matrix(n, n) + n * torch.eye(n)
+        b = torch.randn(n)
+        x, iters, res = trnsolver.gmres(A, b, tol=1e-5)
+        residual = A @ x - b
+        assert torch.linalg.norm(residual).item() / torch.linalg.norm(b).item() < 1e-4
