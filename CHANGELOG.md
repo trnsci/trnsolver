@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `jacobi_preconditioner(A)` in `trnsolver.iterative` — diagonal preconditioner
+  callable for `cg`. Partial progress on #16.
+- Benchmark suite `benchmarks/bench_solver.py` covering eigh, factorizations,
+  solve, CG (with/without Jacobi preconditioner), and GMRES. Closes #8.
+- Status badges in README (CI, PyPI, Python versions, license, docs). Closes #4.
+
+### Changed
+
+- `cg(A, b, M=...)` tensor preconditioner is now applied as `M @ r` (already-
+  inverted operator), not `inv(M) @ r` recomputed every iteration.
+
 ## [0.1.1] — 2026-04-12
 
 ### Changed

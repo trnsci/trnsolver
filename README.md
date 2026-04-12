@@ -1,5 +1,11 @@
 # trnsolver
 
+[![CI](https://github.com/trnsci/trnsolver/actions/workflows/ci.yml/badge.svg)](https://github.com/trnsci/trnsolver/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/trnsolver)](https://pypi.org/project/trnsolver/)
+[![Python](https://img.shields.io/pypi/pyversions/trnsolver)](https://pypi.org/project/trnsolver/)
+[![License](https://img.shields.io/github/license/trnsci/trnsolver)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-mkdocs-blue)](https://trnsci.github.io/trnsolver/)
+
 Linear solvers and eigendecomposition for AWS Trainium via NKI.
 
 Eigenvalue problems, matrix factorizations, and iterative solvers for scientific computing on Trainium. The Jacobi eigensolver is the primary NKI acceleration target — each Givens rotation maps to a 2-row matmul on the Tensor Engine.
