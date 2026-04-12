@@ -14,6 +14,19 @@ import torch
 from typing import Optional, Callable, Tuple
 
 
+def jacobi_preconditioner(A: torch.Tensor) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Build a Jacobi (diagonal) preconditioner M(r) = r / diag(A).
+
+    Cheap and effective when A is diagonally dominant. Approximates A^{-1}
+    by inverting only the diagonal.
+    """
+    d = torch.diagonal(A).clone()
+    if torch.any(d.abs() < 1e-15):
+        raise ValueError("Jacobi preconditioner: diagonal has near-zero entries")
+    inv_d = 1.0 / d
+    return lambda r: r * inv_d
+
+
 def cg(
     A: torch.Tensor | Callable,
     b: torch.Tensor,
@@ -30,7 +43,9 @@ def cg(
         x0: Initial guess (default: zeros)
         tol: Convergence tolerance on relative residual
         maxiter: Maximum iterations
-        M: Preconditioner matrix or callable M(r) → M^{-1}@r
+        M: Preconditioner as callable M(r) → approx A^{-1} @ r, or tensor
+            (interpreted as the already-inverted preconditioner applied as M@r).
+            Use `jacobi_preconditioner(A)` for the common diagonal case.
 
     Returns:
         x: Solution vector
@@ -39,7 +54,12 @@ def cg(
     """
     n = b.shape[0]
     matvec = A if callable(A) else lambda x: torch.mv(A, x)
-    precond = M if callable(M) else (lambda r: torch.mv(torch.linalg.inv(M), r)) if M is not None else None
+    if M is None:
+        precond = None
+    elif callable(M):
+        precond = M
+    else:
+        precond = lambda r: torch.mv(M, r)
 
     x = x0.clone() if x0 is not None else torch.zeros(n, dtype=b.dtype, device=b.device)
     r = b - matvec(x)
