@@ -1,8 +1,8 @@
 site_name: trnsolver
 site_description: Linear solvers and eigendecomposition for AWS Trainium via NKI
-site_url: https://scttfrdmn.github.io/trnsolver/
-repo_url: https://github.com/scttfrdmn/trnsolver
-repo_name: scttfrdmn/trnsolver
+site_url: https://trnsci.github.io/trnsolver/
+repo_url: https://github.com/trnsci/trnsolver
+repo_name: trnsci/trnsolver
 
 theme:
   name: material

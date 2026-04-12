@@ -20,7 +20,7 @@ The `trnsolver[neuron]` extra is only useful when building a custom Neuron envir
 ## Development install
 
 ```bash
-git clone https://github.com/scttfrdmn/trnsolver.git
+git clone https://github.com/trnsci/trnsolver.git
 cd trnsolver
 pip install -e ".[dev]"
 pytest tests/ -v

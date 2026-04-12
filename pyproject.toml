@@ -36,9 +36,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/scttfrdmn/trnsolver"
-Repository = "https://github.com/scttfrdmn/trnsolver"
-Issues = "https://github.com/scttfrdmn/trnsolver/issues"
+Homepage = "https://github.com/trnsci/trnsolver"
+Repository = "https://github.com/trnsci/trnsolver"
+Issues = "https://github.com/trnsci/trnsolver/issues"
 
 [tool.setuptools.packages.find]
 include = ["trnsolver*"]
