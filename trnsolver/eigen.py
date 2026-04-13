@@ -4,9 +4,10 @@ Eigenvalue decomposition for Trainium.
 Symmetric eigenvalue problem: A @ V = V @ diag(eigenvalues)
 
 Methods:
-- NKI path: classical Jacobi sweeps with the `jacobi_rotation_kernel`.
-  Targets correctness on trn1/trn2 for n ≤ 512. Per-rotation dispatch;
-  batched within-sweep parallelism is a later perf phase (#10).
+- NKI path: Brent-Luk parallel Jacobi. Host precomputes the n-1 round
+  permutations and applies each round in a fixed strided-pair layout so the
+  NKI kernel (trnsolver/nki/dispatch.py::jacobi_round_kernel) compiles once
+  and is reused across all rounds and all sweeps.
 - PyTorch path: torch.linalg.eigh (LAPACK / MAGMA depending on device).
 
 Primary use case: SCF eigenvalue problem FC = SCε in quantum chemistry.
@@ -20,6 +21,7 @@ import torch
 from typing import Optional, Tuple
 
 from .nki import _use_nki, _REQUIRE_NKI, HAS_NKI
+from ._brent_luk import brent_luk_permutations
 
 
 def eigh(
@@ -44,8 +46,6 @@ def eigh(
         except Exception:
             if _REQUIRE_NKI:
                 raise
-            # Silent fallback — keeps the public API robust on non-Neuron hosts
-            # where HAS_NKI is True but the runtime fails for other reasons.
             return _torch_eigh(A)
     return _torch_eigh(A)
 
@@ -69,7 +69,6 @@ def eigh_generalized(
     L = torch.linalg.cholesky(B)
     L_inv_A = torch.linalg.solve_triangular(L, A, upper=False)
     A_prime = torch.linalg.solve_triangular(L, L_inv_A.T, upper=False).T
-    # Symmetrize for numerical stability
     A_prime = 0.5 * (A_prime + A_prime.T)
 
     eigenvalues, V_prime = eigh(A_prime, max_sweeps, tol)
@@ -82,83 +81,156 @@ def _torch_eigh(A: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return torch.linalg.eigh(A)
 
 
+def _rotation_angles_strided(D: torch.Tensor) -> torch.Tensor:
+    """Compute (c, s) for each strided pair (2i, 2i+1) of the current D.
+
+    Classical Jacobi rotation angle:
+        if |D[p,p] - D[q,q]| ≈ 0:   θ = π/4
+        else:
+            τ = (D[q,q] - D[p,p]) / (2 D[p,q])
+            t = sign(τ) / (|τ| + √(1 + τ²))
+            c = 1 / √(1 + t²)
+            s = t c
+
+    Works element-wise over half pairs. Returns a (half, 2) tensor on the
+    same device as D.
+    """
+    n = D.shape[0]
+    half = n // 2
+
+    idx_p = torch.arange(0, n, 2, device=D.device)        # 0, 2, 4, ...
+    idx_q = idx_p + 1                                      # 1, 3, 5, ...
+
+    d_pp = D[idx_p, idx_p]                                 # (half,)
+    d_qq = D[idx_q, idx_q]
+    d_pq = D[idx_p, idx_q]
+
+    # Guard zeros: if d_pq ≈ 0 the rotation is unnecessary; pick c=1, s=0.
+    abs_pq = d_pq.abs()
+    safe = abs_pq > 1e-30
+
+    diff = d_qq - d_pp
+    # τ = (d_qq - d_pp) / (2 d_pq); handle d_pq ≈ 0 with a safe divisor
+    tau_denom = torch.where(safe, 2.0 * d_pq, torch.ones_like(d_pq))
+    tau = diff / tau_denom
+    t = torch.where(
+        tau >= 0,
+        1.0 / (tau + torch.sqrt(1.0 + tau * tau)),
+        -1.0 / (-tau + torch.sqrt(1.0 + tau * tau)),
+    )
+    c = 1.0 / torch.sqrt(1.0 + t * t)
+    s = t * c
+
+    # Special case: when d_pp ≈ d_qq exactly, the formula above is fine
+    # (tau is large but stable). When d_pq ≈ 0, set c=1, s=0.
+    c = torch.where(safe, c, torch.ones_like(c))
+    s = torch.where(safe, s, torch.zeros_like(s))
+
+    return torch.stack([c, s], dim=1).to(D.dtype)          # (half, 2)
+
+
+def _diag_block_fixup_strided(D: torch.Tensor, cs: torch.Tensor, d_pp_old: torch.Tensor, d_qq_old: torch.Tensor, d_pq_old: torch.Tensor) -> torch.Tensor:
+    """Overwrite the 2×2 diagonal blocks of D at strided pairs (2i, 2i+1).
+
+    The NKI kernel rotates rows and columns independently, which produces
+    incorrect values at the intersection (2i:2i+2, 2i:2i+2) blocks. Replace
+    them with the analytically correct post-rotation values:
+
+        D[p,p] = c² d_pp - 2cs d_pq + s² d_qq
+        D[q,q] = s² d_pp + 2cs d_pq + c² d_qq
+        D[p,q] = D[q,p] = 0
+    """
+    n = D.shape[0]
+    c = cs[:, 0]
+    s = cs[:, 1]
+
+    new_pp = c * c * d_pp_old - 2.0 * c * s * d_pq_old + s * s * d_qq_old
+    new_qq = s * s * d_pp_old + 2.0 * c * s * d_pq_old + c * c * d_qq_old
+
+    idx_p = torch.arange(0, n, 2, device=D.device)
+    idx_q = idx_p + 1
+
+    D = D.clone()
+    D[idx_p, idx_p] = new_pp
+    D[idx_q, idx_q] = new_qq
+    D[idx_p, idx_q] = 0.0
+    D[idx_q, idx_p] = 0.0
+    return D
+
+
 def _jacobi_eigh_nki(
     A: torch.Tensor,
     max_sweeps: int,
     tol: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Classical Jacobi sweeps via the NKI rotation kernel.
+    """Brent-Luk parallel Jacobi via the NKI batched-round kernel.
 
-    Computes rotation cosines/sines on the host; dispatches each rotation to
-    the `jacobi_rotation_kernel`. The kernel returns new D and V tensors
-    (NKI kernels don't mutate inputs). After each rotation we fix up the two
-    diagonal entries D[p,p], D[q,q] and the zeroed pivot D[p,q] = D[q,p] = 0
-    on the host, since the kernel rotates rows and columns independently and
-    the diagonal is the intersection.
-
-    Correctness-only at this stage: per-rotation dispatch overhead dominates,
-    batched parallelism is the Phase 3 perf deliverable.
+    Requires even n. Pads A with a zero-off-diagonal identity block if odd
+    (not yet implemented; Phase 1 requires even n).
     """
     if not HAS_NKI:
         raise RuntimeError("NKI backend requested but neuronxcc is not available")
-    # Import inside the function so module import doesn't fail on non-NKI hosts.
-    from .nki.dispatch import jacobi_rotation_kernel
+    from .nki.dispatch import jacobi_round_kernel
     import torch_neuronx  # noqa: F401 — registers the Neuron PJRT plugin
     import torch_xla
 
     n = A.shape[0]
     assert A.shape == (n, n), f"Expected square matrix, got {A.shape}"
+    if n % 2 != 0:
+        raise NotImplementedError(
+            f"Phase 1 NKI Jacobi requires even n; got n={n}. Pad to even or use backend='pytorch'."
+        )
 
-    # NKI kernels run on the XLA (Neuron) device. Move D and V there for the
-    # whole sweep; move results back at the end.
     orig_device = A.device
     xla_device = torch_xla.device()
+
     D = A.clone().to(xla_device)
     V = torch.eye(n, dtype=A.dtype, device=xla_device)
 
-    skip_thresh = tol * 0.01
+    # Precompute Brent-Luk permutation schedule (int64 → int64 indexing).
+    perms_host = brent_luk_permutations(n)                # (n-1, n) int64
+    perms = perms_host.to(xla_device)
+
+    # Cumulative permutation tracks where each original index ends up.
+    cum_perm = torch.arange(n, dtype=torch.int64, device=xla_device)
 
     for sweep in range(max_sweeps):
-        # Convergence: sum of squared off-diagonal elements
-        off_sq = (D * D).sum().item() - (torch.diagonal(D) ** 2).sum().item()
-        if off_sq < tol:
+        # Convergence: sum of squared off-diagonals.
+        diag_sq = (torch.diagonal(D) ** 2).sum()
+        off_sq = (D * D).sum() - diag_sq
+        if off_sq.item() < tol:
             break
 
-        for p in range(n):
-            for q in range(p + 1, n):
-                d_pq = D[p, q].item()
-                if abs(d_pq) < skip_thresh:
-                    continue
+        for r in range(n - 1):
+            perm = perms[r]
 
-                d_pp = D[p, p].item()
-                d_qq = D[q, q].item()
+            # Permute D (both rows and cols) and V (cols) into strided pair layout.
+            D = D[perm][:, perm]
+            V = V[:, perm]
+            cum_perm = cum_perm[perm]
 
-                # Rotation that zeroes D[p, q]
-                if abs(d_pp - d_qq) < 1e-15:
-                    theta = math.pi / 4.0
-                    c = math.cos(theta)
-                    s = math.sin(theta) if d_pq >= 0 else -math.sin(theta)
-                else:
-                    tau = (d_qq - d_pp) / (2.0 * d_pq)
-                    if tau >= 0:
-                        t = 1.0 / (tau + math.sqrt(1.0 + tau * tau))
-                    else:
-                        t = -1.0 / (-tau + math.sqrt(1.0 + tau * tau))
-                    c = 1.0 / math.sqrt(1.0 + t * t)
-                    s = t * c
+            # Save original block values for diagonal fixup after the kernel.
+            idx_p = torch.arange(0, n, 2, device=xla_device)
+            idx_q = idx_p + 1
+            d_pp_old = D[idx_p, idx_p].clone()
+            d_qq_old = D[idx_q, idx_q].clone()
+            d_pq_old = D[idx_p, idx_q].clone()
 
-                # Kernel: rotate rows p,q and cols p,q of D; cols p,q of V
-                D, V = jacobi_rotation_kernel(D, V, p, q, c, s)
+            # Rotation angles from the current D (on host compute is easier
+            # for stability; shape is stable).
+            cs = _rotation_angles_strided(D)              # (n/2, 2)
 
-                # Host-side diagonal + pivot fixup (the kernel rotates rows
-                # and columns independently, which double-counts the 2x2 block
-                # at (p,q). We replace that block with the correct values.)
-                new_pp = c * c * d_pp - 2.0 * c * s * d_pq + s * s * d_qq
-                new_qq = s * s * d_pp + 2.0 * c * s * d_pq + c * c * d_qq
-                D[p, p] = new_pp
-                D[q, q] = new_qq
-                D[p, q] = 0.0
-                D[q, p] = 0.0
+            # Kernel: single compile per (n, dtype), cached afterwards.
+            D, V = jacobi_round_kernel(D, V, cs)
+
+            # Diagonal block fixup (2x2 blocks that the row/col rotations
+            # double-touched with inconsistent values).
+            D = _diag_block_fixup_strided(D, cs, d_pp_old, d_qq_old, d_pq_old)
+
+    # Un-permute to original index order.
+    inv_perm = torch.argsort(cum_perm)
+    D = D[inv_perm][:, inv_perm]
+    V = V[:, inv_perm]
 
     eigenvalues = torch.diagonal(D).clone()
     idx = torch.argsort(eigenvalues)

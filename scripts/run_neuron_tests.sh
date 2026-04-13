@@ -50,11 +50,21 @@ fi
 
 echo "Instance: $INSTANCE_ID"
 
+# Auto-stop on script exit is optional. When the script is invoked under a
+# timeout-bound runner (background task, CI wrapper, etc.), the trap firing
+# mid-compile would kill an in-flight NKI run. Set AUTO_STOP=1 to opt in;
+# otherwise the operator is responsible for running scripts/stop_neuron_ci.sh.
+AUTO_STOP="${AUTO_STOP:-0}"
+
 cleanup() {
   local exit_code=$?
   echo ""
-  echo "Stopping $INSTANCE_ID..."
-  aws ec2 stop-instances --instance-ids "$INSTANCE_ID" --region "$REGION" >/dev/null
+  if [[ "$AUTO_STOP" == "1" ]]; then
+    echo "Stopping $INSTANCE_ID (AUTO_STOP=1)..."
+    aws ec2 stop-instances --instance-ids "$INSTANCE_ID" --region "$REGION" >/dev/null
+  else
+    echo "Leaving $INSTANCE_ID running. Stop with: AWS_PROFILE=$AWS_PROFILE ./scripts/stop_neuron_ci.sh $INSTANCE_TYPE"
+  fi
   exit "$exit_code"
 }
 trap cleanup EXIT
