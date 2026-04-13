@@ -55,8 +55,13 @@ jobs:
         with:
           enable-cache: true
       - name: Install neuronx-cc from Neuron pip repo
+        # --index-strategy unsafe-best-match: uv normally locks a package to
+        # the first index it's found on (dependency-confusion protection), but
+        # neuronx-cc has transitive deps (e.g. islpy) that exist on both the
+        # Neuron repo (older pins) and PyPI (newer). Match pip's behavior of
+        # considering all indexes for the best version.
         run: |
-          uv pip install --system "neuronx-cc" --extra-index-url https://pip.repos.neuron.amazonaws.com
+          uv pip install --system --index-strategy unsafe-best-match "neuronx-cc" --extra-index-url https://pip.repos.neuron.amazonaws.com
           python -c "from neuronxcc.nki import simulate_kernel" || { echo "nki.simulate_kernel not available in this neuronxcc version; simulator CI job requires an SDK that includes NKI 0.3.0 features. See https://pip.repos.neuron.amazonaws.com for the current public version floor."; exit 1; }
       - run: uv pip install --system -e ".[dev]"
       - run: pytest tests/ -v -m simulator --cov=trnsolver --cov-report=xml --cov-append
