@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+import scipy.linalg
 
 import trnsolver
 
@@ -57,6 +58,10 @@ class TestEigh:
     def test_eigh_torch(self, benchmark, symmetric_matrix):
         benchmark(torch.linalg.eigh, symmetric_matrix)
 
+    def test_eigh_scipy(self, benchmark, symmetric_matrix):
+        A_np = symmetric_matrix.numpy()
+        benchmark(scipy.linalg.eigh, A_np)
+
 
 class TestEighGeneralized:
     def test_eigh_gen_trnsolver_pytorch(self, benchmark, spd_matrix, symmetric_matrix):
@@ -79,6 +84,10 @@ class TestCholesky:
     def test_cholesky_torch(self, benchmark, spd_matrix):
         benchmark(torch.linalg.cholesky, spd_matrix)
 
+    def test_cholesky_scipy(self, benchmark, spd_matrix):
+        A_np = spd_matrix.numpy()
+        benchmark(scipy.linalg.cholesky, A_np, lower=True)
+
 
 class TestLU:
     def test_lu_trnsolver(self, benchmark, random_matrix):
@@ -96,6 +105,12 @@ class TestSolveSpd:
 
     def test_solve_torch(self, benchmark, spd_matrix, random_vector):
         benchmark(torch.linalg.solve, spd_matrix, random_vector)
+
+    def test_solve_spd_scipy(self, benchmark, spd_matrix, random_vector):
+        A_np = spd_matrix.numpy()
+        b_np = random_vector.numpy()
+        L_np = scipy.linalg.cholesky(A_np, lower=True)
+        benchmark(scipy.linalg.cho_solve, (L_np, True), b_np)
 
 
 class TestInvSqrtSpd:

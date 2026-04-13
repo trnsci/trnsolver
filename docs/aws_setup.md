@@ -50,6 +50,35 @@ The script will:
 
 It exits non-zero if any test fails.
 
+## GPU baseline instance (cuSOLVER comparison)
+
+For vintage-matched cuSOLVER baselines (see [Benchmarks](benchmarks.md)), provision the GPU CI instance with:
+
+```bash
+cd infra/terraform
+AWS_PROFILE=aws terraform apply -var=enable_gpu_ci=true \
+  -var="vpc_id=vpc-xxxxxx" -var="subnet_id=subnet-xxxxxx"
+```
+
+Defaults to `g5.xlarge` (A10G Ampere, the trn1 vintage peer). Run the benchmarks with:
+
+```bash
+AWS_PROFILE=aws ./scripts/run_cuda_tests.sh g5
+```
+
+Same SSM-based pattern as the Neuron runner: starts the instance, runs `pytest benchmarks/bench_cuda.py -m cuda --benchmark-only`, prints output, stops the instance via trap. Costs ~$0.17 per 10-minute run on `g5.xlarge`.
+
+To opt into an H100 comparison for trn2:
+
+```bash
+AWS_PROFILE=aws terraform apply -var=enable_gpu_ci=true \
+  -var=gpu_instance_type=p5.48xlarge -var=gpu_instance_tag=trnsolver-ci-p5 \
+  -var="vpc_id=..." -var="subnet_id=..."
+AWS_PROFILE=aws ./scripts/run_cuda_tests.sh p5
+```
+
+That's $98/hr — use sparingly.
+
 ## Cost
 
 Stopped = EBS only (~$10/mo for 100 GB gp3). Running:
@@ -59,6 +88,8 @@ Stopped = EBS only (~$10/mo for 100 GB gp3). Running:
 | trn1.2xlarge | $1.34 | $0.22 |
 | trn2.8xlarge | $10.00 | $1.67 |
 | inf2.xlarge | $0.76 | $0.13 |
+| g5.xlarge (A10G, CUDA) | $1.01 | $0.17 |
+| p5.48xlarge (H100×8, CUDA) | $98.00 | $16.33 |
 
 ## Troubleshooting
 

@@ -12,6 +12,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `inv_sqrt_spd_ns(A)` — Newton-Schulz iteration for `A^{-1/2}`. All-GEMM,
   returns `(X, iters, residual)`. Progress on #14 (NKI-GEMM backend swap
   lands when trnblas GEMM validates on hardware).
+- scipy.linalg baselines (eigh, cholesky, cho_solve) in
+  `benchmarks/bench_solver.py` for LAPACK comparison. Progress on #13.
+- `benchmarks/bench_cuda.py` — CUDA / cuSOLVER benchmarks, auto-skipped
+  when no GPU is available. Matches the op surface of bench_solver.py.
+- `infra/terraform/gpu.tf` — opt-in GPU CI instance (default `g5.xlarge`
+  A10G, vintage peer of trn1). Disabled by default via
+  `enable_gpu_ci = false`.
+- `scripts/run_cuda_tests.sh` — SSM-based runner that mirrors
+  `run_neuron_tests.sh` for the GPU box.
+- `docs/benchmarks.md` rewritten with vintage-matching methodology and
+  real CPU numbers; `docs/aws_setup.md` documents the GPU instance and
+  H100 opt-in.
 
 ## [0.2.0] — 2026-04-12
 

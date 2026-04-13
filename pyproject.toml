@@ -48,5 +48,6 @@ include = ["trnsolver*"]
 [tool.pytest.ini_options]
 markers = [
     "neuron: requires Neuron hardware (trn1/trn2 instance)",
+    "cuda: requires an Nvidia GPU (cuSOLVER baselines)",
 ]
 testpaths = ["tests"]
