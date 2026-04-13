@@ -30,6 +30,24 @@ pip install -e ".[dev]"
 pytest tests/ -v -m "not neuron"
 ```
 
+## Lint and format
+
+Ruff enforces style and sorts imports. Run locally:
+
+```bash
+ruff check .          # lint
+ruff format .         # format
+```
+
+Pre-commit hooks run both automatically on `git commit`:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+CI enforces the same checks (`.github/workflows/ci.yml::lint`), so skipping hooks locally just moves the failure to CI.
+
 ## Tests
 
 - `pytest tests/ -v -m "not neuron"` — the CPU-only suite. Must pass on every PR.
