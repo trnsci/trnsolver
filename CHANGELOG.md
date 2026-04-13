@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-04-12
+
 ### Added
 
 - `inv_sqrt_spd_ns(A)` — Newton-Schulz iteration for `A^{-1/2}`. All-GEMM,
@@ -15,15 +17,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - scipy.linalg baselines (eigh, cholesky, cho_solve) in
   `benchmarks/bench_solver.py` for LAPACK comparison. Progress on #13.
 - `benchmarks/bench_cuda.py` — CUDA / cuSOLVER benchmarks, auto-skipped
-  when no GPU is available. Matches the op surface of bench_solver.py.
+  when no GPU is available. Vintage-matched methodology (trn1 ↔ A10G,
+  trn2 ↔ H100). Progress on #13.
 - `infra/terraform/gpu.tf` — opt-in GPU CI instance (default `g5.xlarge`
-  A10G, vintage peer of trn1). Disabled by default via
-  `enable_gpu_ci = false`.
-- `scripts/run_cuda_tests.sh` — SSM-based runner that mirrors
+  A10G, vintage peer of trn1; `p5.4xlarge` for trn2 via override).
+  Disabled by default via `enable_gpu_ci = false`.
+- `scripts/run_cuda_tests.sh` — SSM-based runner mirroring
   `run_neuron_tests.sh` for the GPU box.
+
+### Changed
+
 - `docs/benchmarks.md` rewritten with vintage-matching methodology and
   real CPU numbers; `docs/aws_setup.md` documents the GPU instance and
   H100 opt-in.
+- CI: bumped to `actions/checkout@v6` and `actions/setup-python@v6`
+  (Node.js 24 runtime); standalone Deploy Docs workflow removed — docs
+  are served from trnsci.dev.
+- `pyproject.toml` normalized across the trnsci suite; added
+  `Documentation` URL pointing to `trnsci.dev/trnsolver/`.
 
 ## [0.2.0] — 2026-04-12
 
