@@ -116,18 +116,20 @@ CMD_ID=$(aws ssm send-command \
 echo "Command ID: $CMD_ID"
 echo "Waiting for command to complete (this may take several minutes)..."
 
-# aws ssm wait command-executed exits 255 if the command fails. We want to
-# capture output even on failure, so don't fail-fast here.
-aws ssm wait command-executed \
-  --command-id "$CMD_ID" \
-  --instance-id "$INSTANCE_ID" \
-  --region "$REGION" || true
-
-STATUS=$(aws ssm get-command-invocation \
-  --command-id "$CMD_ID" \
-  --instance-id "$INSTANCE_ID" \
-  --region "$REGION" \
-  --query 'Status' --output text)
+# `aws ssm wait command-executed` has a short built-in timeout that fires
+# before NKI compilation finishes. Poll manually — match trnfft's pattern.
+STATUS="InProgress"
+for i in $(seq 1 120); do
+  STATUS=$(aws ssm get-command-invocation \
+    --command-id "$CMD_ID" \
+    --instance-id "$INSTANCE_ID" \
+    --region "$REGION" \
+    --query 'Status' --output text 2>/dev/null || echo "Unknown")
+  case "$STATUS" in
+    Success|Failed|TimedOut|Cancelled) break ;;
+  esac
+  sleep 15
+done
 
 echo ""
 echo "=== STDOUT ==="
