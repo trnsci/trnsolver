@@ -6,6 +6,9 @@ repo_name: trnsci/trnsolver
 
 theme:
   name: material
+  font:
+    text: Atkinson Hyperlegible
+    code: Atkinson Hyperlegible Mono
   palette:
     scheme: default
     primary: indigo
@@ -23,6 +26,7 @@ nav:
       - Iterative Solvers: api/iterative.md
       - NKI Backend: api/nki.md
   - Architecture: architecture.md
+  - Benchmarks: benchmarks.md
   - Deployment:
       - AWS Setup for Neuron CI: aws_setup.md
 
