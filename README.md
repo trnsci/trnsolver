@@ -1,6 +1,8 @@
 # trnsolver
 
 [![CI](https://github.com/trnsci/trnsolver/actions/workflows/ci.yml/badge.svg)](https://github.com/trnsci/trnsolver/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/trnsci/trnsolver/graph/badge.svg)](https://codecov.io/gh/trnsci/trnsolver)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![PyPI](https://img.shields.io/pypi/v/trnsolver)](https://pypi.org/project/trnsolver/)
 [![Python](https://img.shields.io/pypi/pyversions/trnsolver)](https://pypi.org/project/trnsolver/)
 [![License](https://img.shields.io/github/license/trnsci/trnsolver)](LICENSE)

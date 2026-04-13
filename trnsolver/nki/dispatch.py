@@ -25,6 +25,7 @@ import os
 try:
     import neuronxcc.nki as nki
     import neuronxcc.nki.language as nl
+
     HAS_NKI = True
 except ImportError:
     HAS_NKI = False

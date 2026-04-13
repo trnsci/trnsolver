@@ -1,13 +1,13 @@
 """Test eigenvalue decomposition."""
 
+import numpy as np
 import pytest
 import torch
-import numpy as np
+
 import trnsolver
 
 
 class TestEigh:
-
     def test_identity(self):
         A = torch.eye(4)
         vals, vecs = trnsolver.eigh(A)
@@ -50,7 +50,6 @@ class TestEigh:
 
 
 class TestEighGeneralized:
-
     def test_vs_standard(self, sym_matrix, spd_matrix):
         """Generalized with B=I should match standard eigh."""
         n = 8

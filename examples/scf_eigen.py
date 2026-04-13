@@ -18,15 +18,17 @@ Usage:
 
 import argparse
 import time
+
 import torch
+
 import trnsolver
 
 
 def scf_iteration(
-    H_core: torch.Tensor,    # (n, n) — core Hamiltonian
-    S: torch.Tensor,          # (n, n) — overlap matrix (SPD)
-    eri: torch.Tensor,        # (n, n, n, n) — two-electron integrals (simplified)
-    nocc: int,                # Number of occupied orbitals
+    H_core: torch.Tensor,  # (n, n) — core Hamiltonian
+    S: torch.Tensor,  # (n, n) — overlap matrix (SPD)
+    eri: torch.Tensor,  # (n, n, n, n) — two-electron integrals (simplified)
+    nocc: int,  # Number of occupied orbitals
     max_iter: int = 50,
     tol: float = 1e-8,
 ) -> dict:
@@ -34,7 +36,7 @@ def scf_iteration(
 
     Returns dict with energy, MO coefficients, orbital energies.
     """
-    n = H_core.shape[0]
+    H_core.shape[0]
 
     # Initial guess: diagonalize H_core
     eps, C = trnsolver.eigh_generalized(H_core, S)
@@ -98,7 +100,7 @@ def main():
     n = args.nbasis
     nocc = args.nocc
 
-    print(f"SCF calculation:")
+    print("SCF calculation:")
     print(f"  Basis functions: {n}")
     print(f"  Occupied MOs:    {nocc}")
     print(f"  Backend:         {trnsolver.get_backend()}")

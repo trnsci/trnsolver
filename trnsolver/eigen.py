@@ -16,19 +16,17 @@ The generalized eigenproblem reduces to standard form via Cholesky of S.
 
 from __future__ import annotations
 
-import math
 import torch
-from typing import Optional, Tuple
 
-from .nki import _use_nki, _REQUIRE_NKI, HAS_NKI
 from ._brent_luk import brent_luk_permutations
+from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki
 
 
 def eigh(
     A: torch.Tensor,
     max_sweeps: int = 100,
     tol: float = 1e-10,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Symmetric eigenvalue decomposition: A = V @ diag(w) @ V^T
 
     Args:
@@ -55,7 +53,7 @@ def eigh_generalized(
     B: torch.Tensor,
     max_sweeps: int = 100,
     tol: float = 1e-10,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Generalized symmetric eigenvalue problem: A @ x = λ B @ x
 
     Reduces to standard form via Cholesky of B:
@@ -76,7 +74,7 @@ def eigh_generalized(
     return eigenvalues, eigenvectors
 
 
-def _torch_eigh(A: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def _torch_eigh(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """PyTorch backend path — delegates to torch.linalg.eigh (LAPACK)."""
     return torch.linalg.eigh(A)
 
@@ -96,12 +94,11 @@ def _rotation_angles_strided(D: torch.Tensor) -> torch.Tensor:
     same device as D.
     """
     n = D.shape[0]
-    half = n // 2
 
-    idx_p = torch.arange(0, n, 2, device=D.device)        # 0, 2, 4, ...
-    idx_q = idx_p + 1                                      # 1, 3, 5, ...
+    idx_p = torch.arange(0, n, 2, device=D.device)  # 0, 2, 4, ...
+    idx_q = idx_p + 1  # 1, 3, 5, ...
 
-    d_pp = D[idx_p, idx_p]                                 # (half,)
+    d_pp = D[idx_p, idx_p]  # (half,)
     d_qq = D[idx_q, idx_q]
     d_pq = D[idx_p, idx_q]
 
@@ -126,10 +123,16 @@ def _rotation_angles_strided(D: torch.Tensor) -> torch.Tensor:
     c = torch.where(safe, c, torch.ones_like(c))
     s = torch.where(safe, s, torch.zeros_like(s))
 
-    return torch.stack([c, s], dim=1).to(D.dtype)          # (half, 2)
+    return torch.stack([c, s], dim=1).to(D.dtype)  # (half, 2)
 
 
-def _diag_block_fixup_strided(D: torch.Tensor, cs: torch.Tensor, d_pp_old: torch.Tensor, d_qq_old: torch.Tensor, d_pq_old: torch.Tensor) -> torch.Tensor:
+def _diag_block_fixup_strided(
+    D: torch.Tensor,
+    cs: torch.Tensor,
+    d_pp_old: torch.Tensor,
+    d_qq_old: torch.Tensor,
+    d_pq_old: torch.Tensor,
+) -> torch.Tensor:
     """Overwrite the 2×2 diagonal blocks of D at strided pairs (2i, 2i+1).
 
     The NKI kernel rotates rows and columns independently, which produces
@@ -162,7 +165,7 @@ def _jacobi_eigh_nki(
     A: torch.Tensor,
     max_sweeps: int,
     tol: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Brent-Luk parallel Jacobi via the NKI batched-round kernel.
 
     Requires even n. Pads A with a zero-off-diagonal identity block if odd
@@ -170,9 +173,10 @@ def _jacobi_eigh_nki(
     """
     if not HAS_NKI:
         raise RuntimeError("NKI backend requested but neuronxcc is not available")
-    from .nki.dispatch import rotate_pairs_kernel
     import torch_neuronx  # noqa: F401 — registers the Neuron PJRT plugin
     import torch_xla
+
+    from .nki.dispatch import rotate_pairs_kernel
 
     n = A.shape[0]
     assert A.shape == (n, n), f"Expected square matrix, got {A.shape}"
@@ -181,7 +185,6 @@ def _jacobi_eigh_nki(
             f"Phase 1 NKI Jacobi requires even n; got n={n}. Pad to even or use backend='pytorch'."
         )
 
-    half = n // 2
     orig_device = A.device
     xla_device = torch_xla.device()
 
@@ -195,7 +198,7 @@ def _jacobi_eigh_nki(
     idx_p = torch.arange(0, n, 2, device=xla_device)
     idx_q = idx_p + 1
 
-    for sweep in range(max_sweeps):
+    for _sweep in range(max_sweeps):
         diag_sq = (torch.diagonal(D) ** 2).sum()
         off_sq = (D * D).sum() - diag_sq
         if off_sq.item() < tol:
@@ -211,13 +214,13 @@ def _jacobi_eigh_nki(
             d_qq_old = D[idx_q, idx_q].clone()
             d_pq_old = D[idx_p, idx_q].clone()
 
-            cs = _rotation_angles_strided(D)              # (half, 2)
-            c_col = cs[:, 0:1].contiguous()               # (half, 1)
+            cs = _rotation_angles_strided(D)  # (half, 2)
+            c_col = cs[:, 0:1].contiguous()  # (half, 1)
             s_col = cs[:, 1:2].contiguous()
 
             # --- Rotate D's rows: even rows (0, 2, 4, ...) with odd rows (1, 3, 5, ...) ---
-            D_even = D[idx_p, :]                          # (half, n)
-            D_odd  = D[idx_q, :]
+            D_even = D[idx_p, :]  # (half, n)
+            D_odd = D[idx_q, :]
             D_even_new, D_odd_new = rotate_pairs_kernel(D_even, D_odd, c_col, s_col)
             D = D.clone()
             D[idx_p, :] = D_even_new
@@ -225,15 +228,15 @@ def _jacobi_eigh_nki(
 
             # --- Rotate D's cols: even cols with odd cols ---
             # Transpose-view: cols (n, half) → tile (half, n) by taking D^T rows
-            Dc_even = D[:, idx_p].t().contiguous()        # (half, n)
-            Dc_odd  = D[:, idx_q].t().contiguous()
+            Dc_even = D[:, idx_p].t().contiguous()  # (half, n)
+            Dc_odd = D[:, idx_q].t().contiguous()
             Dc_even_new, Dc_odd_new = rotate_pairs_kernel(Dc_even, Dc_odd, c_col, s_col)
             D[:, idx_p] = Dc_even_new.t()
             D[:, idx_q] = Dc_odd_new.t()
 
             # --- Rotate V's cols: even cols with odd cols ---
             Vc_even = V[:, idx_p].t().contiguous()
-            Vc_odd  = V[:, idx_q].t().contiguous()
+            Vc_odd = V[:, idx_q].t().contiguous()
             Vc_even_new, Vc_odd_new = rotate_pairs_kernel(Vc_even, Vc_odd, c_col, s_col)
             V = V.clone()
             V[:, idx_p] = Vc_even_new.t()

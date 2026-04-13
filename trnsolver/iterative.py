@@ -10,8 +10,9 @@ All inner products and matvecs map to trnblas Level 1/2 ops.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
-from typing import Optional, Callable, Tuple
 
 
 def jacobi_preconditioner(A: torch.Tensor) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -30,11 +31,11 @@ def jacobi_preconditioner(A: torch.Tensor) -> Callable[[torch.Tensor], torch.Ten
 def cg(
     A: torch.Tensor | Callable,
     b: torch.Tensor,
-    x0: Optional[torch.Tensor] = None,
+    x0: torch.Tensor | None = None,
     tol: float = 1e-6,
     maxiter: int = 1000,
-    M: Optional[torch.Tensor | Callable] = None,
-) -> Tuple[torch.Tensor, int, float]:
+    M: torch.Tensor | Callable | None = None,
+) -> tuple[torch.Tensor, int, float]:
     """Conjugate Gradient solver for A @ x = b (A must be SPD).
 
     Args:
@@ -59,7 +60,9 @@ def cg(
     elif callable(M):
         precond = M
     else:
-        precond = lambda r: torch.mv(M, r)
+
+        def precond(r):
+            return torch.mv(M, r)
 
     x = x0.clone() if x0 is not None else torch.zeros(n, dtype=b.dtype, device=b.device)
     r = b - matvec(x)
@@ -67,10 +70,7 @@ def cg(
     if b_norm < 1e-15:
         return x, 0, 0.0
 
-    if precond is not None:
-        z = precond(r)
-    else:
-        z = r.clone()
+    z = precond(r) if precond is not None else r.clone()
 
     p = z.clone()
     rz = torch.dot(r, z).item()
@@ -89,10 +89,7 @@ def cg(
         if r_norm / b_norm < tol:
             return x, k + 1, r_norm / b_norm
 
-        if precond is not None:
-            z = precond(r)
-        else:
-            z = r.clone()
+        z = precond(r) if precond is not None else r.clone()
 
         rz_new = torch.dot(r, z).item()
         beta = rz_new / rz
@@ -105,11 +102,11 @@ def cg(
 def gmres(
     A: torch.Tensor | Callable,
     b: torch.Tensor,
-    x0: Optional[torch.Tensor] = None,
+    x0: torch.Tensor | None = None,
     tol: float = 1e-6,
     maxiter: int = 100,
     restart: int = 30,
-) -> Tuple[torch.Tensor, int, float]:
+) -> tuple[torch.Tensor, int, float]:
     """GMRES solver for A @ x = b (general, non-symmetric).
 
     Restarted GMRES with Arnoldi process. Each iteration builds an
@@ -139,7 +136,7 @@ def gmres(
 
     total_iters = 0
 
-    for outer in range(maxiter):
+    for _outer in range(maxiter):
         r = b - matvec(x)
         r_norm = torch.linalg.norm(r).item()
         if r_norm / b_norm < tol:
@@ -172,7 +169,7 @@ def gmres(
             # (simplified: just check residual norm)
 
         # Solve least-squares: min ||H @ y - g||
-        y, _ = torch.linalg.lstsq(H[:m + 1, :m], g[:m + 1])[:2]
+        y, _ = torch.linalg.lstsq(H[: m + 1, :m], g[: m + 1])[:2]
         x = x + V[:, :m] @ y[:m]
 
     r = b - matvec(x)

@@ -7,9 +7,9 @@ TRNSOLVER_REQUIRE_NKI=1 so these tests fail loudly if the kernel compiles
 but returns wrong values.
 """
 
+import numpy as np
 import pytest
 import torch
-import numpy as np
 
 import trnsolver
 
@@ -17,7 +17,6 @@ pytestmark = pytest.mark.neuron
 
 
 class TestJacobiEighNKI:
-
     def test_identity(self):
         A = torch.eye(4)
         w, V = trnsolver.eigh(A)

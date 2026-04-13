@@ -36,10 +36,12 @@ pytestmark = [
 
 def _sync(fn):
     """Wrap a call so pytest-benchmark times the synchronous kernel cost."""
+
     def wrapper(*args, **kwargs):
         out = fn(*args, **kwargs)
         torch.cuda.synchronize()
         return out
+
     return wrapper
 
 

@@ -1,13 +1,13 @@
 """Test iterative solvers."""
 
+import numpy as np
 import pytest
 import torch
-import numpy as np
+
 import trnsolver
 
 
 class TestCG:
-
     def test_identity(self):
         A = torch.eye(4)
         b = torch.tensor([1.0, 2.0, 3.0, 4.0])
@@ -28,7 +28,10 @@ class TestCG:
         n = 16
         A = spd_matrix(n)
         b = torch.randn(n)
-        matvec = lambda x: torch.mv(A, x)
+
+        def matvec(x):
+            return torch.mv(A, x)
+
         x, iters, res = trnsolver.cg(matvec, b)
         residual = A @ x - b
         np.testing.assert_allclose(residual.numpy(), np.zeros(n), atol=1e-4)
@@ -70,7 +73,6 @@ class TestCG:
 
 
 class TestGMRES:
-
     def test_identity(self):
         A = torch.eye(4)
         b = torch.tensor([1.0, 2.0, 3.0, 4.0])

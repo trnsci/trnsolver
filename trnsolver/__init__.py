@@ -12,22 +12,33 @@ __version__ = "0.3.0"
 from .eigen import eigh, eigh_generalized
 
 # Factorizations
-from .factor import cholesky, lu, qr, solve, solve_spd, inv_spd, inv_sqrt_spd, inv_sqrt_spd_ns
+from .factor import cholesky, inv_spd, inv_sqrt_spd, inv_sqrt_spd_ns, lu, qr, solve, solve_spd
 
 # Iterative solvers
 from .iterative import cg, gmres, jacobi_preconditioner
 
 # Backend control
-from .nki import HAS_NKI, set_backend, get_backend
+from .nki import HAS_NKI, get_backend, set_backend
 
 __all__ = [
     # Eigen
-    "eigh", "eigh_generalized",
+    "eigh",
+    "eigh_generalized",
     # Factorization
-    "cholesky", "lu", "qr", "solve", "solve_spd", "inv_spd", "inv_sqrt_spd",
+    "cholesky",
+    "lu",
+    "qr",
+    "solve",
+    "solve_spd",
+    "inv_spd",
+    "inv_sqrt_spd",
     "inv_sqrt_spd_ns",
     # Iterative
-    "cg", "gmres", "jacobi_preconditioner",
+    "cg",
+    "gmres",
+    "jacobi_preconditioner",
     # Backend
-    "HAS_NKI", "set_backend", "get_backend",
+    "HAS_NKI",
+    "set_backend",
+    "get_backend",
 ]

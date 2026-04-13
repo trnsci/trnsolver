@@ -19,8 +19,8 @@ Run only PyTorch baselines (no hardware needed):
 from __future__ import annotations
 
 import pytest
-import torch
 import scipy.linalg
+import torch
 
 import trnsolver
 

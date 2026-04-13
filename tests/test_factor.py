@@ -1,13 +1,13 @@
 """Test matrix factorizations."""
 
+import numpy as np
 import pytest
 import torch
-import numpy as np
+
 import trnsolver
 
 
 class TestCholesky:
-
     def test_identity(self):
         L = trnsolver.cholesky(torch.eye(4))
         np.testing.assert_allclose(L.numpy(), np.eye(4), atol=1e-6)
@@ -32,7 +32,6 @@ class TestCholesky:
 
 
 class TestLU:
-
     def test_reconstruction(self, random_matrix):
         A = random_matrix(8, 8)
         P, L, U = trnsolver.lu(A)
@@ -41,7 +40,6 @@ class TestLU:
 
 
 class TestQR:
-
     def test_reconstruction(self, random_matrix):
         A = random_matrix(8, 6)
         Q, R = trnsolver.qr(A)
@@ -56,7 +54,6 @@ class TestQR:
 
 
 class TestSolve:
-
     def test_identity(self):
         A = torch.eye(4)
         b = torch.tensor([1.0, 2.0, 3.0, 4.0])
@@ -72,7 +69,6 @@ class TestSolve:
 
 
 class TestSolveSPD:
-
     def test_vs_solve(self, spd_matrix):
         n = 16
         A = spd_matrix(n)
@@ -91,7 +87,6 @@ class TestSolveSPD:
 
 
 class TestInvSqrtSPD:
-
     def test_identity(self):
         A = torch.eye(4)
         A_inv_sqrt = trnsolver.inv_sqrt_spd(A)
@@ -107,7 +102,6 @@ class TestInvSqrtSPD:
 
 
 class TestInvSqrtSpdNS:
-
     def test_identity(self):
         A = 2.0 * torch.eye(4, dtype=torch.float64)
         X, iters, res = trnsolver.inv_sqrt_spd_ns(A)

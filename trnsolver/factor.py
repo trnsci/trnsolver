@@ -15,7 +15,6 @@ For SCF:
 from __future__ import annotations
 
 import torch
-from typing import Tuple, Optional
 
 
 def cholesky(A: torch.Tensor, upper: bool = False) -> torch.Tensor:
@@ -29,7 +28,7 @@ def cholesky(A: torch.Tensor, upper: bool = False) -> torch.Tensor:
     return L
 
 
-def lu(A: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def lu(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """LU factorization with partial pivoting: P @ A = L @ U
 
     Returns:
@@ -42,7 +41,7 @@ def lu(A: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return P, L, U
 
 
-def qr(A: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def qr(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """QR factorization: A = Q @ R
 
     Returns:
@@ -104,7 +103,7 @@ def inv_sqrt_spd_ns(
     *,
     max_iters: int = 20,
     tol: float = 1e-7,
-) -> Tuple[torch.Tensor, int, float]:
+) -> tuple[torch.Tensor, int, float]:
     """A^{-1/2} for SPD A via the coupled Newton-Schulz iteration.
 
     Iterates:
@@ -139,18 +138,18 @@ def inv_sqrt_spd_ns(
     """
     n = A.shape[0]
     s = torch.linalg.norm(A, ord="fro")
-    I = torch.eye(n, dtype=A.dtype, device=A.device)
+    eye_n = torch.eye(n, dtype=A.dtype, device=A.device)
 
     Y = A / s
-    Z = I.clone()
+    Z = eye_n.clone()
 
-    norm_I = torch.linalg.norm(I, ord="fro")
+    norm_I = torch.linalg.norm(eye_n, ord="fro")
     residual = float("inf")
     for k in range(max_iters):
-        T = 0.5 * (3.0 * I - Z @ Y)
+        T = 0.5 * (3.0 * eye_n - Z @ Y)
         Y = Y @ T
         Z = T @ Z
-        residual = (torch.linalg.norm(Y @ Z - I, ord="fro") / norm_I).item()
+        residual = (torch.linalg.norm(Y @ Z - eye_n, ord="fro") / norm_I).item()
         if residual < tol:
             return Z / torch.sqrt(s), k + 1, residual
 
