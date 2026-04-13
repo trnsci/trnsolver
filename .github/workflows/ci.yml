@@ -49,8 +49,14 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Install neuronx-cc (Neuron SDK 2.29 / NKI 0.3.0 Stable)
-        run: pip install "neuronx-cc>=2.29" --extra-index-url https://pip.repos.neuron.amazonaws.com
+      - name: Install neuronx-cc from Neuron pip repo
+        # The public Neuron pip index tops out at 2.24.x — the 2.29 SDK ships
+        # only on the DLAMI. For CI-side simulator runs we install whatever
+        # the index offers and verify nki.simulate_kernel exists before the
+        # test step (early versions of neuronxcc pre-date the simulator).
+        run: |
+          pip install "neuronx-cc" --extra-index-url https://pip.repos.neuron.amazonaws.com
+          python -c "from neuronxcc.nki import simulate_kernel" || { echo "nki.simulate_kernel not available in this neuronxcc version; simulator CI job requires an SDK that includes NKI 0.3.0 features. See https://pip.repos.neuron.amazonaws.com for the current public version floor."; exit 1; }
       - run: pip install -e ".[dev]"
       - run: pytest tests/ -v -m simulator --cov=trnsolver --cov-report=xml --cov-append
       - name: Upload coverage reports to Codecov
