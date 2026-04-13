@@ -170,7 +170,7 @@ def _jacobi_eigh_nki(
     """
     if not HAS_NKI:
         raise RuntimeError("NKI backend requested but neuronxcc is not available")
-    from .nki.dispatch import jacobi_round_kernel
+    from .nki.dispatch import rotate_pairs_kernel
     import torch_neuronx  # noqa: F401 — registers the Neuron PJRT plugin
     import torch_xla
 
@@ -181,21 +181,21 @@ def _jacobi_eigh_nki(
             f"Phase 1 NKI Jacobi requires even n; got n={n}. Pad to even or use backend='pytorch'."
         )
 
+    half = n // 2
     orig_device = A.device
     xla_device = torch_xla.device()
 
     D = A.clone().to(xla_device)
     V = torch.eye(n, dtype=A.dtype, device=xla_device)
 
-    # Precompute Brent-Luk permutation schedule (int64 → int64 indexing).
-    perms_host = brent_luk_permutations(n)                # (n-1, n) int64
+    perms_host = brent_luk_permutations(n)
     perms = perms_host.to(xla_device)
-
-    # Cumulative permutation tracks where each original index ends up.
     cum_perm = torch.arange(n, dtype=torch.int64, device=xla_device)
 
+    idx_p = torch.arange(0, n, 2, device=xla_device)
+    idx_q = idx_p + 1
+
     for sweep in range(max_sweeps):
-        # Convergence: sum of squared off-diagonals.
         diag_sq = (torch.diagonal(D) ** 2).sum()
         off_sq = (D * D).sum() - diag_sq
         if off_sq.item() < tol:
@@ -203,28 +203,43 @@ def _jacobi_eigh_nki(
 
         for r in range(n - 1):
             perm = perms[r]
-
-            # Permute D (both rows and cols) and V (cols) into strided pair layout.
             D = D[perm][:, perm]
             V = V[:, perm]
             cum_perm = cum_perm[perm]
 
-            # Save original block values for diagonal fixup after the kernel.
-            idx_p = torch.arange(0, n, 2, device=xla_device)
-            idx_q = idx_p + 1
             d_pp_old = D[idx_p, idx_p].clone()
             d_qq_old = D[idx_q, idx_q].clone()
             d_pq_old = D[idx_p, idx_q].clone()
 
-            # Rotation angles from the current D (on host compute is easier
-            # for stability; shape is stable).
-            cs = _rotation_angles_strided(D)              # (n/2, 2)
+            cs = _rotation_angles_strided(D)              # (half, 2)
+            c_col = cs[:, 0:1].contiguous()               # (half, 1)
+            s_col = cs[:, 1:2].contiguous()
 
-            # Kernel: single compile per (n, dtype), cached afterwards.
-            D, V = jacobi_round_kernel(D, V, cs)
+            # --- Rotate D's rows: even rows (0, 2, 4, ...) with odd rows (1, 3, 5, ...) ---
+            D_even = D[idx_p, :]                          # (half, n)
+            D_odd  = D[idx_q, :]
+            D_even_new, D_odd_new = rotate_pairs_kernel(D_even, D_odd, c_col, s_col)
+            D = D.clone()
+            D[idx_p, :] = D_even_new
+            D[idx_q, :] = D_odd_new
 
-            # Diagonal block fixup (2x2 blocks that the row/col rotations
-            # double-touched with inconsistent values).
+            # --- Rotate D's cols: even cols with odd cols ---
+            # Transpose-view: cols (n, half) → tile (half, n) by taking D^T rows
+            Dc_even = D[:, idx_p].t().contiguous()        # (half, n)
+            Dc_odd  = D[:, idx_q].t().contiguous()
+            Dc_even_new, Dc_odd_new = rotate_pairs_kernel(Dc_even, Dc_odd, c_col, s_col)
+            D[:, idx_p] = Dc_even_new.t()
+            D[:, idx_q] = Dc_odd_new.t()
+
+            # --- Rotate V's cols: even cols with odd cols ---
+            Vc_even = V[:, idx_p].t().contiguous()
+            Vc_odd  = V[:, idx_q].t().contiguous()
+            Vc_even_new, Vc_odd_new = rotate_pairs_kernel(Vc_even, Vc_odd, c_col, s_col)
+            V = V.clone()
+            V[:, idx_p] = Vc_even_new.t()
+            V[:, idx_q] = Vc_odd_new.t()
+
+            # --- Diagonal block fixup ---
             D = _diag_block_fixup_strided(D, cs, d_pp_old, d_qq_old, d_pq_old)
 
     # Un-permute to original index order.

@@ -107,14 +107,20 @@ fi
 # (needed by torch_neuronx PJRT init) is on PATH. sudo'ing to ubuntu
 # without activation doesn't propagate the venv PATH.
 REQ_NKI="${TRNSOLVER_REQUIRE_NKI:-1}"
+# --optlevel=1 drops the Neuron compiler to fast codegen (less runtime
+# optimization, much faster compile). Appropriate for Phase 1 iteration;
+# Phase 3 perf work should drop the flag or raise to --optlevel=2.
+NEURON_CC_FLAGS_DEFAULT="--optlevel=1"
+NEURON_CC_FLAGS_SETTING="${NEURON_CC_FLAGS:-$NEURON_CC_FLAGS_DEFAULT}"
 TEST_SCRIPT="source /opt/aws_neuronx_venv_pytorch_2_9/bin/activate && \
   cd /home/ubuntu/trnsolver && \
   git fetch --all && \
   git checkout $SHA && \
   pip install -e '.[dev]' --quiet && \
+  export NEURON_CC_FLAGS='$NEURON_CC_FLAGS_SETTING' && \
   TRNSOLVER_REQUIRE_NKI=$REQ_NKI $PYTEST_INVOCATION"
 
-echo "Sending test command (SHA=$SHA, warm=$WARM, require_nki=$REQ_NKI)..."
+echo "Sending test command (SHA=$SHA, warm=$WARM, require_nki=$REQ_NKI, cc_flags=$NEURON_CC_FLAGS_SETTING)..."
 CMD_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
