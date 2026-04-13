@@ -86,22 +86,30 @@ if [[ "$PING" != "Online" ]]; then
 fi
 
 # --warm: run the suite twice to expose the NEFF cache delta — the second
-# pass gets warm /var/tmp/neuron-compile-cache/. -s surfaces the perf
-# prints from TestPerformance.
+# pass gets warm /var/tmp/neuron-compile-cache/.
 if [[ "$WARM" == "1" ]]; then
-  PYTEST_INVOCATION="\$NEURON_VENV/bin/pytest /home/ubuntu/trnsolver/tests/ -v -s -m neuron --tb=short && echo === WARM PASS === && \$NEURON_VENV/bin/pytest /home/ubuntu/trnsolver/tests/ -v -s -m neuron --tb=short"
+  PYTEST_INVOCATION="pytest tests/ -v -s -m neuron --tb=short && echo === WARM PASS === && pytest tests/ -v -s -m neuron --tb=short"
 else
-  PYTEST_INVOCATION="\$NEURON_VENV/bin/pytest /home/ubuntu/trnsolver/tests/ -v -m neuron --tb=short"
+  PYTEST_INVOCATION="pytest tests/ -v -m neuron --tb=short"
 fi
 
-echo "Sending test command (SHA=$SHA, warm=$WARM)..."
+# Activate the Neuron venv inside the user shell so libneuronpjrt-path
+# (needed by torch_neuronx PJRT init) is on PATH. sudo'ing to ubuntu
+# without activation doesn't propagate the venv PATH.
+REQ_NKI="${TRNSOLVER_REQUIRE_NKI:-1}"
+TEST_SCRIPT="source /opt/aws_neuronx_venv_pytorch_2_9/bin/activate && \
+  cd /home/ubuntu/trnsolver && \
+  git fetch --all && \
+  git checkout $SHA && \
+  pip install -e '.[dev]' --quiet && \
+  TRNSOLVER_REQUIRE_NKI=$REQ_NKI $PYTEST_INVOCATION"
+
+echo "Sending test command (SHA=$SHA, warm=$WARM, require_nki=$REQ_NKI)..."
 CMD_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
   --comment "trnsolver neuron tests @ $SHA" \
-  --parameters "commands=[
-    \"bash -c 'set -euo pipefail; cd /home/ubuntu/trnsolver && sudo -u ubuntu git fetch --all && sudo -u ubuntu git checkout $SHA && NEURON_VENV=\$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1) && sudo -u ubuntu \$NEURON_VENV/bin/pip install -e /home/ubuntu/trnsolver[dev] --quiet && sudo -u ubuntu TRNSOLVER_REQUIRE_NKI=${TRNSOLVER_REQUIRE_NKI:-1} $PYTEST_INVOCATION'\"
-  ]" \
+  --parameters "{\"commands\":[\"sudo -u ubuntu bash -c \\\"$TEST_SCRIPT\\\"\"]}" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
 
