@@ -60,6 +60,8 @@ Jacobi is preferred over Householder tridiagonalization on Trainium because each
 - `set_backend("auto" | "pytorch" | "nki")` — choose dispatch mode.
 - `TRNSOLVER_REQUIRE_NKI=1` env var — fail loudly on kernel-path errors instead of silently falling back. Used by the validation suite.
 
+For the suite-wide picture of which NKI kernels are validated on hardware across trnsci, see the [NKI validation status page](https://trnsci.dev/nki_validation_status/).
+
 ## Known gaps
 
 - **NKI Jacobi kernel is a stub.** Falls back to `torch.linalg.eigh` until validated on hardware.
