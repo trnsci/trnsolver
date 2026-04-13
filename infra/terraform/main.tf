@@ -49,9 +49,13 @@ data "aws_ami" "neuron" {
   most_recent = true
   owners      = ["amazon"]
 
+  # Any PyTorch-2.x Neuron AMI on Ubuntu 24.04. `most_recent=true` picks the
+  # newest, which (as of Neuron SDK 2.29, April 2026) bundles PyTorch 2.9 or
+  # later along with neuronxcc 2.29 / NKI 0.3.0. Widen the filter rather than
+  # pin to a specific torch version so AMI releases don't require a TF edit.
   filter {
     name   = "name"
-    values = ["Deep Learning AMI Neuron PyTorch 2.9*Ubuntu 24.04*"]
+    values = ["Deep Learning AMI Neuron PyTorch 2.*Ubuntu 24.04*"]
   }
 }
 

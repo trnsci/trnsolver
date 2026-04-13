@@ -76,7 +76,7 @@ Reproduce: `AWS_PROFILE=aws ./scripts/run_cuda_tests.sh g5`.
 
 ## Trainium results (trn1 / trn2)
 
-_Pending — the NKI Jacobi kernel at `trnsolver/nki/dispatch.py` needs to be rewritten with valid NKI 2.24 syntax and wired into `eigen.py` before hardware validation can produce numbers. See [#9](https://github.com/trnsci/trnsolver/issues/9) for the current audit and v0.4.0 plan._
+_Pending — classical Jacobi was architecturally mismatched to NKI (see [#9](https://github.com/trnsci/trnsolver/issues/9) post-mortem). Phase 1 redesign is iterating against the new NKI 0.3.0 CPU simulator (Neuron SDK 2.29, April 2026) with full-sweep Jacobi / Householder-QR / block-Jacobi candidates; hardware numbers will land once the redesigned kernel validates in simulation._
 
 ## Notes
 

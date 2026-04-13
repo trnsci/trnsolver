@@ -112,7 +112,8 @@ REQ_NKI="${TRNSOLVER_REQUIRE_NKI:-1}"
 # Phase 3 perf work should drop the flag or raise to --optlevel=2.
 NEURON_CC_FLAGS_DEFAULT="--optlevel=1"
 NEURON_CC_FLAGS_SETTING="${NEURON_CC_FLAGS:-$NEURON_CC_FLAGS_DEFAULT}"
-TEST_SCRIPT="source /opt/aws_neuronx_venv_pytorch_2_9/bin/activate && \
+TEST_SCRIPT="NEURON_VENV=\\\$(ls -d /opt/aws_neuronx_venv_pytorch_* 2>/dev/null | sort -V | tail -1) && \
+  source \\\$NEURON_VENV/bin/activate && \
   cd /home/ubuntu/trnsolver && \
   git fetch --all && \
   git checkout $SHA && \
