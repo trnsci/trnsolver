@@ -30,10 +30,24 @@ Returns `A⁻¹` for SPD `A` via Cholesky.
 
 ## `inv_sqrt_spd(A)`
 
-Returns `A⁻¹ᐟ²` for SPD `A`. Used as the density-fitting metric inverse in DF-MP2 (paired with `gemm` in trnblas).
-
-Currently implemented via eigendecomposition: `A⁻¹ᐟ² = V Λ⁻¹ᐟ² Vᵀ`. A Newton-Schulz GEMM-only variant is on the roadmap once the NKI GEMM in trnblas is validated.
+Returns `A⁻¹ᐟ²` for SPD `A` via eigendecomposition: `A⁻¹ᐟ² = V Λ⁻¹ᐟ² Vᵀ`.
+Robust default for general SPD, including ill-conditioned metrics.
 
 ```python
 M = trnsolver.inv_sqrt_spd(metric)
+```
+
+## `inv_sqrt_spd_ns(A, *, max_iters=20, tol=1e-7)`
+
+Returns `(X, iters, residual)` where `X ≈ A⁻¹ᐟ²`, computed via the coupled
+Newton-Schulz iteration `T = ½(3I − ZY); Y ← YT; Z ← TZ` starting from a
+Frobenius-norm-scaled `Y₀`. All operations are GEMMs, which maps cleanly to
+the Trainium Tensor Engine via `trnblas.gemm` once that backend validates.
+
+Choose this over `inv_sqrt_spd` when the NKI backend is active **and** `A` is
+well-conditioned (condition number ≲ 10⁶). For ill-conditioned SPD, stick
+with the eigendecomposition path.
+
+```python
+M, iters, res = trnsolver.inv_sqrt_spd_ns(metric, tol=1e-8)
 ```

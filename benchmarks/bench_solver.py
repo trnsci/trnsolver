@@ -102,6 +102,10 @@ class TestInvSqrtSpd:
     def test_inv_sqrt_spd_trnsolver(self, benchmark, spd_matrix):
         benchmark(trnsolver.inv_sqrt_spd, spd_matrix)
 
+    def test_inv_sqrt_spd_ns_trnsolver(self, benchmark, spd_matrix):
+        # Newton-Schulz (all-GEMM) variant — CPU baseline for the NKI target.
+        benchmark(trnsolver.inv_sqrt_spd_ns, spd_matrix)
+
 
 # ---------------------------------------------------------------------------
 # Iterative solvers

@@ -12,7 +12,7 @@ __version__ = "0.2.0"
 from .eigen import eigh, eigh_generalized
 
 # Factorizations
-from .factor import cholesky, lu, qr, solve, solve_spd, inv_spd, inv_sqrt_spd
+from .factor import cholesky, lu, qr, solve, solve_spd, inv_spd, inv_sqrt_spd, inv_sqrt_spd_ns
 
 # Iterative solvers
 from .iterative import cg, gmres, jacobi_preconditioner
@@ -25,6 +25,7 @@ __all__ = [
     "eigh", "eigh_generalized",
     # Factorization
     "cholesky", "lu", "qr", "solve", "solve_spd", "inv_spd", "inv_sqrt_spd",
+    "inv_sqrt_spd_ns",
     # Iterative
     "cg", "gmres", "jacobi_preconditioner",
     # Backend

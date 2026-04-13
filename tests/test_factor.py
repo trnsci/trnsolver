@@ -104,3 +104,37 @@ class TestInvSqrtSPD:
         A_inv_sqrt = trnsolver.inv_sqrt_spd(A)
         product = A_inv_sqrt @ A @ A_inv_sqrt
         np.testing.assert_allclose(product.numpy(), np.eye(n), atol=1e-3)
+
+
+class TestInvSqrtSpdNS:
+
+    def test_identity(self):
+        A = 2.0 * torch.eye(4, dtype=torch.float64)
+        X, iters, res = trnsolver.inv_sqrt_spd_ns(A)
+        # Expected A^{-1/2} = (1/sqrt(2)) I
+        expected = (1.0 / np.sqrt(2.0)) * np.eye(4)
+        np.testing.assert_allclose(X.numpy(), expected, atol=1e-6)
+        assert iters >= 1
+        assert res < 1e-6
+
+    def test_matches_eig_reference(self, spd_matrix):
+        n = 32
+        A = spd_matrix(n, dtype=torch.float64)
+        X_ref = trnsolver.inv_sqrt_spd(A)
+        X_ns, iters, res = trnsolver.inv_sqrt_spd_ns(A, tol=1e-9)
+        # Allow some slack; NS is quadratically convergent but not exact.
+        np.testing.assert_allclose(X_ns.numpy(), X_ref.numpy(), rtol=1e-4, atol=1e-5)
+        assert iters < 20
+
+    def test_reconstruction(self, spd_matrix):
+        n = 16
+        A = spd_matrix(n, dtype=torch.float64)
+        X, _, _ = trnsolver.inv_sqrt_spd_ns(A, tol=1e-9)
+        product = X @ A @ X
+        np.testing.assert_allclose(product.numpy(), np.eye(n), atol=1e-4)
+
+    def test_returns_iteration_count(self):
+        A = torch.eye(4, dtype=torch.float64) * 3.0
+        _, iters, res = trnsolver.inv_sqrt_spd_ns(A)
+        assert isinstance(iters, int) and iters >= 1
+        assert isinstance(res, float)

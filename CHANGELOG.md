@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `inv_sqrt_spd_ns(A)` — Newton-Schulz iteration for `A^{-1/2}`. All-GEMM,
+  returns `(X, iters, residual)`. Progress on #14 (NKI-GEMM backend swap
+  lands when trnblas GEMM validates on hardware).
+
 ## [0.2.0] — 2026-04-12
 
 ### Added
