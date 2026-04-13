@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-04-12
+
 ### Added
 
 - `jacobi_preconditioner(A)` in `trnsolver.iterative` — diagonal preconditioner
@@ -14,11 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Benchmark suite `benchmarks/bench_solver.py` covering eigh, factorizations,
   solve, CG (with/without Jacobi preconditioner), and GMRES. Closes #8.
 - Status badges in README (CI, PyPI, Python versions, license, docs). Closes #4.
+- Manual Neuron hardware CI workflow (`.github/workflows/neuron.yml`) —
+  `workflow_dispatch`-only, OIDC-based, wraps `scripts/run_neuron_tests.sh`.
+  Closes #5.
 
 ### Changed
 
 - `cg(A, b, M=...)` tensor preconditioner is now applied as `M @ r` (already-
   inverted operator), not `inv(M) @ r` recomputed every iteration.
+- Repository transferred from `scttfrdmn/trnsolver` to `trnsci/trnsolver`.
+  Hardcoded URLs updated across docs, pyproject, terraform, and CI.
 
 ## [0.1.1] — 2026-04-12
 
