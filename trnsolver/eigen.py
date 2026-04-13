@@ -103,6 +103,7 @@ def _jacobi_eigh_nki(
         raise RuntimeError("NKI backend requested but neuronxcc is not available")
     # Import inside the function so module import doesn't fail on non-NKI hosts.
     from .nki.dispatch import jacobi_rotation_kernel
+    import torch_neuronx  # noqa: F401 — registers the Neuron PJRT plugin
     import torch_xla
 
     n = A.shape[0]
