@@ -25,12 +25,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-neuron = [
-    # Pinned >=2.24 for NKI 2.24+ nc_matmul calling convention (unified
-    # across the trnsci suite).
-    "neuronxcc>=2.24",
-    "torch-neuronx>=2.9",
-]
+# No [neuron] extra: neuronx-cc and torch-neuronx ship pre-installed in the
+# Deep Learning AMI Neuron venv at /opt/aws_neuronx_venv_pytorch_*/. Users
+# run trnsolver inside that venv on a Trainium instance provisioned via
+# infra/terraform (AMI filter `Deep Learning*Neuron*PyTorch*Ubuntu 24.04*`,
+# most_recent=true — picks up the latest SDK automatically). There is no
+# separate pip install for the Neuron packages.
 dev = [
     "pytest>=7.0",
     "pytest-benchmark>=4.0",

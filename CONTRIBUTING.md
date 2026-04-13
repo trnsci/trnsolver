@@ -25,10 +25,14 @@ make test-all
 A single sub-project in isolation:
 
 ```bash
-cd trnfft   # or any other
-pip install -e ".[dev]"
-pytest tests/ -v -m "not neuron"
+cd trnsolver
+uv pip install -e ".[dev]"          # or: pip install -e ".[dev]"
+pytest tests/ -v -m "not neuron and not simulator"
 ```
+
+`uv` is preferred — much faster than pip, same interface. `uv sync` installs from the committed `uv.lock` for a reproducible dev environment.
+
+**Neuron packages (`neuronx-cc`, `torch-neuronx`) are NOT installed via pip.** They ship pre-installed in the Deep Learning AMI Neuron venv at `/opt/aws_neuronx_venv_pytorch_*/`. The `infra/terraform/main.tf` AMI filter + `most_recent=true` picks up whatever DLAMI is current; SDK upgrades are transparent.
 
 ## Lint and format
 
@@ -53,9 +57,9 @@ CI enforces the same checks (`.github/workflows/ci.yml::lint`), so skipping hook
 Three test channels, in order of iteration cost:
 
 - `pytest tests/ -v -m "not neuron and not simulator"` — pure CPU unit tests. Fast (< 1 s). Must pass on every PR.
-- `pytest tests/ -v -m simulator` — NKI kernels run on CPU via `nki.simulate_kernel` (Neuron SDK 2.29+, NKI 0.3.0 Stable). No Trainium hardware needed. Install the compiler from the Neuron pip repo first:
+- `pytest tests/ -v -m simulator` — NKI kernels run on CPU via `nki.simulate_kernel` (Neuron SDK 2.29+, NKI 0.3.0 Stable). No Trainium hardware needed. The simulator is part of the DLAMI's `aws_neuronx_venv`; when running locally on a Linux x86_64 box, a CI-style bootstrap works:
   ```bash
-  pip install "neuronx-cc>=2.29" --extra-index-url https://pip.repos.neuron.amazonaws.com
+  uv pip install --system "neuronx-cc" --extra-index-url https://pip.repos.neuron.amazonaws.com
   ```
   Linux x86_64 only. GitHub Actions `test-simulator` job runs this automatically on every push. Use this as the **inner loop** for NKI kernel development — seconds per iteration instead of minutes on hardware.
 - `pytest tests/ -v -m neuron` — real Trainium hardware. Burn only for final validation. Invoke via `AWS_PROFILE=aws ./scripts/run_neuron_tests.sh trn1` — the script wakes the pre-provisioned trn1 instance, runs the suite over SSM, prints results. Not part of standard CI.
