@@ -103,12 +103,17 @@ def _jacobi_eigh_nki(
         raise RuntimeError("NKI backend requested but neuronxcc is not available")
     # Import inside the function so module import doesn't fail on non-NKI hosts.
     from .nki.dispatch import jacobi_rotation_kernel
+    import torch_xla
 
     n = A.shape[0]
     assert A.shape == (n, n), f"Expected square matrix, got {A.shape}"
 
-    D = A.clone()
-    V = torch.eye(n, dtype=A.dtype, device=A.device)
+    # NKI kernels run on the XLA (Neuron) device. Move D and V there for the
+    # whole sweep; move results back at the end.
+    orig_device = A.device
+    xla_device = torch_xla.device()
+    D = A.clone().to(xla_device)
+    V = torch.eye(n, dtype=A.dtype, device=xla_device)
 
     skip_thresh = tol * 0.01
 
@@ -158,4 +163,4 @@ def _jacobi_eigh_nki(
     idx = torch.argsort(eigenvalues)
     eigenvalues = eigenvalues[idx]
     V = V[:, idx]
-    return eigenvalues, V
+    return eigenvalues.to(orig_device), V.to(orig_device)
