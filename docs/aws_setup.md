@@ -72,12 +72,12 @@ To opt into an H100 comparison for trn2:
 
 ```bash
 AWS_PROFILE=aws terraform apply -var=enable_gpu_ci=true \
-  -var=gpu_instance_type=p5.48xlarge -var=gpu_instance_tag=trnsolver-ci-p5 \
+  -var=gpu_instance_type=p5.4xlarge -var=gpu_instance_tag=trnsolver-ci-p5 \
   -var="vpc_id=..." -var="subnet_id=..."
 AWS_PROFILE=aws ./scripts/run_cuda_tests.sh p5
 ```
 
-That's $98/hr — use sparingly.
+That's ~$12/hr (single H100) — still pricey, use sparingly.
 
 ## Cost
 
@@ -89,7 +89,7 @@ Stopped = EBS only (~$10/mo for 100 GB gp3). Running:
 | trn2.8xlarge | $10.00 | $1.67 |
 | inf2.xlarge | $0.76 | $0.13 |
 | g5.xlarge (A10G, CUDA) | $1.01 | $0.17 |
-| p5.48xlarge (H100×8, CUDA) | $98.00 | $16.33 |
+| p5.4xlarge (H100×1, CUDA) | $12.00 | $2.00 |
 
 ## Troubleshooting
 

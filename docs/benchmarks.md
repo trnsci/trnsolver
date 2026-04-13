@@ -13,9 +13,9 @@ Comparing a 2022 Trainium chip to a 2024 H100 is not informative — both the ar
 | Trainium chip | Launch | Nvidia peer | EC2 instance | On-demand cost |
 |---|---|---|---|---|
 | trn1 (NeuronCore v2) | Oct 2022 | A10G (Ampere, 2021) | `g5.xlarge` | ~$1.01/hr |
-| trn2 (NeuronCore v3) | Dec 2024 | H100 (Hopper, 2022) | `p5.48xlarge` | ~$98/hr |
+| trn2 (NeuronCore v3) | Dec 2024 | H100 (Hopper, 2022) | `p5.4xlarge` | ~$12/hr |
 
-The default GPU baseline is `g5.xlarge` (A10G) because it's the vintage peer of `trn1.2xlarge` and within the same price tier. H100 baselines are an opt-in follow-up; they require `p5.48xlarge` which is ~70× the cost.
+The default GPU baseline is `g5.xlarge` (A10G) because it's the vintage peer of `trn1.2xlarge` and within the same price tier. H100 baselines are an opt-in follow-up on `p5.4xlarge` (1× H100) — roughly 10× the cost of the A10G box, but still far cheaper than `p5.48xlarge` (8× H100, ~$98/hr).
 
 ## Reproducing locally (CPU)
 

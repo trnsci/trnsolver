@@ -18,7 +18,7 @@ variable "gpu_instance_type" {
   default     = "g5.xlarge"
   # Alternatives:
   #   g5.xlarge       — A10G, ~$1.006/hr, vintage peer of trn1
-  #   p5.48xlarge     — H100 x8, ~$98/hr, vintage peer of trn2
+  #   p5.4xlarge      — H100 x1, ~$12/hr, vintage peer of trn2
   #   p4d.24xlarge    — A100 x8, ~$32/hr, peer of trn1 on a higher tier
 }
 
