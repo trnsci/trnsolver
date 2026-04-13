@@ -1,0 +1,63 @@
+name: Neuron hardware tests
+
+# Manually triggered workflow that runs the `@pytest.mark.neuron`-marked suite
+# on a Trainium instance via SSM. The instance is provisioned separately with
+# `infra/terraform/`. This workflow wraps `scripts/run_neuron_tests.sh`.
+#
+# Prerequisites (one-time, manual):
+#   1. Provision the CI instance: `cd infra/terraform && terraform apply`.
+#   2. Register an AWS IAM role that trusts the GitHub OIDC provider for this
+#      repo. The role needs ec2:{Start,Stop,Describe}Instances and
+#      ssm:{SendCommand,GetCommandInvocation,DescribeInstanceInformation}.
+#   3. Add the role ARN to repo secrets as `AWS_ROLE_ARN`.
+#
+# Until step 3 is done, the workflow will fail at the OIDC assume-role step.
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_type:
+        description: "Instance family tag suffix (trn1, trn2, inf2)"
+        required: false
+        default: "trn1"
+      aws_region:
+        description: "AWS region"
+        required: false
+        default: "us-east-1"
+      warm:
+        description: "Run suite twice (warm NEFF cache pass)"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  # Only one hardware run at a time — the EC2 instance is shared.
+  group: neuron-hardware
+  cancel-in-progress: false
+
+jobs:
+  neuron:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Run neuron-marked tests via SSM
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: |
+          chmod +x scripts/run_neuron_tests.sh
+          if [[ "${{ inputs.warm }}" == "true" ]]; then
+            ./scripts/run_neuron_tests.sh --warm "${{ inputs.instance_type }}"
+          else
+            ./scripts/run_neuron_tests.sh "${{ inputs.instance_type }}"
+          fi

@@ -29,7 +29,10 @@ TAG="trnsolver-ci-${INSTANCE_TYPE}"
 REGION="${AWS_REGION:-us-east-1}"
 SHA="$(git rev-parse HEAD)"
 
-: "${AWS_PROFILE:?Set AWS_PROFILE, e.g. AWS_PROFILE=aws ./scripts/run_neuron_tests.sh}"
+if [[ -z "${AWS_PROFILE:-}" && -z "${AWS_ACCESS_KEY_ID:-}" ]]; then
+  echo "ERROR: set AWS_PROFILE (local) or AWS_ACCESS_KEY_ID+AWS_SECRET_ACCESS_KEY (CI/OIDC)" >&2
+  exit 1
+fi
 
 echo "Looking up instance with Name=$TAG in $REGION..."
 INSTANCE_ID=$(aws ec2 describe-instances \
