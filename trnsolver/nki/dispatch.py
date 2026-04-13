@@ -114,7 +114,7 @@ if HAS_NKI:
             row_p = nl.load(D[2*i:2*i+1, 0:n])
             row_q = nl.load(D[2*i+1:2*i+2, 0:n])
 
-            new_row_p = nl.add(nl.multiply(row_p, c_tile), nl.multiply(row_q, -s_tile))
+            new_row_p = nl.add(nl.multiply(row_p, c_tile), nl.multiply(row_q, nl.negative(s_tile)))
             new_row_q = nl.add(nl.multiply(row_p, s_tile), nl.multiply(row_q, c_tile))
 
             nl.store(D_out[2*i:2*i+1, 0:n], value=new_row_p)
@@ -124,7 +124,7 @@ if HAS_NKI:
             col_p = nl.load(D[0:n, 2*i:2*i+1])
             col_q = nl.load(D[0:n, 2*i+1:2*i+2])
 
-            new_col_p = nl.add(nl.multiply(col_p, c_tile), nl.multiply(col_q, -s_tile))
+            new_col_p = nl.add(nl.multiply(col_p, c_tile), nl.multiply(col_q, nl.negative(s_tile)))
             new_col_q = nl.add(nl.multiply(col_p, s_tile), nl.multiply(col_q, c_tile))
 
             nl.store(D_out[0:n, 2*i:2*i+1], value=new_col_p)
@@ -134,7 +134,7 @@ if HAS_NKI:
             v_p = nl.load(V[0:n, 2*i:2*i+1])
             v_q = nl.load(V[0:n, 2*i+1:2*i+2])
 
-            new_v_p = nl.add(nl.multiply(v_p, c_tile), nl.multiply(v_q, -s_tile))
+            new_v_p = nl.add(nl.multiply(v_p, c_tile), nl.multiply(v_q, nl.negative(s_tile)))
             new_v_q = nl.add(nl.multiply(v_p, s_tile), nl.multiply(v_q, c_tile))
 
             nl.store(V_out[0:n, 2*i:2*i+1], value=new_v_p)
