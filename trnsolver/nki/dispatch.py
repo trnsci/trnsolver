@@ -1,9 +1,11 @@
 """
 NKI dispatch for solver operations.
 
-The Jacobi eigensolver is the primary NKI acceleration target:
-each Givens rotation is a 2×2 matmul on the Tensor Engine,
-and the off-diagonal max-finding maps to the Vector Engine.
+Phase 1 target: a correctness-validated Jacobi rotation kernel on trn1/trn2.
+The kernel is intentionally simple (single rotation per call, Vector-Engine
+element-wise math only) — performance tuning (batched within-sweep
+parallelism, Tensor-Engine matmul, cross-core sharding) lands in later
+phases per trnsci.dev/roadmap/.
 """
 
 from __future__ import annotations
@@ -13,7 +15,6 @@ import os
 try:
     import neuronxcc.nki as nki
     import neuronxcc.nki.language as nl
-    import neuronxcc.nki.isa as nisa
     HAS_NKI = True
 except ImportError:
     HAS_NKI = False
@@ -48,44 +49,85 @@ def _use_nki() -> bool:
 if HAS_NKI:
 
     @nki.jit
-    def jacobi_rotation_kernel(
-        D_ref, V_ref, p: int, q: int, c: float, s: float, n: int
-    ):
-        """Apply single Jacobi rotation to D and V matrices.
+    def jacobi_rotation_kernel(D, V, p: int, q: int, c: float, s: float):
+        """Apply one Givens rotation at (p, q) with cos=c, sin=s.
 
-        D' = G^T @ D @ G  (updates rows/cols p, q of D)
-        V' = V @ G        (accumulates eigenvectors)
+        Rotates rows p and q of D; columns p and q of D (D is symmetric and
+        stays so); columns p and q of V (eigenvector accumulator).
 
-        G is the Givens rotation matrix with cos(θ)=c, sin(θ)=s
-        at positions (p,q).
+        Math (per rotation):
+            D_new[p, :] = c * D[p, :] - s * D[q, :]
+            D_new[q, :] = s * D[p, :] + c * D[q, :]
+            (same for cols p, q by symmetry of D)
+            V_new[:, p] = c * V[:, p] - s * V[:, q]
+            V_new[:, q] = s * V[:, p] + c * V[:, q]
+            D_new[p, q] = D_new[q, p] = 0    (by construction of c, s)
 
-        On Tensor Engine: the 2-row/col update is a rank-2 operation.
-        On Vector Engine: the element-wise updates along rows p, q.
+        Phase 1 design (correctness MVP):
+        - Partition dim = 1 (load one row at a time; n rows sit in free dim)
+        - Free dim = n (the matrix width)
+        - Vector-Engine only: nl.multiply, nl.add — no nc_matmul yet
+        - Full copy of D and V to output HBM, then overwrite the 4 changed
+          rows/cols. O(n^2) per rotation; dispatch overhead dominates.
+          Batched within-sweep parallelism (#10) is the Phase 3 perf follow-up.
 
-        STUB: Scaffolded for on-hardware validation.
+        Target size: n ≤ 512. Larger n needs tiling over the free dim.
         """
-        # Load rows p and q of D
-        d_p = nl.load(D_ref[p, :])
-        d_q = nl.load(D_ref[q, :])
+        n = D.shape[0]
 
-        # Rotate rows
-        new_p = nl.add(nl.multiply(d_p, c), nl.multiply(d_q, -s))
-        new_q = nl.add(nl.multiply(d_p, s), nl.multiply(d_q, c))
-        nl.store(D_ref[p, :], new_p)
-        nl.store(D_ref[q, :], new_q)
+        D_out = nl.ndarray((n, n), dtype=D.dtype, buffer=nl.shared_hbm)
+        V_out = nl.ndarray((n, n), dtype=V.dtype, buffer=nl.shared_hbm)
 
-        # Rotate columns (D is symmetric, so update cols too)
-        d_col_p = nl.load(D_ref[:, p])
-        d_col_q = nl.load(D_ref[:, q])
-        nl.store(D_ref[:, p], nl.add(nl.multiply(d_col_p, c), nl.multiply(d_col_q, -s)))
-        nl.store(D_ref[:, q], nl.add(nl.multiply(d_col_p, s), nl.multiply(d_col_q, c)))
+        # Copy D and V verbatim first; we'll overwrite the affected rows/cols below.
+        D_full = nl.load(D[0:n, 0:n])
+        V_full = nl.load(V[0:n, 0:n])
+        nl.store(D_out[0:n, 0:n], value=D_full)
+        nl.store(V_out[0:n, 0:n], value=V_full)
 
-        # Zero the (p,q) and (q,p) entries
-        nl.store(D_ref[p, q], 0.0)
-        nl.store(D_ref[q, p], 0.0)
+        # ---- D row rotation: D[p,:] and D[q,:] ----
+        # Load the two rows as two separate (1, n) tiles.
+        row_p = nl.load(D[p:p+1, 0:n])        # shape (1, n), partition=1
+        row_q = nl.load(D[q:q+1, 0:n])
 
-        # Accumulate eigenvectors: V' = V @ G
-        v_p = nl.load(V_ref[:, p])
-        v_q = nl.load(V_ref[:, q])
-        nl.store(V_ref[:, p], nl.add(nl.multiply(v_p, c), nl.multiply(v_q, -s)))
-        nl.store(V_ref[:, q], nl.add(nl.multiply(v_p, s), nl.multiply(v_q, c)))
+        new_row_p = nl.add(nl.multiply(row_p, c), nl.multiply(row_q, -s))
+        new_row_q = nl.add(nl.multiply(row_p, s), nl.multiply(row_q, c))
+
+        nl.store(D_out[p:p+1, 0:n], value=new_row_p)
+        nl.store(D_out[q:q+1, 0:n], value=new_row_q)
+
+        # ---- D column rotation: D[:,p] and D[:,q] ----
+        # D is symmetric, so columns p and q of the *updated* D equal the
+        # rotated rows we just computed — but we also need to mix columns
+        # using the rows we haven't touched yet. The cleanest way is to
+        # rotate the columns from the original D_full, then overwrite.
+        col_p = nl.load(D[0:n, p:p+1])        # (n, 1)
+        col_q = nl.load(D[0:n, q:q+1])
+
+        new_col_p = nl.add(nl.multiply(col_p, c), nl.multiply(col_q, -s))
+        new_col_q = nl.add(nl.multiply(col_p, s), nl.multiply(col_q, c))
+
+        nl.store(D_out[0:n, p:p+1], value=new_col_p)
+        nl.store(D_out[0:n, q:q+1], value=new_col_q)
+
+        # Diagonal entries D[p,p], D[q,q] participate in both row and col
+        # rotations. The correct post-rotation values are:
+        #   D[p,p] = c^2 * D[p,p] - 2*c*s * D[p,q] + s^2 * D[q,q]
+        #   D[q,q] = s^2 * D[p,p] + 2*c*s * D[p,q] + c^2 * D[q,q]
+        # (and D[p,q] = D[q,p] = 0 by construction of c, s).
+        # Compute these on the host (as scalars) and store via small loads.
+        # Actually the host already has D[p,p], D[q,q], D[p,q] as Python
+        # floats (from eigen.py before dispatch); we'll inject the correct
+        # diagonal values via a post-call fixup on the host side rather
+        # than inside the kernel. See _jacobi_eigh_nki in eigen.py.
+
+        # ---- V column rotation: V[:,p] and V[:,q] ----
+        v_p = nl.load(V[0:n, p:p+1])
+        v_q = nl.load(V[0:n, q:q+1])
+
+        new_v_p = nl.add(nl.multiply(v_p, c), nl.multiply(v_q, -s))
+        new_v_q = nl.add(nl.multiply(v_p, s), nl.multiply(v_q, c))
+
+        nl.store(V_out[0:n, p:p+1], value=new_v_p)
+        nl.store(V_out[0:n, q:q+1], value=new_v_q)
+
+        return D_out, V_out
