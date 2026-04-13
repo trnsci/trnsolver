@@ -12,6 +12,16 @@ Eigenvalue problems, matrix factorizations, and iterative solvers for scientific
 
 Part of the **trnsci** scientific computing suite ([github.com/trnsci](https://github.com/trnsci)).
 
+## Current phase
+
+trnsolver follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Active work is tracked in phase-labeled GitHub issues:
+
+- **[Phase 1 — correctness](https://github.com/trnsci/trnsolver/issues/26)** (active): NKI Jacobi kernel validated on hardware, eigh_generalized on NKI path, SCF example end-to-end. Target release: **v0.4.0**.
+- **[Phase 2 — precision](https://github.com/trnsci/trnsolver/issues/27)**: iterative refinement for eigh / solve_spd, Kahan summation in CG / GMRES.
+- **[Phase 3 — perf](https://github.com/trnsci/trnsolver/issues/28)**: Newton-Schulz NKI backend, preconditioner suite, NEFF cache reuse.
+- **[Phase 4 — multi-chip](https://github.com/trnsci/trnsolver/issues/29)**: parallel Jacobi sweeps across NeuronCores.
+- **[Phase 5 — generation](https://github.com/trnsci/trnsolver/issues/30)**: trn2 rotation-block tuning.
+
 ## Install
 
 ```bash

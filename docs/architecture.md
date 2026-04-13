@@ -1,5 +1,19 @@
 # Architecture
 
+## Phase roadmap
+
+trnsolver follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Each phase has a tracker issue; work is labeled `phase-N-<theme>` across the whole suite for cross-project coordination.
+
+| Phase | Theme | Trnsolver scope | Tracker |
+|---|---|---|---|
+| 1 | correctness | NKI Jacobi kernel validated on trn1/trn2; eigh_generalized on NKI path; SCF example end-to-end | [#26](https://github.com/trnsci/trnsolver/issues/26) |
+| 2 | precision | Iterative refinement for eigh / solve_spd; Kahan summation in CG / GMRES; depends on trnblas double-double GEMM | [#27](https://github.com/trnsci/trnsolver/issues/27) |
+| 3 | perf | Newton-Schulz NKI backend, preconditioners (Jacobi ✓, IC0, SSOR, block-Jacobi), NEFF cache reuse | [#28](https://github.com/trnsci/trnsolver/issues/28) |
+| 4 | multi-chip | Parallel Jacobi sweeps across NeuronCores; sharded preconditioners | [#29](https://github.com/trnsci/trnsolver/issues/29) |
+| 5 | generation | trn2-tuned rotation-block tile size; runtime capability detection in dispatch | [#30](https://github.com/trnsci/trnsolver/issues/30) |
+
+v0.3.0 shipped with the CPU path feature-complete and a stub NKI kernel. v0.4.0 is the Phase 1 ship.
+
 ## Package layout
 
 ```
