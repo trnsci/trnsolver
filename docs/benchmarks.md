@@ -57,15 +57,28 @@ Run on darwin/Apple-silicon CPU, Python 3.14, torch 2.x, scipy 1.17.1, float32 e
 
 Numbers are for illustration — on the benchmark-target Linux CI hardware scipy.linalg is generally faster than torch.linalg for small dense factorizations, and the trnsolver CPU path should sit between them (thin layer over `torch.linalg`). Reference values live in `results.json` artifacts from CI runs.
 
-## GPU results (A10G / g5.xlarge)
+## GPU results — A10G / g5.xlarge (cuSOLVER via torch.linalg)
 
-_Pending — populated by running `AWS_PROFILE=aws ./scripts/run_cuda_tests.sh`._
+Run on AWS `g5.xlarge` (1× A10G, 24 GB, Ampere). Numbers include an explicit `torch.cuda.synchronize()` so the timer captures kernel execution, not async launch. Mean of 5+ warm rounds, µs:
+
+| Op | n=64 | n=128 | n=256 | n=512 |
+|---|---:|---:|---:|---:|
+| `cholesky` | 95 | 110 | 166 | 277 |
+| `qr` | 283 | 615 | 1,028 | 2,248 |
+| `solve_spd` | 195 | 293 | 560 | 1,306 |
+| `eigh` | 944 | 2,095 | 5,463 | 15,919 |
+| `inv_sqrt_spd` (eig-based) | 1,108 | 2,298 | 6,191 | 17,709 |
+| `inv_sqrt_spd_ns` (Newton-Schulz) | 2,979 | 3,005 | **2,973** | 3,492 |
+
+**The headline result**: on GPU, `inv_sqrt_spd_ns` **beats the eigendecomposition-based `inv_sqrt_spd` by 2.1× at n=256 and 5.1× at n=512**. Same story — eigh dominates on CPU because LAPACK is heavily optimized for it, but when you're on an accelerator the all-GEMM shape of Newton-Schulz wins. This is the evidence that the NS path will pay off on Trainium once the trnblas NKI GEMM backend lands.
+
+Reproduce: `AWS_PROFILE=aws ./scripts/run_cuda_tests.sh g5`.
 
 ## Trainium results (trn1 / trn2)
 
-_Pending — populated by running `AWS_PROFILE=aws ./scripts/run_neuron_tests.sh`._
+_Pending — the NKI Jacobi kernel at `trnsolver/nki/dispatch.py` needs to be rewritten with valid NKI 2.24 syntax and wired into `eigen.py` before hardware validation can produce numbers. See [#9](https://github.com/trnsci/trnsolver/issues/9) for the current audit and v0.4.0 plan._
 
 ## Notes
 
-- `inv_sqrt_spd_ns` is Newton-Schulz — all GEMM. On CPU it loses to the eigendecomposition path because eigh is heavily optimized in LAPACK/MKL. The shape of the workload is the important thing: once the trnblas NKI GEMM backend validates on Trainium, the NS path should win on trn1 / trn2.
+- `inv_sqrt_spd_ns` is Newton-Schulz — all GEMM. On CPU it loses to the eigendecomposition path because eigh is heavily optimized in LAPACK/MKL. On GPU it wins at n ≥ 256 because the workload shape fits the Tensor Core pipeline. Trainium's Tensor Engine should show a similar win once `trnblas` GEMM validates on hardware.
 - cuSOLVER is invoked indirectly via `torch.linalg` on a CUDA tensor. We don't link cuSOLVER directly.
