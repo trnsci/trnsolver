@@ -10,9 +10,10 @@ Part of the trnsci scientific computing suite ([github.com/trnsci](https://githu
 
 - **Symmetric & generalized eigensolvers** — `eigh`, `eigh_generalized` (Cholesky reduction)
 - **Factorizations** — `cholesky`, `lu`, `qr`
-- **Direct solvers** — `solve`, `solve_spd`, `inv_spd`, `inv_sqrt_spd`
-- **Iterative solvers** — `cg` (SPD systems), `gmres` (general)
-- **NKI acceleration** — Jacobi rotation kernel scaffolded for the Tensor Engine
+- **Direct solvers** — `solve`, `solve_spd`, `inv_spd`, `inv_sqrt_spd`, `inv_sqrt_spd_ns` (Newton-Schulz)
+- **Iterative solvers** — `cg` (SPD systems, with preconditioner support), `gmres` (general)
+- **Preconditioners** — `jacobi_preconditioner` diagonal; IC0/SSOR/block-Jacobi on roadmap
+- **NKI acceleration** — Jacobi rotation and Newton-Schulz are the primary Tensor Engine targets (hardware validation in v0.4.0)
 - **SCF-ready** — generalized eigenproblem `FC = SCε` is the headline use case (quantum chemistry)
 
 ## Quick example

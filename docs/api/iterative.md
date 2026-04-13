@@ -24,3 +24,14 @@ GMRES for general (non-symmetric) systems. Same calling convention as `cg`. `res
 ```python
 x, iters, residual = trnsolver.gmres(A, b, tol=1e-6)
 ```
+
+## `jacobi_preconditioner(A)`
+
+Build a diagonal (Jacobi) preconditioner callable `M(r) = r / diag(A)` for use as the `M=` argument of `cg`. Cheap and effective when `A` is diagonally dominant or has widely varying diagonal scales.
+
+```python
+M = trnsolver.jacobi_preconditioner(A)
+x, iters, res = trnsolver.cg(A, b, M=M, tol=1e-8)
+```
+
+Raises `ValueError` if any diagonal entry is within `1e-15` of zero. More-capable preconditioners (IC0, SSOR, block-Jacobi) are tracked in [#16](https://github.com/trnsci/trnsolver/issues/16).
