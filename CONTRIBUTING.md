@@ -50,8 +50,15 @@ CI enforces the same checks (`.github/workflows/ci.yml::lint`), so skipping hook
 
 ## Tests
 
-- `pytest tests/ -v -m "not neuron"` — the CPU-only suite. Must pass on every PR.
-- `pytest tests/ -v -m neuron` — on-hardware suite, run from a machine with AWS credentials via `scripts/run_neuron_tests.sh`. Not part of standard CI.
+Three test channels, in order of iteration cost:
+
+- `pytest tests/ -v -m "not neuron and not simulator"` — pure CPU unit tests. Fast (< 1 s). Must pass on every PR.
+- `pytest tests/ -v -m simulator` — NKI kernels run on CPU via `nki.simulate_kernel` (Neuron SDK 2.29+, NKI 0.3.0 Stable). No Trainium hardware needed. Install the compiler from the Neuron pip repo first:
+  ```bash
+  pip install "neuronx-cc>=2.29" --extra-index-url https://pip.repos.neuron.amazonaws.com
+  ```
+  Linux x86_64 only. GitHub Actions `test-simulator` job runs this automatically on every push. Use this as the **inner loop** for NKI kernel development — seconds per iteration instead of minutes on hardware.
+- `pytest tests/ -v -m neuron` — real Trainium hardware. Burn only for final validation. Invoke via `AWS_PROFILE=aws ./scripts/run_neuron_tests.sh trn1` — the script wakes the pre-provisioned trn1 instance, runs the suite over SSM, prints results. Not part of standard CI.
 
 ## Conventions
 

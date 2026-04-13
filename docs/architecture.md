@@ -14,6 +14,8 @@ trnsolver follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Eac
 
 v0.3.0 shipped with the CPU path feature-complete and a stub NKI kernel. v0.4.0 is the Phase 1 ship.
 
+**Phase 1 iteration is no longer hardware-gated.** Neuron SDK 2.29 (April 2026) brought NKI 0.3.0 Stable with a CPU simulator (`nki.simulate_kernel`); the `test-simulator` CI job exercises kernel correctness on `ubuntu-latest` without a trn1 instance. Hardware runs via `scripts/run_neuron_tests.sh` are now reserved for final real-device validation, not inner-loop iteration.
+
 ## Package layout
 
 ```
