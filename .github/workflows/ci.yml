@@ -74,3 +74,36 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: trnsci/trnsolver
           flags: simulator
+
+  # pytest-benchmark bit-rot gate. Runs the benchmark suite with minimum
+  # rounds on ubuntu-latest to catch import / fixture / API drift before
+  # it hits the real perf measurement path. No perf gate — just execution.
+  # Real perf numbers come from the hardware (`run_neuron_tests.sh`) and
+  # g5 (`run_cuda_tests.sh`) runners.
+  bench-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv pip install --system -e ".[dev]"
+      - name: Run benchmark smoke (exclude neuron + cuda)
+        # --override-ini: bench_*.py is outside the test_*.py default pattern;
+        # override rather than pollute the pyproject test config.
+        run: |
+          pytest benchmarks/ -v --benchmark-only -m "not neuron and not cuda" \
+            --override-ini 'python_files=bench_*.py' \
+            --benchmark-min-rounds=2 \
+            --benchmark-json=bench.json \
+            --tb=short
+      - name: Upload benchmark JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-smoke-results
+          path: bench.json
+          retention-days: 14
