@@ -161,6 +161,120 @@ def _diag_block_fixup_strided(
     return D
 
 
+def _call_matvec(A, v):
+    """Dispatch matvec_kernel through torch_xla or the CPU simulator."""
+    from .nki.dispatch import matvec_kernel
+
+    if _use_simulator():
+        import nki
+
+        w = nki.simulate(matvec_kernel)(A.detach().cpu().numpy(), v.detach().cpu().numpy())
+        return torch.from_numpy(w).to(A.device)
+    return matvec_kernel(A, v)
+
+
+def _call_rank2_update(A, u, v):
+    """Dispatch rank2_update_kernel through torch_xla or the CPU simulator."""
+    from .nki.dispatch import rank2_update_kernel
+
+    if _use_simulator():
+        import nki
+
+        out = nki.simulate(rank2_update_kernel)(
+            A.detach().cpu().numpy(), u.detach().cpu().numpy(), v.detach().cpu().numpy()
+        )
+        return torch.from_numpy(out).to(A.device)
+    return rank2_update_kernel(A, u, v)
+
+
+def _householder_tridiag(
+    A: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Symmetric Householder tridiagonalization via NKI kernels.
+
+    Returns (diag, subdiag, V_reflectors). V[:, k] stores the k-th
+    Householder vector (zero-padded above row k+1), normalized so that
+    ||V[:, k]||₂ = 1. Q₁ can be reconstructed on the host as the product
+    of (I − 2 V[:, k] V[:, k]ᵀ) for k = 0..n-2.
+
+    Host drives the outer loop; kernels (matvec_kernel, rank2_update_kernel)
+    handle the hot Tensor-Engine-shaped ops. Under TRNSOLVER_USE_SIMULATOR=1
+    the kernels route through nki.simulate on CPU; otherwise through the
+    XLA path on a Neuron device.
+
+    Correctness MVP — the kernels are Vector-Engine-only for now. Tensor
+    Engine conversion is a pure-perf refactor (issue #36) that keeps the
+    same correctness test contract.
+    """
+    if not HAS_NKI:
+        raise RuntimeError("NKI backend requested but the nki package isn't importable")
+
+    n = A.shape[0]
+    assert A.shape == (n, n), f"Expected square matrix, got {A.shape}"
+    if n > 128:
+        raise NotImplementedError(
+            f"Phase 1 Householder tridiag requires n ≤ 128 (single-tile); got n={n}."
+        )
+
+    A_work = A.clone()
+    V_refs = torch.zeros((n, max(n - 1, 1)), dtype=A.dtype, device=A.device)
+
+    for k in range(n - 2):
+        # Householder on column k, entries k+1..n-1
+        x = A_work[k + 1 :, k]
+        x_norm = torch.linalg.norm(x).item()
+        if x_norm < 1e-20:
+            # Already zero below diag in this column; skip step.
+            continue
+
+        sign_x0 = torch.sign(x[0]).item() if x[0].item() != 0 else 1.0
+        alpha = -sign_x0 * x_norm
+
+        # v_sub = x - alpha * e1, expanded to full n with zeros above row k+1
+        v = torch.zeros(n, dtype=A.dtype, device=A.device)
+        v[k + 1 :] = x
+        v[k + 1] -= alpha
+
+        vv = torch.dot(v, v).item()
+        if vv < 1e-30:
+            continue
+        beta = 2.0 / vv
+
+        # w = beta * A @ v (via kernel)
+        v_col = v.unsqueeze(1)  # (n, 1)
+        w_col = _call_matvec(A_work, v_col)  # (n, 1)
+        w = w_col.squeeze(1) * beta
+
+        # gamma = beta * v^T w / 2
+        gamma = beta * torch.dot(v, w).item() / 2.0
+
+        # u = w - gamma * v
+        u = w - gamma * v
+
+        # A <- A - u v^T - v u^T (via kernel; u, v are zero above row k+1)
+        u_col = u.unsqueeze(1)
+        A_work = _call_rank2_update(A_work, u_col, v_col)
+
+        # Enforce the tridiagonal structure at col/row k: the kernel update
+        # leaves (i ≤ k, j ≤ k) untouched and correctly modifies (k+1:, k+1:);
+        # the new (k+1, k) entry should be α and everything below that in col k
+        # should be zero.
+        A_work[k + 1, k] = alpha
+        A_work[k, k + 1] = alpha
+        if k + 2 < n:
+            A_work[k + 2 :, k] = 0.0
+            A_work[k, k + 2 :] = 0.0
+
+        # Store normalized reflector for eventual Q reconstruction.
+        v_norm = v.norm()
+        if v_norm.item() > 0:
+            V_refs[:, k] = v / v_norm
+
+    diag = torch.diagonal(A_work).clone()
+    subdiag = torch.diagonal(A_work, offset=1).clone()
+    return diag, subdiag, V_refs
+
+
 def _call_rotate_pairs(even, odd, c, s):
     """Dispatch rotate_pairs_kernel through torch_xla or the CPU simulator.
 
