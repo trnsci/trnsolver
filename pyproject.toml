@@ -25,12 +25,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# No [neuron] extra: neuronx-cc and torch-neuronx ship pre-installed in the
-# Deep Learning AMI Neuron venv at /opt/aws_neuronx_venv_pytorch_*/. Users
-# run trnsolver inside that venv on a Trainium instance provisioned via
-# infra/terraform (AMI filter `Deep Learning*Neuron*PyTorch*Ubuntu 24.04*`,
-# most_recent=true — picks up the latest SDK automatically). There is no
-# separate pip install for the Neuron packages.
+neuron = [
+    # NKI 0.3.0 Stable (Neuron SDK 2.29+, April 2026). trnsolver imports
+    # from the canonical `nki.*` namespace; the legacy `neuronxcc.nki.*`
+    # shim is not used. The SDK 2.29 DLAMI bundles nki==0.3.0 alongside
+    # neuronxcc==2.24.5133.
+    #
+    # These packages ship pre-installed on the Deep Learning AMI Neuron
+    # venv at /opt/aws_neuronx_venv_pytorch_*/ — infra/terraform's AMI
+    # filter + most_recent=true picks up new SDKs automatically. This
+    # extra is for hosts that need the simulator path outside the DLAMI
+    # (e.g. ubuntu-latest CI runners), installable from the AWS pip index
+    # at https://pip.repos.neuron.amazonaws.com.
+    "nki>=0.3.0",
+    "neuronxcc>=2.24",
+    "torch-neuronx>=2.9",
+]
 dev = [
     "pytest>=7.0",
     "pytest-benchmark>=4.0",
@@ -80,7 +90,7 @@ indent-style = "space"
 [tool.pytest.ini_options]
 markers = [
     "neuron: requires Neuron hardware (trn1/trn2 instance)",
-    "simulator: runs NKI kernels via nki.simulate_kernel on CPU (no hardware)",
+    "nki_simulator: routes dispatch through nki.simulate on CPU (TRNSOLVER_USE_SIMULATOR=1)",
     "cuda: requires an Nvidia GPU (cuSOLVER baselines)",
 ]
 testpaths = ["tests"]

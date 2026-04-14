@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 
 from ._brent_luk import brent_luk_permutations
-from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki
+from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki, _use_simulator
 
 
 def eigh(
@@ -161,6 +161,29 @@ def _diag_block_fixup_strided(
     return D
 
 
+def _call_rotate_pairs(even, odd, c, s):
+    """Dispatch rotate_pairs_kernel through torch_xla or the CPU simulator.
+
+    When `TRNSOLVER_USE_SIMULATOR=1` is set and the `nki` package is
+    importable, inputs are converted torch → numpy and routed through
+    `nki.simulate(kernel)(np_args)`; outputs come back as torch tensors.
+    Otherwise the kernel is invoked with its XLA inputs directly.
+    """
+    from .nki.dispatch import rotate_pairs_kernel
+
+    if _use_simulator():
+        import nki
+
+        even_np = even.detach().cpu().numpy()
+        odd_np = odd.detach().cpu().numpy()
+        c_np = c.detach().cpu().numpy()
+        s_np = s.detach().cpu().numpy()
+        ne, no = nki.simulate(rotate_pairs_kernel)(even_np, odd_np, c_np, s_np)
+        return torch.from_numpy(ne).to(even.device), torch.from_numpy(no).to(even.device)
+
+    return rotate_pairs_kernel(even, odd, c, s)
+
+
 def _jacobi_eigh_nki(
     A: torch.Tensor,
     max_sweeps: int,
@@ -170,13 +193,14 @@ def _jacobi_eigh_nki(
 
     Requires even n. Pads A with a zero-off-diagonal identity block if odd
     (not yet implemented; Phase 1 requires even n).
+
+    Dispatch paths:
+      * `TRNSOLVER_USE_SIMULATOR=1` → CPU, kernels routed through
+        `nki.simulate(...)`. No torch_xla dependency.
+      * Otherwise → Neuron hardware via torch_xla / torch_neuronx.
     """
     if not HAS_NKI:
-        raise RuntimeError("NKI backend requested but neuronxcc is not available")
-    import torch_neuronx  # noqa: F401 — registers the Neuron PJRT plugin
-    import torch_xla
-
-    from .nki.dispatch import rotate_pairs_kernel
+        raise RuntimeError("NKI backend requested but the nki package isn't importable")
 
     n = A.shape[0]
     assert A.shape == (n, n), f"Expected square matrix, got {A.shape}"
@@ -186,16 +210,24 @@ def _jacobi_eigh_nki(
         )
 
     orig_device = A.device
-    xla_device = torch_xla.device()
 
-    D = A.clone().to(xla_device)
-    V = torch.eye(n, dtype=A.dtype, device=xla_device)
+    if _use_simulator():
+        # Stay on CPU — the simulator takes numpy, no XLA device needed.
+        work_device = A.device
+    else:
+        import torch_neuronx  # noqa: F401 — registers the Neuron PJRT plugin
+        import torch_xla
+
+        work_device = torch_xla.device()
+
+    D = A.clone().to(work_device)
+    V = torch.eye(n, dtype=A.dtype, device=work_device)
 
     perms_host = brent_luk_permutations(n)
-    perms = perms_host.to(xla_device)
-    cum_perm = torch.arange(n, dtype=torch.int64, device=xla_device)
+    perms = perms_host.to(work_device)
+    cum_perm = torch.arange(n, dtype=torch.int64, device=work_device)
 
-    idx_p = torch.arange(0, n, 2, device=xla_device)
+    idx_p = torch.arange(0, n, 2, device=work_device)
     idx_q = idx_p + 1
 
     for _sweep in range(max_sweeps):
@@ -221,7 +253,7 @@ def _jacobi_eigh_nki(
             # --- Rotate D's rows: even rows (0, 2, 4, ...) with odd rows (1, 3, 5, ...) ---
             D_even = D[idx_p, :]  # (half, n)
             D_odd = D[idx_q, :]
-            D_even_new, D_odd_new = rotate_pairs_kernel(D_even, D_odd, c_col, s_col)
+            D_even_new, D_odd_new = _call_rotate_pairs(D_even, D_odd, c_col, s_col)
             D = D.clone()
             D[idx_p, :] = D_even_new
             D[idx_q, :] = D_odd_new
@@ -230,14 +262,14 @@ def _jacobi_eigh_nki(
             # Transpose-view: cols (n, half) → tile (half, n) by taking D^T rows
             Dc_even = D[:, idx_p].t().contiguous()  # (half, n)
             Dc_odd = D[:, idx_q].t().contiguous()
-            Dc_even_new, Dc_odd_new = rotate_pairs_kernel(Dc_even, Dc_odd, c_col, s_col)
+            Dc_even_new, Dc_odd_new = _call_rotate_pairs(Dc_even, Dc_odd, c_col, s_col)
             D[:, idx_p] = Dc_even_new.t()
             D[:, idx_q] = Dc_odd_new.t()
 
             # --- Rotate V's cols: even cols with odd cols ---
             Vc_even = V[:, idx_p].t().contiguous()
             Vc_odd = V[:, idx_q].t().contiguous()
-            Vc_even_new, Vc_odd_new = rotate_pairs_kernel(Vc_even, Vc_odd, c_col, s_col)
+            Vc_even_new, Vc_odd_new = _call_rotate_pairs(Vc_even, Vc_odd, c_col, s_col)
             V = V.clone()
             V[:, idx_p] = Vc_even_new.t()
             V[:, idx_q] = Vc_odd_new.t()

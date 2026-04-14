@@ -29,6 +29,8 @@ nav:
   - Benchmarks: benchmarks.md
   - Deployment:
       - AWS Setup for Neuron CI: aws_setup.md
+  - Contributing:
+      - Developing NKI kernels: developing_kernels.md
 
 markdown_extensions:
   - pymdownx.highlight

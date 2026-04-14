@@ -34,17 +34,19 @@ jobs:
         with:
           enable-cache: true
       - run: uv pip install --system -e ".[dev]"
-      - run: pytest tests/ -v -x --tb=short -m "not neuron and not simulator" --cov=trnsolver --cov-report=xml
+      - run: pytest tests/ -v -x --tb=short -m "not neuron and not nki_simulator" --cov=trnsolver --cov-report=xml
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: trnsci/trnsolver
 
-  # Runs the NKI CPU simulator. neuronx-cc ships from the Neuron pip repo
-  # (not public PyPI); the guard below checks nki.simulate_kernel is importable
-  # before the test step so a pip-repo regression fails fast with a clear error.
-  test-simulator:
+  # Runs NKI kernels through nki.simulate(kernel)(numpy_args) on CPU.
+  # Catches Python-trace-level errors (bad kwargs, dropped ops, shape
+  # mismatches) pre-merge without AWS round-trips. MLIR verifier errors
+  # remain hardware-only (simulator explicitly skips compile). NKI 0.3.0
+  # Stable is the canonical namespace — package is `nki`, not `neuronxcc.nki`.
+  nki-simulator:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -54,17 +56,18 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - name: Install neuronx-cc from Neuron pip repo
+      - name: Install trnsolver + NKI simulator deps
         # --index-strategy unsafe-best-match: uv normally locks a package to
-        # the first index it's found on (dependency-confusion protection), but
-        # neuronx-cc has transitive deps (e.g. islpy) that exist on both the
-        # Neuron repo (older pins) and PyPI (newer). Match pip's behavior of
-        # considering all indexes for the best version.
+        # the first index it's found on; nki's transitive deps (e.g. islpy)
+        # exist on both the Neuron repo and PyPI. Match pip's multi-index
+        # behavior so resolution picks the newest available wheel per package.
         run: |
-          uv pip install --system --index-strategy unsafe-best-match "neuronx-cc" --extra-index-url https://pip.repos.neuron.amazonaws.com
-          python -c "from neuronxcc.nki import simulate_kernel" || { echo "nki.simulate_kernel not available in this neuronxcc version; simulator CI job requires an SDK that includes NKI 0.3.0 features. See https://pip.repos.neuron.amazonaws.com for the current public version floor."; exit 1; }
-      - run: uv pip install --system -e ".[dev]"
-      - run: pytest tests/ -v -m simulator --cov=trnsolver --cov-report=xml --cov-append
+          uv pip install --system -e ".[dev]"
+          uv pip install --system --index-strategy unsafe-best-match "nki>=0.3.0" --extra-index-url https://pip.repos.neuron.amazonaws.com
+      - name: Run simulator-backed kernel tests
+        env:
+          TRNSOLVER_USE_SIMULATOR: "1"
+        run: pytest tests/ -v -m nki_simulator --tb=short --cov=trnsolver --cov-report=xml --cov-append
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v5
         with:

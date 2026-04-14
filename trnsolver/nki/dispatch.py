@@ -23,14 +23,28 @@ from __future__ import annotations
 import os
 
 try:
-    import neuronxcc.nki as nki
-    import neuronxcc.nki.language as nl
+    import nki
+    import nki.language as nl
 
     HAS_NKI = True
 except ImportError:
     HAS_NKI = False
 
+# When set, kernel-path failures re-raise instead of silently falling back
+# to PyTorch. Used by the validation suite to catch silent kernel breakage.
 _REQUIRE_NKI = os.environ.get("TRNSOLVER_REQUIRE_NKI", "").lower() in ("1", "true", "yes")
+
+# When set, dispatch bypasses torch_xla and runs kernels through
+# `nki.simulate(kernel)(np_args)` on CPU. Lets us iterate kernels on any
+# x86_64 Linux box without paying the NEFF compile + hardware dispatch
+# cost. Semantics follow NKI 0.3.0's simulator: no NEFF compile, no
+# SBUF/PSUM capacity checks, no latency/parallelism modelling. Correctness
+# iteration only; hardware still owns perf numbers.
+_USE_SIMULATOR = os.environ.get("TRNSOLVER_USE_SIMULATOR", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 _backend = "auto"
 
@@ -41,7 +55,7 @@ def set_backend(backend: str):
     global _backend
     assert backend in ("auto", "pytorch", "nki")
     if backend == "nki" and not HAS_NKI:
-        raise RuntimeError("NKI backend requires neuronxcc")
+        raise RuntimeError("NKI backend requires the nki package (NKI 0.3.0+)")
     _backend = backend
 
 
@@ -55,6 +69,16 @@ def _use_nki() -> bool:
     if _backend == "pytorch":
         return False
     return HAS_NKI
+
+
+def _use_simulator() -> bool:
+    """True iff dispatch should route through `nki.simulate` on CPU.
+
+    Requires both `TRNSOLVER_USE_SIMULATOR=1` in the env and `nki` to be
+    importable; otherwise kernels go through torch_xla (or the PyTorch
+    fallback if `_use_nki()` is False).
+    """
+    return _USE_SIMULATOR and HAS_NKI
 
 
 if HAS_NKI:

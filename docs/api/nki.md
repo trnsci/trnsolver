@@ -16,21 +16,21 @@ Returns the current backend string.
 
 ## `HAS_NKI`
 
-Module-level boolean — `True` iff `neuronxcc.nki` imported successfully.
+Module-level boolean — `True` iff the `nki` package (NKI 0.3.0 Stable, Neuron SDK 2.29+) imported successfully.
 
 ## Environment variables
 
 | Variable | Effect |
 |----------|--------|
 | `TRNSOLVER_REQUIRE_NKI=1` | Kernel-path failures re-raise instead of silently falling back to PyTorch. Used by the validation suite to catch silent kernel breakage. |
+| `TRNSOLVER_USE_SIMULATOR=1` | Route kernel dispatch through `nki.simulate(kernel)(numpy_args)` on CPU instead of torch_xla. No hardware needed. See [Developing kernels](../developing_kernels.md). |
 
 ## Jacobi rotation kernel
 
-`trnsolver.nki.dispatch.jacobi_rotation_kernel` is the primary NKI acceleration target. Each Givens rotation:
+`trnsolver.nki.dispatch.rotate_pairs_kernel` is the primary NKI acceleration target. Each sweep round:
 
-- Loads rows `p` and `q` of `D` (the working symmetric matrix) and rotates them via `(c, -s; s, c)`
-- Mirrors the rotation on columns `p` and `q` (D is symmetric)
-- Zeros the `(p, q)` and `(q, p)` off-diagonal entries
-- Accumulates the rotation into `V` (the eigenvector matrix)
+- Loads the `n/2` pairs of rows (even / odd at strided positions 2i, 2i+1) and rotates them by per-row `(c, -s; s, c)`
+- The host driver calls the kernel three times per round (D rows, D cols, V cols) under a Brent-Luk permutation
+- Compile graph is stable per `(half, n, dtype)` — NKI caches after the first invocation
 
-Currently scaffolded — falls back to `torch.linalg.eigh` until on-hardware validation completes. See [Architecture](../architecture.md#nki-jacobi-strategy) for the mapping rationale.
+See [Architecture](../architecture.md#nki-jacobi-strategy) and [#9](https://github.com/trnsci/trnsolver/issues/9) for the design rationale.

@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **NKI namespace migration: `neuronxcc.nki.*` → `nki.*`** (Neuron SDK 2.29 /
+  NKI 0.3.0 Stable). `trnsolver/nki/dispatch.py` and `trnsolver/eigen.py`
+  import from the canonical top-level `nki` package. Legacy shim not used.
+- `[neuron]` extra restored with `nki>=0.3.0`, `neuronxcc>=2.24`,
+  `torch-neuronx>=2.9`. These packages ship pre-installed on the Deep
+  Learning AMI Neuron venv; the extra is for hosts that need the simulator
+  path outside the DLAMI (ubuntu-latest CI runners).
+- Pytest marker renamed `simulator` → `nki_simulator` to match suite
+  convention. CI job renamed `test-simulator` → `nki-simulator`.
+- Test file renamed `tests/test_jacobi_simulator.py` → `tests/test_nki_sim.py`
+  and reworked to exercise the **public API** (`trnsolver.eigh`) under
+  `TRNSOLVER_USE_SIMULATOR=1`, rather than calling the kernel directly.
+  Catches integration bugs in dispatch + host driver, not just kernel-local
+  issues.
+
+### Added
+
+- `TRNSOLVER_USE_SIMULATOR=1` env var: dispatch bypasses `torch_xla` and
+  routes `rotate_pairs_kernel` through `nki.simulate(kernel)(np_args)` on
+  CPU. Seconds-per-iteration feedback for kernel development without AWS
+  cost.
+- `trnsolver.nki._use_simulator()` helper exported alongside `_use_nki()`.
+- `scripts/run_simulator_tests.sh` — SSM runner mirroring
+  `run_neuron_tests.sh` but with `TRNSOLVER_USE_SIMULATOR=1` set.
+- `docs/developing_kernels.md` — kernel-author guide: three dispatch
+  modes, simulator workflow, CI gate matrix, architecture-first reminder.
+- `docs/api/nki.md`: env-var table now documents
+  `TRNSOLVER_USE_SIMULATOR`.
+
+Closes #39.
+
 ## [0.3.0] — 2026-04-12
 
 ### Added

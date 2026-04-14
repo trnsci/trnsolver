@@ -1,0 +1,95 @@
+"""Simulator-backed kernel correctness tests (NKI 0.3.0 Stable).
+
+Run with `TRNSOLVER_USE_SIMULATOR=1` on any x86_64 Linux host that has
+`nki>=0.3.0` installed. Bypasses torch_xla + NEFF compile; dispatch in
+`trnsolver.nki` routes the `rotate_pairs_kernel` through
+`nki.simulate(kernel)(np_args)`.
+
+Exercises the **public API** (`trnsolver.eigh`) so the dispatch wiring,
+Brent-Luk permutation driver, and kernel all get coverage — not just the
+kernel in isolation. Kernel-level correctness at the NKI tile layer is
+covered by the simulator's internal parity; a failing assertion here
+points to an integration bug (host driver or dispatch), not a bad kernel.
+
+Intentionally curated to small n — the simulator is O(kernel-logical-ops)
+on CPU and slows with n. Correctness parity is what we're verifying;
+hardware + benchmarks own perf.
+"""
+
+from __future__ import annotations
+
+import os
+
+import numpy as np
+import pytest
+import torch
+
+pytestmark = pytest.mark.nki_simulator
+
+
+@pytest.fixture(autouse=True)
+def _simulator_enabled():
+    """Skip unless TRNSOLVER_USE_SIMULATOR is set and nki is importable.
+
+    The marker alone isn't sufficient: `pytest -m nki_simulator` on a host
+    without the simulator configured should skip, not fail. Pair the marker
+    with an explicit env-var + HAS_NKI check so runs that mean to exercise
+    the simulator fail loudly instead of silently falling back.
+    """
+    if os.environ.get("TRNSOLVER_USE_SIMULATOR", "").lower() not in ("1", "true", "yes"):
+        pytest.skip("TRNSOLVER_USE_SIMULATOR=1 required")
+
+    from trnsolver.nki import HAS_NKI
+
+    if not HAS_NKI:
+        pytest.skip("nki package not importable on this host")
+
+
+class TestEighSimulator:
+    """eigh dispatches through the simulator when the env var is set.
+
+    Uses the `auto` backend (default). On hosts with HAS_NKI=True the NKI
+    path is taken, and the dispatch branch in `eigen._jacobi_eigh_nki`
+    routes to the simulator when `_use_simulator()` returns True.
+    """
+
+    def test_identity(self):
+        import trnsolver
+
+        A = torch.eye(8)
+        w, V = trnsolver.eigh(A)
+        np.testing.assert_allclose(w.numpy(), np.ones(8), atol=1e-4)
+
+    def test_diagonal(self):
+        import trnsolver
+
+        diag = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+        A = torch.diag(diag)
+        w, V = trnsolver.eigh(A)
+        np.testing.assert_allclose(sorted(w.numpy()), sorted(diag.numpy()), atol=1e-4)
+
+    @pytest.mark.parametrize("n", [8, 16])
+    def test_eigh_vs_torch(self, n):
+        import trnsolver
+
+        torch.manual_seed(42)
+        A = torch.randn(n, n)
+        A = 0.5 * (A + A.T)
+
+        w_ref, _ = torch.linalg.eigh(A)
+        w, V = trnsolver.eigh(A)
+
+        np.testing.assert_allclose(w.numpy(), w_ref.numpy(), atol=1e-3, rtol=1e-3)
+
+    def test_eigh_reconstruction(self):
+        """V diag(w) V^T should reconstruct A."""
+        import trnsolver
+
+        torch.manual_seed(42)
+        n = 8
+        A = torch.randn(n, n)
+        A = 0.5 * (A + A.T)
+
+        w, V = trnsolver.eigh(A)
+        reconstructed = V @ torch.diag(w) @ V.T
+        np.testing.assert_allclose(reconstructed.numpy(), A.numpy(), atol=1e-2)
