@@ -4,35 +4,39 @@ Eigenvalue decomposition for Trainium.
 Symmetric eigenvalue problem: A @ V = V @ diag(eigenvalues)
 
 Methods:
-- NKI path: Brent-Luk parallel Jacobi. Host precomputes the n-1 round
-  permutations and applies each round in a fixed strided-pair layout so the
-  NKI kernel (trnsolver/nki/dispatch.py::jacobi_round_kernel) compiles once
-  and is reused across all rounds and all sweeps.
+- NKI path: Householder tridiagonalization via NKI kernels (matvec +
+  rank-2 update on the Tensor Engine) followed by pure-host implicit-
+  shift QR iteration on the tridiagonal. Eigenvector matrix is assembled
+  on host from stored Householder reflectors and accumulated Givens
+  rotations.
 - PyTorch path: torch.linalg.eigh (LAPACK / MAGMA depending on device).
 
 Primary use case: SCF eigenvalue problem FC = SCε in quantum chemistry.
 The generalized eigenproblem reduces to standard form via Cholesky of S.
+
+Design background: the classical-Jacobi path (pre-2026-04-14) fought the
+NKI compile cache. See #9 post-mortem and #38's architecture decision
+for the Householder-QR pivot rationale.
 """
 
 from __future__ import annotations
 
+import math
+
 import torch
 
-from ._brent_luk import brent_luk_permutations
 from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki, _use_simulator
 
 
 def eigh(
     A: torch.Tensor,
-    max_sweeps: int = 100,
     tol: float = 1e-10,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Symmetric eigenvalue decomposition: A = V @ diag(w) @ V^T
 
     Args:
         A: Symmetric matrix (n, n)
-        max_sweeps: Maximum Jacobi sweeps (NKI path only)
-        tol: Convergence threshold — sum of squared off-diagonal elements
+        tol: Convergence tolerance for QR iteration (NKI path only)
 
     Returns:
         eigenvalues: (n,) sorted ascending
@@ -40,7 +44,7 @@ def eigh(
     """
     if _use_nki():
         try:
-            return _jacobi_eigh_nki(A, max_sweeps, tol)
+            return _householder_qr_eigh(A, tol)
         except Exception:
             if _REQUIRE_NKI:
                 raise
@@ -51,7 +55,6 @@ def eigh(
 def eigh_generalized(
     A: torch.Tensor,
     B: torch.Tensor,
-    max_sweeps: int = 100,
     tol: float = 1e-10,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generalized symmetric eigenvalue problem: A @ x = λ B @ x
@@ -69,7 +72,7 @@ def eigh_generalized(
     A_prime = torch.linalg.solve_triangular(L, L_inv_A.T, upper=False).T
     A_prime = 0.5 * (A_prime + A_prime.T)
 
-    eigenvalues, V_prime = eigh(A_prime, max_sweeps, tol)
+    eigenvalues, V_prime = eigh(A_prime, tol)
     eigenvectors = torch.linalg.solve_triangular(L.T, V_prime, upper=True)
     return eigenvalues, eigenvectors
 
@@ -79,86 +82,9 @@ def _torch_eigh(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.linalg.eigh(A)
 
 
-def _rotation_angles_strided(D: torch.Tensor) -> torch.Tensor:
-    """Compute (c, s) for each strided pair (2i, 2i+1) of the current D.
-
-    Classical Jacobi rotation angle:
-        if |D[p,p] - D[q,q]| ≈ 0:   θ = π/4
-        else:
-            τ = (D[q,q] - D[p,p]) / (2 D[p,q])
-            t = sign(τ) / (|τ| + √(1 + τ²))
-            c = 1 / √(1 + t²)
-            s = t c
-
-    Works element-wise over half pairs. Returns a (half, 2) tensor on the
-    same device as D.
-    """
-    n = D.shape[0]
-
-    idx_p = torch.arange(0, n, 2, device=D.device)  # 0, 2, 4, ...
-    idx_q = idx_p + 1  # 1, 3, 5, ...
-
-    d_pp = D[idx_p, idx_p]  # (half,)
-    d_qq = D[idx_q, idx_q]
-    d_pq = D[idx_p, idx_q]
-
-    # Guard zeros: if d_pq ≈ 0 the rotation is unnecessary; pick c=1, s=0.
-    abs_pq = d_pq.abs()
-    safe = abs_pq > 1e-30
-
-    diff = d_qq - d_pp
-    # τ = (d_qq - d_pp) / (2 d_pq); handle d_pq ≈ 0 with a safe divisor
-    tau_denom = torch.where(safe, 2.0 * d_pq, torch.ones_like(d_pq))
-    tau = diff / tau_denom
-    t = torch.where(
-        tau >= 0,
-        1.0 / (tau + torch.sqrt(1.0 + tau * tau)),
-        -1.0 / (-tau + torch.sqrt(1.0 + tau * tau)),
-    )
-    c = 1.0 / torch.sqrt(1.0 + t * t)
-    s = t * c
-
-    # Special case: when d_pp ≈ d_qq exactly, the formula above is fine
-    # (tau is large but stable). When d_pq ≈ 0, set c=1, s=0.
-    c = torch.where(safe, c, torch.ones_like(c))
-    s = torch.where(safe, s, torch.zeros_like(s))
-
-    return torch.stack([c, s], dim=1).to(D.dtype)  # (half, 2)
-
-
-def _diag_block_fixup_strided(
-    D: torch.Tensor,
-    cs: torch.Tensor,
-    d_pp_old: torch.Tensor,
-    d_qq_old: torch.Tensor,
-    d_pq_old: torch.Tensor,
-) -> torch.Tensor:
-    """Overwrite the 2×2 diagonal blocks of D at strided pairs (2i, 2i+1).
-
-    The NKI kernel rotates rows and columns independently, which produces
-    incorrect values at the intersection (2i:2i+2, 2i:2i+2) blocks. Replace
-    them with the analytically correct post-rotation values:
-
-        D[p,p] = c² d_pp - 2cs d_pq + s² d_qq
-        D[q,q] = s² d_pp + 2cs d_pq + c² d_qq
-        D[p,q] = D[q,p] = 0
-    """
-    n = D.shape[0]
-    c = cs[:, 0]
-    s = cs[:, 1]
-
-    new_pp = c * c * d_pp_old - 2.0 * c * s * d_pq_old + s * s * d_qq_old
-    new_qq = s * s * d_pp_old + 2.0 * c * s * d_pq_old + c * c * d_qq_old
-
-    idx_p = torch.arange(0, n, 2, device=D.device)
-    idx_q = idx_p + 1
-
-    D = D.clone()
-    D[idx_p, idx_p] = new_pp
-    D[idx_q, idx_q] = new_qq
-    D[idx_p, idx_q] = 0.0
-    D[idx_q, idx_p] = 0.0
-    return D
+# ----------------------------------------------------------------------
+# NKI kernel dispatch helpers
+# ----------------------------------------------------------------------
 
 
 def _call_matvec(A, v):
@@ -187,24 +113,29 @@ def _call_rank2_update(A, u, v):
     return rank2_update_kernel(A, u, v)
 
 
+# ----------------------------------------------------------------------
+# Householder tridiagonalization (stage 1, #38 option B)
+# ----------------------------------------------------------------------
+
+
 def _householder_tridiag(
     A: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Symmetric Householder tridiagonalization via NKI kernels.
+    """Reduce symmetric A to tridiagonal form via Householder reflections.
 
     Returns (diag, subdiag, V_reflectors). V[:, k] stores the k-th
     Householder vector (zero-padded above row k+1), normalized so that
-    ||V[:, k]||₂ = 1. Q₁ can be reconstructed on the host as the product
-    of (I − 2 V[:, k] V[:, k]ᵀ) for k = 0..n-2.
+    ||V[:, k]||₂ = 1. Q₁ = product of (I − 2 V[:, k] V[:, k]ᵀ) satisfies
+    Q₁ᵀ A Q₁ = T.
 
-    Host drives the outer loop; kernels (matvec_kernel, rank2_update_kernel)
-    handle the hot Tensor-Engine-shaped ops. Under TRNSOLVER_USE_SIMULATOR=1
-    the kernels route through nki.simulate on CPU; otherwise through the
-    XLA path on a Neuron device.
+    Host drives the outer loop; kernels (matvec_kernel, rank2_update_kernel
+    in trnsolver/nki/dispatch.py) handle the hot ops. Under
+    TRNSOLVER_USE_SIMULATOR=1 the kernels route through nki.simulate on CPU;
+    otherwise through the XLA path on a Neuron device.
 
-    Correctness MVP — the kernels are Vector-Engine-only for now. Tensor
-    Engine conversion is a pure-perf refactor (issue #36) that keeps the
-    same correctness test contract.
+    Current kernels are Vector-Engine-only — the Tensor Engine lift (via
+    nisa.nc_matmul + PSUM accumulation) is a pure-perf refactor tracked
+    in #36 that keeps the same correctness test contract.
     """
     if not HAS_NKI:
         raise RuntimeError("NKI backend requested but the nki package isn't importable")
@@ -220,17 +151,14 @@ def _householder_tridiag(
     V_refs = torch.zeros((n, max(n - 1, 1)), dtype=A.dtype, device=A.device)
 
     for k in range(n - 2):
-        # Householder on column k, entries k+1..n-1
         x = A_work[k + 1 :, k]
         x_norm = torch.linalg.norm(x).item()
         if x_norm < 1e-20:
-            # Already zero below diag in this column; skip step.
             continue
 
         sign_x0 = torch.sign(x[0]).item() if x[0].item() != 0 else 1.0
         alpha = -sign_x0 * x_norm
 
-        # v_sub = x - alpha * e1, expanded to full n with zeros above row k+1
         v = torch.zeros(n, dtype=A.dtype, device=A.device)
         v[k + 1 :] = x
         v[k + 1] -= alpha
@@ -240,164 +168,221 @@ def _householder_tridiag(
             continue
         beta = 2.0 / vv
 
-        # w = beta * A @ v (via kernel)
-        v_col = v.unsqueeze(1)  # (n, 1)
-        w_col = _call_matvec(A_work, v_col)  # (n, 1)
+        v_col = v.unsqueeze(1)
+        w_col = _call_matvec(A_work, v_col)
         w = w_col.squeeze(1) * beta
 
-        # gamma = beta * v^T w / 2
         gamma = beta * torch.dot(v, w).item() / 2.0
-
-        # u = w - gamma * v
         u = w - gamma * v
 
-        # A <- A - u v^T - v u^T (via kernel; u, v are zero above row k+1)
         u_col = u.unsqueeze(1)
         A_work = _call_rank2_update(A_work, u_col, v_col)
 
-        # Enforce the tridiagonal structure at col/row k: the kernel update
-        # leaves (i ≤ k, j ≤ k) untouched and correctly modifies (k+1:, k+1:);
-        # the new (k+1, k) entry should be α and everything below that in col k
-        # should be zero.
         A_work[k + 1, k] = alpha
         A_work[k, k + 1] = alpha
         if k + 2 < n:
             A_work[k + 2 :, k] = 0.0
             A_work[k, k + 2 :] = 0.0
 
-        # Store normalized reflector for eventual Q reconstruction.
-        v_norm = v.norm()
-        if v_norm.item() > 0:
-            V_refs[:, k] = v / v_norm
+        v_norm_val = v.norm()
+        if v_norm_val.item() > 0:
+            V_refs[:, k] = v / v_norm_val
 
     diag = torch.diagonal(A_work).clone()
     subdiag = torch.diagonal(A_work, offset=1).clone()
     return diag, subdiag, V_refs
 
 
-def _call_rotate_pairs(even, odd, c, s):
-    """Dispatch rotate_pairs_kernel through torch_xla or the CPU simulator.
+# ----------------------------------------------------------------------
+# Implicit-shift QR iteration (stage 2, pure host)
+# ----------------------------------------------------------------------
 
-    When `TRNSOLVER_USE_SIMULATOR=1` is set and the `nki` package is
-    importable, inputs are converted torch → numpy and routed through
-    `nki.simulate(kernel)(np_args)`; outputs come back as torch tensors.
-    Otherwise the kernel is invoked with its XLA inputs directly.
+
+def _wilkinson_shift(diag_tail: torch.Tensor, subdiag_tail: torch.Tensor) -> float:
+    """Wilkinson shift for the trailing 2×2 block of the active tridiagonal.
+
+    diag_tail    : (2,) — [d[n-2], d[n-1]]
+    subdiag_tail : (1,) — [e[n-2]]
+
+    Picks the eigenvalue of the 2×2 block closer to d[n-1]. Gives cubic
+    convergence of implicit QR near simple eigenvalues.
     """
-    from .nki.dispatch import rotate_pairs_kernel
-
-    if _use_simulator():
-        import nki
-
-        even_np = even.detach().cpu().numpy()
-        odd_np = odd.detach().cpu().numpy()
-        c_np = c.detach().cpu().numpy()
-        s_np = s.detach().cpu().numpy()
-        ne, no = nki.simulate(rotate_pairs_kernel)(even_np, odd_np, c_np, s_np)
-        return torch.from_numpy(ne).to(even.device), torch.from_numpy(no).to(even.device)
-
-    return rotate_pairs_kernel(even, odd, c, s)
+    d0 = diag_tail[0].item()
+    d1 = diag_tail[1].item()
+    e = subdiag_tail[0].item()
+    delta = (d0 - d1) / 2.0
+    sign = 1.0 if delta >= 0 else -1.0
+    denom = abs(delta) + math.sqrt(delta * delta + e * e)
+    if denom < 1e-30:
+        return d1
+    return d1 - sign * e * e / denom
 
 
-def _jacobi_eigh_nki(
-    A: torch.Tensor,
-    max_sweeps: int,
+def _qr_sweep(diag: torch.Tensor, subdiag: torch.Tensor, Q: torch.Tensor, lo: int, hi: int):
+    """One implicit-shift QR sweep on diag[lo:hi+1], subdiag[lo:hi].
+
+    Bulge-chase with Givens rotations. Modifies diag, subdiag, Q in-place.
+    Active block endpoints are inclusive: processes diag[lo], ..., diag[hi].
+    """
+    n_active = hi - lo + 1
+    if n_active < 2:
+        return
+
+    shift = _wilkinson_shift(diag[hi - 1 : hi + 1], subdiag[hi - 1 : hi])
+
+    # Initial Givens to annihilate the first subdiagonal after shift.
+    x = diag[lo].item() - shift
+    y = subdiag[lo].item()
+
+    for k in range(lo, hi):
+        # Compute Givens (c, s) that zeroes y using x.
+        r = math.hypot(x, y)
+        if r < 1e-30:
+            c, s = 1.0, 0.0
+        else:
+            c = x / r
+            s = y / r
+
+        # Apply the rotation to rows/cols k and k+1 of the active tridiagonal.
+        if k > lo:
+            subdiag[k - 1] = r
+
+        d_k = diag[k].item()
+        d_k1 = diag[k + 1].item()
+        e_k = subdiag[k].item()
+
+        new_d_k = c * c * d_k + 2.0 * c * s * e_k + s * s * d_k1
+        new_d_k1 = s * s * d_k - 2.0 * c * s * e_k + c * c * d_k1
+        new_e_k = (c * c - s * s) * e_k + c * s * (d_k1 - d_k)
+
+        diag[k] = new_d_k
+        diag[k + 1] = new_d_k1
+        subdiag[k] = new_e_k
+
+        # Bulge chase — the rotation creates a bulge at position (k+2, k) that
+        # needs to be chased down in the next iteration.
+        if k + 1 < hi:
+            e_k1_old = subdiag[k + 1].item()
+            new_e_k1 = c * e_k1_old
+            bulge = s * e_k1_old
+            subdiag[k + 1] = new_e_k1
+            x = new_e_k
+            y = bulge
+
+        # Accumulate the Givens into Q (columns k and k+1).
+        q_k = Q[:, k].clone()
+        q_k1 = Q[:, k + 1].clone()
+        Q[:, k] = c * q_k + s * q_k1
+        Q[:, k + 1] = -s * q_k + c * q_k1
+
+
+def _qr_iterate(
+    diag: torch.Tensor,
+    subdiag: torch.Tensor,
     tol: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Brent-Luk parallel Jacobi via the NKI batched-round kernel.
+    """Implicit-shift QR with deflation until off-diagonals vanish.
 
-    Requires even n. Pads A with a zero-off-diagonal identity block if odd
-    (not yet implemented; Phase 1 requires even n).
-
-    Dispatch paths:
-      * `TRNSOLVER_USE_SIMULATOR=1` → CPU, kernels routed through
-        `nki.simulate(...)`. No torch_xla dependency.
-      * Otherwise → Neuron hardware via torch_xla / torch_neuronx.
+    Returns (eigenvalues, Q_right) where eigenvalues = final diag values
+    (unsorted), and Q_right is the product of all Givens rotations.
     """
-    if not HAS_NKI:
-        raise RuntimeError("NKI backend requested but the nki package isn't importable")
+    n = diag.shape[0]
+    Q = torch.eye(n, dtype=diag.dtype, device=diag.device)
 
-    n = A.shape[0]
-    assert A.shape == (n, n), f"Expected square matrix, got {A.shape}"
-    if n % 2 != 0:
-        raise NotImplementedError(
-            f"Phase 1 NKI Jacobi requires even n; got n={n}. Pad to even or use backend='pytorch'."
-        )
+    lo = 0
+    hi = n - 1
+    max_iters = 60 * n
+    iters = 0
 
-    orig_device = A.device
+    while lo < hi and iters < max_iters:
+        iters += 1
 
-    if _use_simulator():
-        # Stay on CPU — the simulator takes numpy, no XLA device needed.
-        work_device = A.device
-    else:
-        import torch_neuronx  # noqa: F401 — registers the Neuron PJRT plugin
-        import torch_xla
+        # Deflation from the top: collapse lo up if subdiag[lo] is tiny.
+        while lo < hi and abs(subdiag[lo].item()) < tol * (
+            abs(diag[lo].item()) + abs(diag[lo + 1].item())
+        ):
+            lo += 1
 
-        work_device = torch_xla.device()
-
-    D = A.clone().to(work_device)
-    V = torch.eye(n, dtype=A.dtype, device=work_device)
-
-    perms_host = brent_luk_permutations(n)
-    perms = perms_host.to(work_device)
-    cum_perm = torch.arange(n, dtype=torch.int64, device=work_device)
-
-    idx_p = torch.arange(0, n, 2, device=work_device)
-    idx_q = idx_p + 1
-
-    for _sweep in range(max_sweeps):
-        diag_sq = (torch.diagonal(D) ** 2).sum()
-        off_sq = (D * D).sum() - diag_sq
-        if off_sq.item() < tol:
+        if lo >= hi:
             break
 
-        for r in range(n - 1):
-            perm = perms[r]
-            D = D[perm][:, perm]
-            V = V[:, perm]
-            cum_perm = cum_perm[perm]
+        # Deflation from the bottom: peel off the last eigenvalue once it's isolated.
+        sub_hi = hi
+        while sub_hi > lo and abs(subdiag[sub_hi - 1].item()) < tol * (
+            abs(diag[sub_hi - 1].item()) + abs(diag[sub_hi].item())
+        ):
+            sub_hi -= 1
 
-            d_pp_old = D[idx_p, idx_p].clone()
-            d_qq_old = D[idx_q, idx_q].clone()
-            d_pq_old = D[idx_p, idx_q].clone()
+        if sub_hi == lo:
+            hi = lo  # top isolated — done
+            break
 
-            cs = _rotation_angles_strided(D)  # (half, 2)
-            c_col = cs[:, 0:1].contiguous()  # (half, 1)
-            s_col = cs[:, 1:2].contiguous()
+        # If we peeled from the bottom, run the sweep on the interior block.
+        _qr_sweep(diag, subdiag, Q, lo, sub_hi)
 
-            # --- Rotate D's rows: even rows (0, 2, 4, ...) with odd rows (1, 3, 5, ...) ---
-            D_even = D[idx_p, :]  # (half, n)
-            D_odd = D[idx_q, :]
-            D_even_new, D_odd_new = _call_rotate_pairs(D_even, D_odd, c_col, s_col)
-            D = D.clone()
-            D[idx_p, :] = D_even_new
-            D[idx_q, :] = D_odd_new
+        # Check if the last subdiag converged enough to shrink hi on the next pass.
+        if sub_hi < hi:
+            hi = sub_hi
 
-            # --- Rotate D's cols: even cols with odd cols ---
-            # Transpose-view: cols (n, half) → tile (half, n) by taking D^T rows
-            Dc_even = D[:, idx_p].t().contiguous()  # (half, n)
-            Dc_odd = D[:, idx_q].t().contiguous()
-            Dc_even_new, Dc_odd_new = _call_rotate_pairs(Dc_even, Dc_odd, c_col, s_col)
-            D[:, idx_p] = Dc_even_new.t()
-            D[:, idx_q] = Dc_odd_new.t()
+    return diag, Q
 
-            # --- Rotate V's cols: even cols with odd cols ---
-            Vc_even = V[:, idx_p].t().contiguous()
-            Vc_odd = V[:, idx_q].t().contiguous()
-            Vc_even_new, Vc_odd_new = _call_rotate_pairs(Vc_even, Vc_odd, c_col, s_col)
-            V = V.clone()
-            V[:, idx_p] = Vc_even_new.t()
-            V[:, idx_q] = Vc_odd_new.t()
 
-            # --- Diagonal block fixup ---
-            D = _diag_block_fixup_strided(D, cs, d_pp_old, d_qq_old, d_pq_old)
+# ----------------------------------------------------------------------
+# Eigenvector assembly (apply reflectors to accumulated Givens rotations)
+# ----------------------------------------------------------------------
 
-    # Un-permute to original index order.
-    inv_perm = torch.argsort(cum_perm)
-    D = D[inv_perm][:, inv_perm]
-    V = V[:, inv_perm]
 
-    eigenvalues = torch.diagonal(D).clone()
+def _apply_reflectors(V_refs: torch.Tensor, Q: torch.Tensor) -> torch.Tensor:
+    """Left-multiply Q by the product of Householder reflectors in V_refs.
+
+    Each column V_refs[:, k] is a unit-norm Householder vector. The combined
+    transform is Q_left = ∏_{k=n-3..0} (I - 2 v_k v_kᵀ), applied to Q as
+
+        Q ← (I - 2 v_k v_kᵀ) Q  for k = n-3, n-4, ..., 0
+
+    (reverse order matches the order in which the reflectors were applied
+    during tridiagonalization). Returns the updated Q.
+    """
+    n = Q.shape[0]
+    for k in range(n - 3, -1, -1):
+        v = V_refs[:, k]
+        if v.norm().item() < 1e-20:
+            continue
+        # Q ← Q − 2 v (vᵀ Q)
+        Q = Q - 2.0 * torch.outer(v, v @ Q)
+    return Q
+
+
+# ----------------------------------------------------------------------
+# Public NKI eigh path
+# ----------------------------------------------------------------------
+
+
+def _householder_qr_eigh(
+    A: torch.Tensor,
+    tol: float = 1e-10,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Eigendecomposition via Householder tridiagonalization + implicit-shift QR.
+
+    Two stages:
+      1. NKI-kernel-driven reduction A → T (symmetric tridiagonal) via
+         Householder reflections. Reflectors stored in V_refs.
+      2. Pure-host implicit-shift QR iteration on (diag, subdiag) with
+         deflation. Accumulates Givens rotations into Q_right.
+
+    Eigenvectors = Q_left · Q_right where Q_left is built by applying the
+    stored reflectors to the identity from the right.
+
+    Returns (eigenvalues_sorted_ascending, eigenvectors_columns).
+    """
+    n = A.shape[0]
+    if n == 1:
+        return A[0].clone().unsqueeze(0), torch.eye(1, dtype=A.dtype, device=A.device)
+
+    diag, subdiag, V_refs = _householder_tridiag(A)
+
+    eigenvalues, Q_right = _qr_iterate(diag.clone(), subdiag.clone(), tol)
+    V = _apply_reflectors(V_refs, Q_right)
+
     idx = torch.argsort(eigenvalues)
-    eigenvalues = eigenvalues[idx]
-    V = V[:, idx]
-    return eigenvalues.to(orig_device), V.to(orig_device)
+    return eigenvalues[idx], V[:, idx]

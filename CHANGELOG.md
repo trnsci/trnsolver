@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`eigh` switches from classical Jacobi to Householder-QR** on the NKI
+  path (#38 option B). Two-stage algorithm: stage 1 is Householder
+  tridiagonalization via `matvec_kernel` + `rank2_update_kernel` NKI
+  kernels (Vector-Engine for now; Tensor-Engine refactor tracked in #36);
+  stage 2 is pure-host implicit-shift QR with deflation. Eigenvectors are
+  assembled from stored Householder reflectors + accumulated Givens
+  rotations. Simulator regression at rtol=1e-3 matches
+  `torch.linalg.eigh`. Closes #9, #10, #38.
+- Deleted the Jacobi-era code: `rotate_pairs_kernel`, `_jacobi_eigh_nki`,
+  `_call_rotate_pairs`, `_rotation_angles_strided`,
+  `_diag_block_fixup_strided`, `trnsolver/_brent_luk.py`. Kept as a
+  post-mortem on #9 for architectural record.
+- `tests/test_jacobi_neuron.py` renamed to `tests/test_eigh_neuron.py`;
+  class `TestJacobiEighNKI` → `TestEighNKI`. Tests are algorithm-agnostic
+  (they only call the public `trnsolver.eigh`).
+
 - **NKI namespace migration: `neuronxcc.nki.*` → `nki.*`** (Neuron SDK 2.29 /
   NKI 0.3.0 Stable). `trnsolver/nki/dispatch.py` and `trnsolver/eigen.py`
   import from the canonical top-level `nki` package. Legacy shim not used.

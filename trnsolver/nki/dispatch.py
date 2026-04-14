@@ -1,21 +1,26 @@
 """
 NKI dispatch for solver operations.
 
-Phase 1 kernel: `rotate_pairs_kernel` does the core Jacobi primitive —
-rotate two stacked tiles of shape (half, n) against each other with a
-per-row (c, s) pair. Called 3× per sweep-round by the host:
+Phase 1 kernels (option B from #38 — Householder-QR path for symmetric eigh):
 
-    1. Rotate D's even rows against its odd rows  → D with rotated rows
-    2. Rotate D's even cols against its odd cols  → D with rotated cols too
-    3. Rotate V's even cols against its odd cols  → V accumulator
+    matvec_kernel(A, v)             → w = A @ v
+    rank2_update_kernel(A, u, v)    → A − u vᵀ − v uᵀ
 
-Each call is ~5 NKI ops (2 loads, 2 multiplies + 1 add each for 2 outputs,
-2 stores). Compile graph is trivial; NKI caches per (half, n, dtype) shape.
-Contrast the earlier `affine_range(half)`-with-inline-body design that
-unrolled to 12 ops × half iterations and never finished compiling on trn1.
+Together they implement the per-step work of Householder tridiagonalization,
+driven by `_householder_tridiag` in `trnsolver/eigen.py`. Eigenvalues +
+eigenvectors are finished by pure-host implicit-shift QR on the resulting
+tridiagonal (`_householder_qr_eigh`).
 
-Phase 3 work (#36) will reformulate this as stationary 2×2 matmuls on the
-Tensor Engine; the Vector-Engine path here is the correctness MVP.
+Current kernels are Vector-Engine-only (element-wise broadcast + sum) —
+the proven idiom that compiles cleanly on the NKI 0.3.0 simulator. The
+Tensor Engine refactor via `nisa.nc_matmul` + PSUM outer-product
+accumulation is a pure-perf follow-up (#36) that keeps the same
+correctness test contract.
+
+Design-history note: the Jacobi path (`rotate_pairs_kernel`) that lived
+here before 2026-04-14 was replaced after the #9 post-mortem (classical
+Jacobi fought the NKI compile cache with per-rotation dispatch). See #38
+for the architecture decision and #36 for the underlying directive.
 """
 
 from __future__ import annotations
@@ -83,40 +88,9 @@ def _use_simulator() -> bool:
 
 
 if HAS_NKI:
-
-    @nki.jit
-    def rotate_pairs_kernel(even, odd, c, s):
-        """Mix two stacked tiles by a per-row Givens rotation.
-
-        Args:
-            even, odd : (half, n) tiles — partition dim = half (≤ PMAX)
-            c, s      : (half, 1) tiles — per-pair cosine and sine
-
-        Returns:
-            new_even, new_odd : (half, n) tiles
-                new_even[i, :] = c[i] * even[i, :] − s[i] * odd[i, :]
-                new_odd[i, :]  = s[i] * even[i, :] + c[i] * odd[i, :]
-
-        The (c, s) values broadcast across the free dim (length n).
-        """
-        half, n = even.shape
-
-        new_even = nl.ndarray((half, n), dtype=even.dtype, buffer=nl.shared_hbm)
-        new_odd = nl.ndarray((half, n), dtype=even.dtype, buffer=nl.shared_hbm)
-
-        e = nl.load(even[0:half, 0:n])
-        o = nl.load(odd[0:half, 0:n])
-        c_tile = nl.load(c[0:half, 0:1])
-        s_tile = nl.load(s[0:half, 0:1])
-        neg_s_tile = nl.negative(s_tile)
-
-        ne = nl.add(nl.multiply(e, c_tile), nl.multiply(o, neg_s_tile))
-        no = nl.add(nl.multiply(e, s_tile), nl.multiply(o, c_tile))
-
-        nl.store(new_even[0:half, 0:n], value=ne)
-        nl.store(new_odd[0:half, 0:n], value=no)
-
-        return new_even, new_odd
+    # (Deleted: rotate_pairs_kernel — the Jacobi-era primitive replaced by
+    # matvec_kernel + rank2_update_kernel below for the Householder-QR path.
+    # See #9 post-mortem and #38 decision.)
 
     # ------------------------------------------------------------------
     # Householder-QR building blocks (Phase 1 option B from #38)
@@ -130,8 +104,8 @@ if HAS_NKI:
     #   2. rank2_update_kernel  →  A − u vᵀ − v uᵀ  (symmetric rank-2 update)
     #
     # **Correctness-first cut**: both kernels are implemented via
-    # Vector-Engine broadcast + sum (the same idiom that works for
-    # rotate_pairs_kernel). The architectural win from option B — rank-1
+    # Vector-Engine broadcast + sum (a well-exercised NKI 0.3.0 idiom).
+    # The architectural win from option B — rank-1
     # outer products on the Tensor Engine via `nisa.nc_matmul` + FP32
     # PSUM accumulation — is a pure-perf refactor layered on later once
     # the simulator is validating correctness. See #38 and #36.

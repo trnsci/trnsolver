@@ -2,8 +2,8 @@
 
 Run with `TRNSOLVER_USE_SIMULATOR=1` on any x86_64 Linux host that has
 `nki>=0.3.0` installed. Bypasses torch_xla + NEFF compile; dispatch in
-`trnsolver.nki` routes the `rotate_pairs_kernel` through
-`nki.simulate(kernel)(np_args)`.
+`trnsolver.nki` routes the NKI kernels (matvec_kernel, rank2_update_kernel)
+through `nki.simulate(kernel)(np_args)`.
 
 Exercises the **public API** (`trnsolver.eigh`) so the dispatch wiring,
 Brent-Luk permutation driver, and kernel all get coverage — not just the
@@ -49,8 +49,8 @@ class TestEighSimulator:
     """eigh dispatches through the simulator when the env var is set.
 
     Uses the `auto` backend (default). On hosts with HAS_NKI=True the NKI
-    path is taken, and the dispatch branch in `eigen._jacobi_eigh_nki`
-    routes to the simulator when `_use_simulator()` returns True.
+    path is taken (via `_householder_qr_eigh`), and the kernel helpers
+    route through `nki.simulate` when `_use_simulator()` returns True.
     """
 
     def test_identity(self):
@@ -68,15 +68,9 @@ class TestEighSimulator:
         w, V = trnsolver.eigh(A)
         np.testing.assert_allclose(sorted(w.numpy()), sorted(diag.numpy()), atol=1e-4)
 
-    @pytest.mark.parametrize("n", [8, 16])
+    @pytest.mark.parametrize("n", [8, 16, 32])
     def test_eigh_vs_torch(self, n):
-        """Jacobi eigenvalues agree with torch.linalg.eigh on random symmetric A.
-
-        Tolerance is loose (1e-2) because classical Jacobi in FP32 can leave
-        close eigenvalue pairs partly unconverged when max_sweeps is capped;
-        the kernel is running correctly, convergence rate is the variable.
-        Tightening this is v0.4.0 work, not Phase 1 correctness.
-        """
+        """Householder-QR eigenvalues match torch.linalg.eigh at rtol=1e-3."""
         import trnsolver
 
         torch.manual_seed(42)
@@ -86,24 +80,33 @@ class TestEighSimulator:
         w_ref, _ = torch.linalg.eigh(A)
         w, V = trnsolver.eigh(A)
 
-        # 5e-2 is the realistic FP32-Jacobi floor for close-eigenvalue pairs
-        # at this n. Measured worst case on CI: 2.79e-2 abs / 1.74e-2 rel at
-        # n=16 torch seed 42, one outlier out of 16. Tightening is a kernel
-        # redesign question (#38), not a parameter tweak.
-        np.testing.assert_allclose(w.numpy(), w_ref.numpy(), atol=5e-2, rtol=5e-2)
+        np.testing.assert_allclose(w.numpy(), w_ref.numpy(), atol=1e-3, rtol=1e-3)
 
-    def test_eigh_reconstruction(self):
+    @pytest.mark.parametrize("n", [8, 16, 32])
+    def test_eigh_reconstruction(self, n):
         """V diag(w) V^T should reconstruct A."""
         import trnsolver
 
         torch.manual_seed(42)
-        n = 8
         A = torch.randn(n, n)
         A = 0.5 * (A + A.T)
 
         w, V = trnsolver.eigh(A)
         reconstructed = V @ torch.diag(w) @ V.T
-        np.testing.assert_allclose(reconstructed.numpy(), A.numpy(), atol=1e-2)
+        np.testing.assert_allclose(reconstructed.numpy(), A.numpy(), atol=1e-3, rtol=1e-3)
+
+    @pytest.mark.parametrize("n", [8, 16, 32])
+    def test_eigh_orthonormality(self, n):
+        """Eigenvectors are orthonormal: VᵀV ≈ I."""
+        import trnsolver
+
+        torch.manual_seed(42)
+        A = torch.randn(n, n)
+        A = 0.5 * (A + A.T)
+
+        _w, V = trnsolver.eigh(A)
+        product = V.T @ V
+        np.testing.assert_allclose(product.numpy(), np.eye(n), atol=1e-3, rtol=1e-3)
 
 
 class TestHouseholderTridiagSimulator:

@@ -16,7 +16,7 @@ import trnsolver
 pytestmark = pytest.mark.neuron
 
 
-class TestJacobiEighNKI:
+class TestEighNKI:
     def test_identity(self):
         A = torch.eye(4)
         w, V = trnsolver.eigh(A)
