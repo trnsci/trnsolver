@@ -147,8 +147,20 @@ def _householder_tridiag(
             f"Phase 1 Householder tridiag requires n ≤ 128 (single-tile); got n={n}."
         )
 
-    A_work = A.clone()
-    V_refs = torch.zeros((n, max(n - 1, 1)), dtype=A.dtype, device=A.device)
+    # On hardware (HAS_NKI and not _use_simulator) the NKI kernel expects
+    # tensors on the XLA (Neuron) device. The simulator path takes numpy,
+    # so CPU tensors are fine there.
+    orig_device = A.device
+    if _use_simulator():
+        work_device = orig_device
+    else:
+        import torch_neuronx  # noqa: F401 — registers the Neuron PJRT plugin
+        import torch_xla
+
+        work_device = torch_xla.device()
+
+    A_work = A.clone().to(work_device)
+    V_refs = torch.zeros((n, max(n - 1, 1)), dtype=A.dtype, device=work_device)
 
     for k in range(n - 2):
         x = A_work[k + 1 :, k]
@@ -159,7 +171,7 @@ def _householder_tridiag(
         sign_x0 = torch.sign(x[0]).item() if x[0].item() != 0 else 1.0
         alpha = -sign_x0 * x_norm
 
-        v = torch.zeros(n, dtype=A.dtype, device=A.device)
+        v = torch.zeros(n, dtype=A.dtype, device=work_device)
         v[k + 1 :] = x
         v[k + 1] -= alpha
 
@@ -188,8 +200,9 @@ def _householder_tridiag(
         if v_norm_val.item() > 0:
             V_refs[:, k] = v / v_norm_val
 
-    diag = torch.diagonal(A_work).clone()
-    subdiag = torch.diagonal(A_work, offset=1).clone()
+    diag = torch.diagonal(A_work).clone().to(orig_device)
+    subdiag = torch.diagonal(A_work, offset=1).clone().to(orig_device)
+    V_refs = V_refs.to(orig_device)
     return diag, subdiag, V_refs
 
 
