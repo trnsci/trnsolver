@@ -112,8 +112,14 @@ REQ_NKI="${TRNSOLVER_REQUIRE_NKI:-1}"
 # Phase 3 perf work should drop the flag or raise to --optlevel=2.
 NEURON_CC_FLAGS_DEFAULT="--optlevel=1"
 NEURON_CC_FLAGS_SETTING="${NEURON_CC_FLAGS:-$NEURON_CC_FLAGS_DEFAULT}"
-TEST_SCRIPT="NEURON_VENV=\\\$(ls -d /opt/aws_neuronx_venv_pytorch_* 2>/dev/null | sort -V | tail -1) && \
-  source \\\$NEURON_VENV/bin/activate && \
+# Bash glob expands on the LOCAL shell (where AWS CLI runs) to list the
+# current Neuron venv paths on this instance's AMI — we read the value
+# from the current remote state via one prior SSM probe is too
+# heavyweight, so just pick the latest by Python-minor convention. If the
+# AMI bumps past 2_9, add the new path here; simpler than escape gymnastics
+# through JSON for a deferred shell expansion.
+NEURON_VENV_PATH="/opt/aws_neuronx_venv_pytorch_2_9"
+TEST_SCRIPT="source $NEURON_VENV_PATH/bin/activate && \
   cd /home/ubuntu/trnsolver && \
   git fetch --all && \
   git checkout $SHA && \
