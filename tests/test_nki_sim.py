@@ -68,7 +68,7 @@ class TestEighSimulator:
         w, V = trnsolver.eigh(A)
         np.testing.assert_allclose(sorted(w.numpy()), sorted(diag.numpy()), atol=1e-4)
 
-    @pytest.mark.parametrize("n", [8, 16, 32])
+    @pytest.mark.parametrize("n", [8, 16, 32, 64, 128])
     def test_eigh_vs_torch(self, n):
         """Householder-QR eigenvalues match torch.linalg.eigh at rtol=1e-3."""
         import trnsolver
@@ -82,7 +82,7 @@ class TestEighSimulator:
 
         np.testing.assert_allclose(w.numpy(), w_ref.numpy(), atol=1e-3, rtol=1e-3)
 
-    @pytest.mark.parametrize("n", [8, 16, 32])
+    @pytest.mark.parametrize("n", [8, 16, 32, 64, 128])
     def test_eigh_reconstruction(self, n):
         """V diag(w) V^T should reconstruct A."""
         import trnsolver
@@ -95,7 +95,7 @@ class TestEighSimulator:
         reconstructed = V @ torch.diag(w) @ V.T
         np.testing.assert_allclose(reconstructed.numpy(), A.numpy(), atol=1e-3, rtol=1e-3)
 
-    @pytest.mark.parametrize("n", [8, 16, 32])
+    @pytest.mark.parametrize("n", [8, 16, 32, 64, 128])
     def test_eigh_orthonormality(self, n):
         """Eigenvectors are orthonormal: VᵀV ≈ I."""
         import trnsolver
@@ -117,7 +117,7 @@ class TestHouseholderTridiagSimulator:
     must match `torch.linalg.eigh(A)` since T = Q₁ᵀ A Q₁ is similar to A.
     """
 
-    @pytest.mark.parametrize("n", [8, 16, 32])
+    @pytest.mark.parametrize("n", [8, 16, 32, 64, 128])
     def test_produces_tridiagonal(self, n):
         """Reconstructing T from (diag, subdiag) matches A's tridiagonal structure.
 
@@ -138,7 +138,7 @@ class TestHouseholderTridiagSimulator:
         # above row k+1; last column (k = n-2) may be all zero if early exit.
         assert V.shape == (n, n - 1)
 
-    @pytest.mark.parametrize("n", [8, 16, 32])
+    @pytest.mark.parametrize("n", [8, 16, 32, 64, 128])
     def test_preserves_eigenvalues(self, n):
         """scipy.linalg.eigh_tridiagonal(T) eigenvalues == torch.linalg.eigh(A).
 

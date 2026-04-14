@@ -1,10 +1,12 @@
-"""Hardware-only tests for the NKI Jacobi path.
+"""Hardware-only tests for the NKI eigh path (Householder-QR, NKI 0.3.0).
 
 Run via: `AWS_PROFILE=aws ./scripts/run_neuron_tests.sh trn1`
 
 Silent PyTorch fallback is disabled by default in the runner script via
-TRNSOLVER_REQUIRE_NKI=1 so these tests fail loudly if the kernel compiles
-but returns wrong values.
+TRNSOLVER_REQUIRE_NKI=1 so these tests fail loudly if kernels compile but
+return wrong values. Simulator parity (test_nki_sim.py) covers the same
+contracts at zero AWS cost; this file owns the real-hardware signal
+(MLIR verifier, NEFF compile, on-chip dispatch).
 """
 
 import numpy as np
