@@ -72,11 +72,11 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 
 ## Status
 
-**v0.3.0** — PyTorch path is feature-complete. NKI Jacobi kernel is scaffolded but not yet validated on hardware; `set_backend("auto")` falls back to `torch.linalg.eigh` everywhere until v0.4.0 lands.
+**v0.4.0** — NKI Householder-QR `eigh` validated on trn1.2xlarge (NKI 0.3.0). 14/14 hardware tests pass. `set_backend("auto")` dispatches to the NKI path for n ≤ 128 on Neuron devices.
 
 **API coverage:**
 
-| Category | Shipped (v0.3.0) | Deferred |
+| Category | Shipped (v0.4.0) | Deferred |
 |----------|------------------|----------|
 | Eigensolvers | `eigh`, `eigh_generalized` | `svd` (Jacobi-SVD target for v0.5.0) |
 | Factorizations | `cholesky`, `lu`, `qr` | `schur`, `pinv` (see #22) |
