@@ -97,9 +97,9 @@ def _call_matvec(A, v):
     Both kernels compute the same result.
     """
     if _use_simulator():
-        from .nki.dispatch import matvec_kernel_sim
-
         import nki
+
+        from .nki.dispatch import matvec_kernel_sim
 
         w = nki.simulate(matvec_kernel_sim)(A.detach().cpu().numpy(), v.detach().cpu().numpy())
         return torch.from_numpy(w).to(A.device)
