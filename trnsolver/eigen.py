@@ -200,6 +200,18 @@ def _householder_tridiag(
         if v_norm_val.item() > 0:
             V_refs[:, k] = v / v_norm_val
 
+        # Commit all pending XLA ops before the next iteration.
+        # A_work is the output of rank2_update_kernel, so it carries a
+        # computation history that makes the traced XLA graph unique per
+        # step — causing a fresh NEFF compile on every outer-loop call.
+        # torch_xla.sync() materialises A_work into a concrete HBM buffer;
+        # the next _call_matvec then sees a plain leaf tensor and reuses
+        # the cached NEFF. Skipped on the simulator path (no XLA layer).
+        if not _use_simulator():
+            import torch_xla
+
+            torch_xla.sync()
+
     diag = torch.diagonal(A_work).clone().to(orig_device)
     subdiag = torch.diagonal(A_work, offset=1).clone().to(orig_device)
     V_refs = V_refs.to(orig_device)
