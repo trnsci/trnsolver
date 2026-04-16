@@ -6,7 +6,7 @@ computing on Trainium. Complements trnblas (BLAS) and trnfft (FFT).
 Part of the trnsci scientific computing suite.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # Eigenvalue decomposition
 from .eigen import eigh, eigh_generalized

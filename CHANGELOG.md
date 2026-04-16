@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-04-16
+
 ### Changed
 
 - **`eigh` switches from classical Jacobi to Householder-QR** on the NKI
@@ -55,6 +57,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TRNSOLVER_USE_SIMULATOR`.
 
 Closes #39.
+
+### Fixed
+
+- **`torch_xla.sync()` after each `rank2_update_kernel` call** in
+  `_householder_tridiag`. Without the barrier, `A_work` (the kernel output)
+  carried a growing XLA computation history into the next loop iteration,
+  causing a unique traced graph — and a fresh NEFF compile — on every
+  Householder step. With the barrier, each `_call_matvec` sees a concrete
+  leaf tensor and reuses the cached NEFF. Also resolved the NCC_IDEL901
+  delinearization compiler crash that appeared on the 30th+ compilation.
+  Exposed by hardware run; simulator was unaffected (numpy path, no XLA).
+  Closes #12.
+
+- **Hardware validated** on trn1.2xlarge (NKI 0.3.0 / neuronxcc 2.24):
+  14/14 `@pytest.mark.neuron` tests pass in 41 s wall-clock.
+  Eigenvalue rtol=1e-3 holds for n ∈ {4, 8, 16, 32, 64, 128}. Closes #26.
 
 ## [0.3.0] — 2026-04-12
 
