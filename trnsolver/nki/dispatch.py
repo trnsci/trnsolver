@@ -1,21 +1,26 @@
 """
 NKI dispatch for solver operations.
 
-Phase 1 kernels (option B from #38 — Householder-QR path for symmetric eigh):
+Phase 3 kernels (option B from #38 — Householder-QR path for symmetric eigh):
 
-    matvec_kernel(A, v)             → w = A @ v
-    rank2_update_kernel(A, u, v)    → A − u vᵀ − v uᵀ
+    matvec_kernel(A, v)             → w = A @ v  [Tensor Engine via nc_matmul]
+    rank2_update_kernel(A, u, v)    → A − u vᵀ − v uᵀ  [Vector Engine]
 
 Together they implement the per-step work of Householder tridiagonalization,
 driven by `_householder_tridiag` in `trnsolver/eigen.py`. Eigenvalues +
 eigenvectors are finished by pure-host implicit-shift QR on the resulting
 tridiagonal (`_householder_qr_eigh`).
 
-Current kernels are Vector-Engine-only (element-wise broadcast + sum) —
-the proven idiom that compiles cleanly on the NKI 0.3.0 simulator. The
-Tensor Engine refactor via `nisa.nc_matmul` + PSUM outer-product
-accumulation is a pure-perf follow-up (#36) that keeps the same
-correctness test contract.
+matvec_kernel uses nisa.nc_matmul (Tensor Engine, PSUM FP32 accumulation).
+A is symmetric throughout tridiagonalization so A^T @ v = A @ v; the
+partition dim n is the contracting dim — exactly the case where the Tensor
+Engine wins over the Vector Engine.
+
+rank2_update_kernel stays on the Vector Engine: the outer products u @ vᵀ
+have contraction rank 1 (the partition dim = 1 path), which gives no
+systolic-array advantage. A future optimisation packs [u|v] into a (n, 2)
+tile and uses nc_matmul(X^T, Y^T) with partition=2 to compute the full
+rank-2 update in one call (tracked in #36).
 
 Design-history note: the Jacobi path (`rotate_pairs_kernel`) that lived
 here before 2026-04-14 was replaced after the #9 post-mortem (classical
@@ -116,32 +121,35 @@ if HAS_NKI:
 
     @nki.jit
     def matvec_kernel(A, v):
-        """Matrix-vector product w = A @ v.
+        """Matrix-vector product w = A @ v via the Tensor Engine.
+
+        nisa.nc_matmul(stationary, moving) computes stationary^T @ moving
+        using PSUM FP32 accumulation on the systolic array. The contraction
+        dimension is the partition dim of both tiles (n here), which is exactly
+        the case where the Tensor Engine wins over the Vector Engine.
+
+        A is symmetric throughout Householder tridiagonalization, so
+        A^T @ v = A @ v. We pass A as the stationary operand and v as the
+        moving operand; nc_matmul returns A^T @ v = A @ v directly.
 
         Args:
-            A : (n, n) FP32 in HBM. n ≤ 128.
+            A : (n, n) FP32 in HBM. n ≤ 128 (single-tile).
             v : (n, 1) FP32 in HBM.
 
         Returns:
             w : (n, 1) FP32 in HBM.
-
-        Correctness via element-wise: load A (partition=n, free=n), load v
-        transposed to (partition=1, free=n), broadcast to (n, n), multiply,
-        sum along free dim. Result shape (n, 1).
         """
         n = A.shape[0]
 
         w = nl.ndarray((n, 1), dtype=A.dtype, buffer=nl.shared_hbm)
 
-        a_tile = nl.load(A[0:n, 0:n])  # (n, n), partition=n
-        # Load v transposed so partition=1, free=n; broadcast to match A.
-        v_row = nl.load_transpose2d(v[0:n, 0:1])  # (1, n), partition=1
-        v_bc = nl.broadcast_to(v_row, (n, n))  # (n, n), partition=n
+        a_tile = nl.load(A[0:n, 0:n])  # (n, n): partition=n, free=n
+        v_tile = nl.load(v[0:n, 0:1])  # (n, 1): partition=n, free=1
 
-        prod = nl.multiply(a_tile, v_bc)  # (n, n)
-        w_tile = nl.sum(prod, axis=1, keepdims=True)  # (n, 1) — free-dim reduce
+        # Tensor Engine: A^T @ v = A @ v (A symmetric). PSUM FP32 accumulation.
+        w_psum = nisa.nc_matmul(a_tile, v_tile)  # (n, 1)
 
-        nl.store(w[0:n, 0:1], value=w_tile)
+        nl.store(w[0:n, 0:1], value=w_psum)
 
         return w
 

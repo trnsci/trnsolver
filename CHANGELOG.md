@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`matvec_kernel` switched to Tensor Engine** (`nisa.nc_matmul`) (#36).
+  The previous Vector-Engine broadcast+sum path is replaced by
+  `nisa.nc_matmul(a_tile, v_tile)`, which computes `A^T @ v` via PSUM FP32
+  accumulation on the systolic array. Because A is symmetric throughout
+  Householder tridiagonalization, `A^T @ v = A @ v`. The contraction dim is
+  the partition dim (n ≤ 128) — the Tensor Engine's optimal case. The
+  `rank2_update_kernel` stays on the Vector Engine (rank-1 outer products,
+  partition=1, no systolic advantage); the packed-(n,2) path is tracked in
+  #36 for a later iteration.
+
 ## [0.4.0] — 2026-04-16
 
 ### Changed
