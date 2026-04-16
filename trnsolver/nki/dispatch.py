@@ -132,6 +132,11 @@ if HAS_NKI:
         A^T @ v = A @ v. We pass A as the stationary operand and v as the
         moving operand; nc_matmul returns A^T @ v = A @ v directly.
 
+        Hardware path only. The NKI 0.3.0 simulator's context wrapper strips
+        the stationary operand before forwarding to the underlying nc_matmul
+        implementation, causing a TypeError. Use matvec_kernel_sim for the
+        nki.simulate path (see _call_matvec in eigen.py).
+
         Args:
             A : (n, n) FP32 in HBM. n ≤ 128 (single-tile).
             v : (n, 1) FP32 in HBM.
@@ -150,6 +155,38 @@ if HAS_NKI:
         w_psum = nisa.nc_matmul(a_tile, v_tile)  # (n, 1)
 
         nl.store(w[0:n, 0:1], value=w_psum)
+
+        return w
+
+    @nki.jit
+    def matvec_kernel_sim(A, v):
+        """Matrix-vector product w = A @ v via the Vector Engine.
+
+        Simulator-compatible path used by nki.simulate in _call_matvec.
+        The NKI 0.3.0 simulator context wrapper does not support
+        nisa.nc_matmul (it strips the stationary argument), so this kernel
+        uses the Vector-Engine broadcast+sum idiom that the simulator handles
+        correctly.  The result is numerically identical to matvec_kernel.
+
+        Args:
+            A : (n, n) FP32 in HBM. n ≤ 128.
+            v : (n, 1) FP32 in HBM.
+
+        Returns:
+            w : (n, 1) FP32 in HBM.
+        """
+        n = A.shape[0]
+
+        w = nl.ndarray((n, 1), dtype=A.dtype, buffer=nl.shared_hbm)
+
+        a_tile = nl.load(A[0:n, 0:n])  # (n, n), partition=n
+        v_row = nl.load_transpose2d(v[0:n, 0:1])  # (1, n), partition=1
+        v_bc = nl.broadcast_to(v_row, (n, n))  # broadcast to match A
+
+        prod = nl.multiply(a_tile, v_bc)  # element-wise A[i,j] * v[j]
+        w_tile = nl.sum(prod, axis=1, keepdims=True)  # sum over j → (n, 1)
+
+        nl.store(w[0:n, 0:1], value=w_tile)
 
         return w
 
