@@ -136,6 +136,11 @@ def inv_sqrt_spd_ns(
         Frobenius for matrices with one dominant eigenvalue. Frobenius is
         good enough for typical DF-MP2 metric matrices.
     """
+    try:
+        import trnblas as _tb
+    except ImportError:
+        _tb = None
+
     n = A.shape[0]
     s = torch.linalg.norm(A, ord="fro")
     eye_n = torch.eye(n, dtype=A.dtype, device=A.device)
@@ -146,10 +151,21 @@ def inv_sqrt_spd_ns(
     norm_I = torch.linalg.norm(eye_n, ord="fro")
     residual = float("inf")
     for k in range(max_iters):
-        T = 0.5 * (3.0 * eye_n - Z @ Y)
-        Y = Y @ T
-        Z = T @ Z
-        residual = (torch.linalg.norm(Y @ Z - eye_n, ord="fro") / norm_I).item()
+        if _tb is not None:
+            # NKI-accelerated path: O(n³) GEMMs via trnblas (blocked NKI GEMM
+            # on Trainium, torch.matmul fallback elsewhere). The O(n²) scalar
+            # combination for T stays on the host — no systolic advantage there.
+            ZY = _tb.gemm(1.0, Z, Y)           # Z @ Y
+            T = 1.5 * eye_n - 0.5 * ZY         # 0.5*(3I - Z@Y), host O(n²)
+            Y = _tb.gemm(1.0, Y, T)             # Y @ T
+            Z = _tb.gemm(1.0, T, Z)             # T @ Z
+            YZ = _tb.gemm(1.0, Y, Z)            # Y @ Z  (convergence check)
+        else:
+            T = 0.5 * (3.0 * eye_n - Z @ Y)
+            Y = Y @ T
+            Z = T @ Z
+            YZ = Y @ Z
+        residual = (torch.linalg.norm(YZ - eye_n, ord="fro") / norm_I).item()
         if residual < tol:
             return Z / torch.sqrt(s), k + 1, residual
 

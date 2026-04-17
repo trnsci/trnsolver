@@ -428,5 +428,13 @@ def _householder_qr_eigh(
     eigenvalues, Q_right = _qr_iterate(diag.clone(), subdiag.clone(), tol)
     V = _apply_reflectors(V_refs, Q_right)
 
+    # Rayleigh-quotient refinement: one A@V pass gives a quadratically
+    # convergent eigenvalue estimate from the already-converged eigenvectors.
+    # (V * (A @ V)).sum(0) computes v_j^T (A v_j) for each column j without
+    # allocating an n×n intermediate. Improves FP32 rounding in the tridiagonal
+    # QR iteration, especially for n ≥ 64 where accumulation drifts.
+    AV = A @ V
+    eigenvalues = (V * AV).sum(dim=0)
+
     idx = torch.argsort(eigenvalues)
     return eigenvalues[idx], V[:, idx]

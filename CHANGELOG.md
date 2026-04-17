@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`inv_sqrt_spd_ns` uses `trnblas.gemm`** for the three O(n³) GEMMs in the
+  Newton-Schulz loop (`Z@Y`, `Y@T`, `T@Z`, convergence `Y@Z`) when trnblas is
+  installed (#14, #25). `trnblas.gemm` dispatches to the blocked NKI GEMM
+  kernel on Trainium; falls back to `torch.matmul` otherwise. The O(n²)
+  scalar combination `T = 1.5I − 0.5(Z@Y)` stays host-side (no systolic
+  advantage). Closes #14.
+
+- **CG and GMRES inner products promoted to FP64** (#27). `torch.dot(r, z)`
+  calls in `cg()` (lines 76, 80, 94) and the Modified Gram-Schmidt inner
+  products in `gmres()` now cast operands to `torch.float64` before the dot,
+  returning a Python float. Working tensors remain FP32; only the scalar
+  accumulations gain double precision. Equivalent to Kahan compensation for
+  FP32 inputs without a per-element Python loop. Closes #27 (Kahan item).
+
+- **Rayleigh-quotient eigenvalue refinement** in `_householder_qr_eigh` (#27).
+  After assembling eigenvectors V from Householder reflectors + Givens
+  rotations, one pass `w = (V * (A @ V)).sum(dim=0)` replaces the QR-iteration
+  eigenvalue estimates with Rayleigh quotients. These are quadratically
+  convergent from the eigenvector approximation and correct FP32 rounding
+  drift that accumulates in the tridiagonal QR iteration at n ≥ 64.
+  No API change; no extra allocation (element-wise multiply avoids n×n
+  intermediate). Closes #27 (refinement item).
+
 ## [0.4.1] — 2026-04-17
 
 ### Changed

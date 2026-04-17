@@ -73,11 +73,11 @@ def cg(
     z = precond(r) if precond is not None else r.clone()
 
     p = z.clone()
-    rz = torch.dot(r, z).item()
+    rz = float(r.to(torch.float64).dot(z.to(torch.float64)))
 
     for k in range(maxiter):
         Ap = matvec(p)
-        pAp = torch.dot(p, Ap).item()
+        pAp = float(p.to(torch.float64).dot(Ap.to(torch.float64)))
         if abs(pAp) < 1e-30:
             break
 
@@ -91,7 +91,7 @@ def cg(
 
         z = precond(r) if precond is not None else r.clone()
 
-        rz_new = torch.dot(r, z).item()
+        rz_new = float(r.to(torch.float64).dot(z.to(torch.float64)))
         beta = rz_new / rz
         p = z + beta * p
         rz = rz_new
@@ -154,9 +154,9 @@ def gmres(
             total_iters += 1
             w = matvec(V[:, j])
 
-            # Modified Gram-Schmidt
+            # Modified Gram-Schmidt — FP64 inner products for numerical stability
             for i in range(j + 1):
-                H[i, j] = torch.dot(w, V[:, i])
+                H[i, j] = float(w.to(torch.float64).dot(V[:, i].to(torch.float64)))
                 w = w - H[i, j] * V[:, i]
 
             H[j + 1, j] = torch.linalg.norm(w)
