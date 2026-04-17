@@ -14,6 +14,8 @@ from collections.abc import Callable
 
 import torch
 
+from .factor import _restore, _to_fp32
+
 
 def jacobi_preconditioner(A: torch.Tensor) -> Callable[[torch.Tensor], torch.Tensor]:
     """Build a Jacobi (diagonal) preconditioner M(r) = r / diag(A).
@@ -54,6 +56,7 @@ def block_jacobi_preconditioner(
     Raises:
         ValueError: If any diagonal block is not positive definite.
     """
+    A, _ = _to_fp32(A)
     n = A.shape[0]
     blocks = []
     start = 0
@@ -70,10 +73,11 @@ def block_jacobi_preconditioner(
         start = end
 
     def apply(r: torch.Tensor) -> torch.Tensor:
-        z = torch.empty_like(r)
+        r_fp32, r_orig = _to_fp32(r)
+        z = torch.empty_like(r_fp32)
         for s, e, L in blocks:
-            z[s:e] = torch.cholesky_solve(r[s:e].unsqueeze(1), L).squeeze(1)
-        return z
+            z[s:e] = torch.cholesky_solve(r_fp32[s:e].unsqueeze(1), L).squeeze(1)
+        return _restore(z, r_orig)
 
     return apply
 
@@ -103,6 +107,11 @@ def cg(
         iters: Number of iterations
         residual: Final relative residual norm
     """
+    b, orig = _to_fp32(b)
+    if not callable(A):
+        A = A.to(b.dtype)
+    if x0 is not None:
+        x0 = x0.to(b.dtype)
     n = b.shape[0]
     matvec = A if callable(A) else lambda x: torch.mv(A, x)
     if M is None:
@@ -118,7 +127,7 @@ def cg(
     r = b - matvec(x)
     b_norm = torch.linalg.norm(b).item()
     if b_norm < 1e-15:
-        return x, 0, 0.0
+        return _restore(x, orig), 0, 0.0
 
     z = precond(r) if precond is not None else r.clone()
 
@@ -137,7 +146,7 @@ def cg(
 
         r_norm = torch.linalg.norm(r).item()
         if r_norm / b_norm < tol:
-            return x, k + 1, r_norm / b_norm
+            return _restore(x, orig), k + 1, r_norm / b_norm
 
         z = precond(r) if precond is not None else r.clone()
 
@@ -146,7 +155,7 @@ def cg(
         p = z + beta * p
         rz = rz_new
 
-    return x, maxiter, torch.linalg.norm(r).item() / b_norm
+    return _restore(x, orig), maxiter, torch.linalg.norm(r).item() / b_norm
 
 
 def gmres(
@@ -176,13 +185,18 @@ def gmres(
         total_iters: Total matvec count
         residual: Final relative residual norm
     """
+    b, orig = _to_fp32(b)
+    if not callable(A):
+        A = A.to(b.dtype)
+    if x0 is not None:
+        x0 = x0.to(b.dtype)
     n = b.shape[0]
     matvec = A if callable(A) else lambda x: torch.mv(A, x)
 
     x = x0.clone() if x0 is not None else torch.zeros(n, dtype=b.dtype, device=b.device)
     b_norm = torch.linalg.norm(b).item()
     if b_norm < 1e-15:
-        return x, 0, 0.0
+        return _restore(x, orig), 0, 0.0
 
     total_iters = 0
 
@@ -190,7 +204,7 @@ def gmres(
         r = b - matvec(x)
         r_norm = torch.linalg.norm(r).item()
         if r_norm / b_norm < tol:
-            return x, total_iters, r_norm / b_norm
+            return _restore(x, orig), total_iters, r_norm / b_norm
 
         # Arnoldi process
         m = min(restart, n)
@@ -223,4 +237,4 @@ def gmres(
         x = x + V[:, :m] @ y[:m]
 
     r = b - matvec(x)
-    return x, total_iters, torch.linalg.norm(r).item() / b_norm
+    return _restore(x, orig), total_iters, torch.linalg.norm(r).item() / b_norm

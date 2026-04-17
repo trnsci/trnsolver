@@ -25,6 +25,7 @@ import math
 
 import torch
 
+from .factor import _restore, _to_fp32
 from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki, _use_simulator
 
 
@@ -42,14 +43,17 @@ def eigh(
         eigenvalues: (n,) sorted ascending
         eigenvectors: (n, n) columns are eigenvectors
     """
+    A, orig = _to_fp32(A)
     if _use_nki():
         try:
-            return _householder_qr_eigh(A, tol)
+            w, V = _householder_qr_eigh(A, tol)
         except Exception:
             if _REQUIRE_NKI:
                 raise
-            return _torch_eigh(A)
-    return _torch_eigh(A)
+            w, V = _torch_eigh(A)
+    else:
+        w, V = _torch_eigh(A)
+    return _restore(w, orig), _restore(V, orig)
 
 
 def eigh_generalized(
@@ -69,6 +73,9 @@ def eigh_generalized(
     otherwise. The inner eigh call dispatches to NKI per backend setting.
     Closes #11.
     """
+    A, orig = _to_fp32(A)
+    B = B.to(A.dtype)
+
     try:
         import trnblas as _tb
     except ImportError:
@@ -93,7 +100,7 @@ def eigh_generalized(
     else:
         eigenvectors = torch.linalg.solve_triangular(L.T, V_prime, upper=True)
 
-    return eigenvalues, eigenvectors
+    return _restore(eigenvalues, orig), _restore(eigenvectors, orig)
 
 
 def _torch_eigh(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

@@ -76,6 +76,8 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 
 ## Status
 
+**v0.7.0** — BF16/FP16 dtype support across the full public API (#19). All entry points (`cholesky`, `lu`, `qr`, `solve`, `solve_spd`, `inv_spd`, `pinv`, `inv_sqrt_spd`, `inv_sqrt_spd_ns`, `eigh`, `eigh_generalized`, `cg`, `gmres`, `block_jacobi_preconditioner`) accept BF16/FP16 inputs, upcast to FP32 internally, and restore the original dtype on output.
+
 **v0.6.0** — `eigh` subspace rotation refinement: one Rayleigh-Ritz step (V^T A V re-diagonalization) after Householder-QR reduces eigenvector residuals by 1–2 orders of magnitude for n ≥ 64 (#31). `solve_spd` gains `iterative_refinement=True`: mixed-precision FP64 residual + second Cholesky solve for SPD systems with cond up to ~1e7 (#32).
 
 **API coverage:**
@@ -93,7 +95,8 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 - **v0.4.1** — `eigh_generalized` NKI triangular-solve path via `trnblas.trsm` (#11)
 - **v0.5.0** — Newton-Schulz trnblas.gemm (#14), FP64 CG/GMRES dots + Rayleigh refinement (#27), block-Jacobi (#16), `pinv` (#22)
 - **v0.6.0** — eigh subspace rotation refinement (#31), solve_spd iterative refinement (#32)
-- **v0.7.0+** — SSOR preconditioner, BF16/FP16 across the API (#19), multi-NeuronCore parallel Jacobi (#20)
+- **v0.7.0** — BF16/FP16 across the full API (#19) ✓
+- **v0.8.0+** — SSOR preconditioner, multi-NeuronCore parallel Jacobi (#20)
 
 ## Operations
 
@@ -129,7 +132,7 @@ All six siblings are on PyPI, along with the umbrella meta-package:
 | [trnfft](https://github.com/trnsci/trnfft) | FFT and complex-valued tensors | v0.8.0 |
 | [trnblas](https://github.com/trnsci/trnblas) | BLAS Level 1–3 | v0.4.0 |
 | [trnrand](https://github.com/trnsci/trnrand) | Philox / Sobol / Halton RNG | v0.1.0 |
-| trnsolver | Linear solvers and eigendecomposition | **v0.6.0** |
+| trnsolver | Linear solvers and eigendecomposition | **v0.7.0** |
 | [trnsparse](https://github.com/trnsci/trnsparse) | Sparse matrix operations | v0.1.1 |
 | [trntensor](https://github.com/trnsci/trntensor) | Tensor contractions (einsum, TT/Tucker) | v0.1.1 |
 

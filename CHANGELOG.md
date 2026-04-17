@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-04-17
+
+### Added
+
+- **BF16/FP16 dtype support across the public API** (#19). All entry points
+  (`cholesky`, `lu`, `qr`, `solve`, `solve_spd`, `inv_spd`, `pinv`,
+  `inv_sqrt_spd`, `inv_sqrt_spd_ns`, `eigh`, `eigh_generalized`, `cg`,
+  `gmres`, `block_jacobi_preconditioner`) now accept `torch.bfloat16` and
+  `torch.float16` inputs. A thin promotion shim (`_to_fp32` / `_restore` in
+  `factor.py`) upcasts BF16/FP16 to FP32 at each public API boundary,
+  runs the existing FP32 computation path unchanged, and downcasts the
+  output back to the original dtype before returning. FP32/FP64 inputs
+  pass through with zero overhead. `block_jacobi_preconditioner` upcasts
+  during factory (block Cholesky in FP32), and the returned closure
+  upcasts its residual argument and restores the output dtype.
+  New test module `tests/test_dtype.py` exercises every covered entry
+  point with both BF16 and FP16 via `pytest.mark.parametrize`. Closes #19.
+
 ## [0.6.0] — 2026-04-17
 
 ### Changed
