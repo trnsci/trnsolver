@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-04-17
+
+### Added
+
+- **`ssor_preconditioner(A, omega=1.0)`** in `trnsolver.iterative`. SSOR
+  (Symmetric Successive Over-Relaxation) preconditioner for symmetric positive
+  definite A. Applies M^{-1} r via three steps: (1) forward triangular solve
+  (D + ω L) t = r, (2) diagonal scaling v = ω(2-ω) diag(A) ⊙ t, (3) backward
+  triangular solve (D + ω L^T) z = v. At ω = 1 this reduces to the symmetric
+  Gauss-Seidel step. M_SSOR is SPD when A is SPD and ω ∈ (0, 2), so it is safe
+  as a CG preconditioner. SSOR outperforms scalar Jacobi on matrices with
+  off-diagonal coupling (1D Laplacian, FEM stiffness, density-fitting metrics).
+  BF16/FP16 inputs are promoted to FP32 in both the factory and the returned
+  closure (consistent with the dtype-promotion pattern in #19). Adds the final
+  preconditioner item from the Phase 3 tracker (#28); SSOR benchmark added to
+  `benchmarks/bench_solver.py`.
+
 ## [0.7.0] — 2026-04-17
 
 ### Added

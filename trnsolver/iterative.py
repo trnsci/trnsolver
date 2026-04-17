@@ -82,6 +82,56 @@ def block_jacobi_preconditioner(
     return apply
 
 
+def ssor_preconditioner(
+    A: torch.Tensor,
+    omega: float = 1.0,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Build an SSOR preconditioner for symmetric positive definite A.
+
+    For symmetric A = D + L + L^T (D diagonal, L strictly lower triangular),
+    the SSOR preconditioner with relaxation ω ∈ (0, 2) applies M^{-1} r via:
+      1. Forward solve:  (D + ω L) t = r
+      2. Scale:          v = ω(2-ω) * diag(A) ⊙ t
+      3. Backward solve: (D + ω L^T) z = v
+
+    At ω = 1 this reduces to the symmetric Gauss-Seidel step. M_SSOR is SPD
+    when A is SPD and ω ∈ (0, 2), so it is safe as a CG preconditioner.
+
+    SSOR outperforms scalar Jacobi on matrices with off-diagonal coupling —
+    FEM stiffness matrices, Poisson-like systems, and density-fitting metrics
+    with neighbour-basis coupling.
+
+    Args:
+        A: Symmetric positive definite matrix (n, n).
+        omega: Relaxation parameter in (0, 2). Default 1.0 (symmetric Gauss-Seidel).
+
+    Returns:
+        Callable M(r) → approx A^{-1} @ r for use as M= argument to `cg`.
+
+    Raises:
+        ValueError: If omega is not in (0, 2) or the diagonal has near-zero entries.
+    """
+    if not (0.0 < omega < 2.0):
+        raise ValueError(f"ssor_preconditioner: omega must be in (0, 2), got {omega}")
+    A, _ = _to_fp32(A)
+    d = torch.diagonal(A).clone()
+    if torch.any(d.abs() < 1e-15):
+        raise ValueError("ssor_preconditioner: diagonal has near-zero entries")
+    # Lower triangular factor: D + ω * L_strictly_lower
+    L_factor = omega * torch.tril(A, diagonal=-1) + torch.diag(d)
+    U_factor = L_factor.T  # valid for symmetric A
+    dscale = omega * (2.0 - omega) * d
+
+    def apply(r: torch.Tensor) -> torch.Tensor:
+        r_fp32, r_orig = _to_fp32(r)
+        t = torch.linalg.solve_triangular(L_factor, r_fp32.unsqueeze(-1), upper=False).squeeze(-1)
+        v = dscale * t
+        z = torch.linalg.solve_triangular(U_factor, v.unsqueeze(-1), upper=True).squeeze(-1)
+        return _restore(z, r_orig)
+
+    return apply
+
+
 def cg(
     A: torch.Tensor | Callable,
     b: torch.Tensor,

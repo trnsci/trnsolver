@@ -57,7 +57,8 @@ Ap = trnsolver.pinv(A)
 # Iterative solvers with preconditioners
 precond = trnsolver.jacobi_preconditioner(A)
 blk_precond = trnsolver.block_jacobi_preconditioner(A, block_size=16)
-x, iters, res = trnsolver.cg(A, b, M=blk_precond, tol=1e-8)
+ssor_precond = trnsolver.ssor_preconditioner(A, omega=1.0)  # symmetric Gauss-Seidel
+x, iters, res = trnsolver.cg(A, b, M=ssor_precond, tol=1e-8)
 x, iters, res = trnsolver.gmres(A, b, tol=1e-6)
 ```
 
@@ -76,6 +77,8 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 
 ## Status
 
+**v0.8.0** — `ssor_preconditioner(A, omega=1.0)` (#28). SSOR preconditioner for SPD systems: two triangular solves + diagonal scaling per application. Outperforms scalar Jacobi on coupled matrices (1D Laplacian, FEM stiffness). ω ∈ (0, 2); ω=1 is symmetric Gauss-Seidel.
+
 **v0.7.0** — BF16/FP16 dtype support across the full public API (#19). All entry points (`cholesky`, `lu`, `qr`, `solve`, `solve_spd`, `inv_spd`, `pinv`, `inv_sqrt_spd`, `inv_sqrt_spd_ns`, `eigh`, `eigh_generalized`, `cg`, `gmres`, `block_jacobi_preconditioner`) accept BF16/FP16 inputs, upcast to FP32 internally, and restore the original dtype on output.
 
 **v0.6.0** — `eigh` subspace rotation refinement: one Rayleigh-Ritz step (V^T A V re-diagonalization) after Householder-QR reduces eigenvector residuals by 1–2 orders of magnitude for n ≥ 64 (#31). `solve_spd` gains `iterative_refinement=True`: mixed-precision FP64 residual + second Cholesky solve for SPD systems with cond up to ~1e7 (#32).
@@ -87,8 +90,8 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 | Eigensolvers | `eigh`, `eigh_generalized` | `svd` (Jacobi-SVD, Phase 3) |
 | Factorizations | `cholesky`, `lu`, `qr`, `pinv` | `schur` (implicit-shift QR, Phase 3) |
 | Direct solvers | `solve`, `solve_spd`, `inv_spd`, `inv_sqrt_spd`, `inv_sqrt_spd_ns` | — |
-| Iterative | `cg` (w/ preconditioner), `gmres` | SSOR (#16, v0.6.0) |
-| Preconditioners | `jacobi_preconditioner`, `block_jacobi_preconditioner` | SSOR (v0.6.0) |
+| Iterative | `cg` (w/ preconditioner), `gmres` | — |
+| Preconditioners | `jacobi_preconditioner`, `block_jacobi_preconditioner`, `ssor_preconditioner` | — |
 
 **Roadmap:**
 - **v0.4.0** — NKI Householder-QR `eigh` validated on trn1.2xlarge (#9, #12, #38)
@@ -96,7 +99,8 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 - **v0.5.0** — Newton-Schulz trnblas.gemm (#14), FP64 CG/GMRES dots + Rayleigh refinement (#27), block-Jacobi (#16), `pinv` (#22)
 - **v0.6.0** — eigh subspace rotation refinement (#31), solve_spd iterative refinement (#32)
 - **v0.7.0** — BF16/FP16 across the full API (#19) ✓
-- **v0.8.0+** — SSOR preconditioner, multi-NeuronCore parallel Jacobi (#20)
+- **v0.8.0** — SSOR preconditioner (#28) ✓
+- **v0.9.0+** — multi-NeuronCore parallel Jacobi (#20)
 
 ## Operations
 
@@ -117,6 +121,7 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 | Iterative | `gmres` | GMRES (general systems) |
 | Iterative | `jacobi_preconditioner` | Diagonal preconditioner for CG |
 | Iterative | `block_jacobi_preconditioner` | Block-diagonal Cholesky preconditioner for CG |
+| Iterative | `ssor_preconditioner` | SSOR / symmetric Gauss-Seidel preconditioner for CG |
 
 ## Benchmarks
 
@@ -132,7 +137,7 @@ All six siblings are on PyPI, along with the umbrella meta-package:
 | [trnfft](https://github.com/trnsci/trnfft) | FFT and complex-valued tensors | v0.8.0 |
 | [trnblas](https://github.com/trnsci/trnblas) | BLAS Level 1–3 | v0.4.0 |
 | [trnrand](https://github.com/trnsci/trnrand) | Philox / Sobol / Halton RNG | v0.1.0 |
-| trnsolver | Linear solvers and eigendecomposition | **v0.7.0** |
+| trnsolver | Linear solvers and eigendecomposition | **v0.8.0** |
 | [trnsparse](https://github.com/trnsci/trnsparse) | Sparse matrix operations | v0.1.1 |
 | [trntensor](https://github.com/trnsci/trntensor) | Tensor contractions (einsum, TT/Tucker) | v0.1.1 |
 

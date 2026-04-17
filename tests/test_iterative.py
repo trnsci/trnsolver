@@ -115,6 +115,72 @@ class TestBlockJacobiPreconditioner:
         np.testing.assert_allclose(M_block1(r).numpy(), M_scalar(r).numpy(), atol=1e-6)
 
 
+class TestSSORPreconditioner:
+    def test_reduces_iterations_vs_jacobi(self):
+        # 1D Laplacian — classical test case where symmetric Gauss-Seidel (omega=1)
+        # beats scalar Jacobi in CG iteration count.
+        n = 64
+        ones = torch.ones(n - 1)
+        A = 2 * torch.eye(n) - torch.diag(ones, 1) - torch.diag(ones, -1)
+        b = torch.randn(n)
+
+        M_jac = trnsolver.jacobi_preconditioner(A)
+        M_ssor = trnsolver.ssor_preconditioner(A, omega=1.0)
+
+        _, iters_jac, _ = trnsolver.cg(A, b, tol=1e-8, maxiter=500, M=M_jac)
+        _, iters_ssor, _ = trnsolver.cg(A, b, tol=1e-8, maxiter=500, M=M_ssor)
+
+        assert iters_ssor < iters_jac
+
+    def test_omega_1_converges(self, spd_matrix):
+        n = 16
+        A = spd_matrix(n)
+        b = torch.randn(n)
+        M = trnsolver.ssor_preconditioner(A, omega=1.0)
+        x, iters, res = trnsolver.cg(A, b, tol=1e-8, maxiter=200, M=M)
+        assert res < 1e-7
+        assert iters > 0
+
+    def test_omega_range(self, spd_matrix):
+        n = 16
+        A = spd_matrix(n)
+        b = torch.randn(n)
+        for omega in (0.5, 1.5):
+            M = trnsolver.ssor_preconditioner(A, omega=omega)
+            _, iters, res = trnsolver.cg(A, b, tol=1e-6, maxiter=200, M=M)
+            assert res < 1e-5, f"omega={omega} did not converge: res={res}"
+
+    def test_invalid_omega(self, spd_matrix):
+        A = spd_matrix(8)
+        with pytest.raises(ValueError, match="omega"):
+            trnsolver.ssor_preconditioner(A, omega=0.0)
+        with pytest.raises(ValueError, match="omega"):
+            trnsolver.ssor_preconditioner(A, omega=2.0)
+
+    def test_apply_matches_manual(self):
+        # Small n=4 case: manually compute forward/backward solve and compare.
+        torch.manual_seed(5)
+        n = 4
+        Q, _ = torch.linalg.qr(torch.randn(n, n))
+        A = Q @ torch.diag(torch.tensor([1.0, 2.0, 3.0, 4.0])) @ Q.T
+        r = torch.randn(n)
+        omega = 1.0
+
+        d = torch.diagonal(A)
+        L_factor = omega * torch.tril(A, diagonal=-1) + torch.diag(d)
+        U_factor = L_factor.T
+        dscale = omega * (2.0 - omega) * d
+
+        t = torch.linalg.solve_triangular(L_factor, r.unsqueeze(-1), upper=False).squeeze(-1)
+        v = dscale * t
+        z_ref = torch.linalg.solve_triangular(U_factor, v.unsqueeze(-1), upper=True).squeeze(-1)
+
+        M = trnsolver.ssor_preconditioner(A, omega=omega)
+        z = M(r)
+
+        np.testing.assert_allclose(z.numpy(), z_ref.numpy(), atol=1e-6)
+
+
 class TestGMRES:
     def test_identity(self):
         A = torch.eye(4)

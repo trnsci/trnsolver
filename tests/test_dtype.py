@@ -162,3 +162,13 @@ class TestLowPrecisionDtype:
         assert x.dtype == dtype
         x_ref, _, _ = trnsolver.gmres(A_fp32, b_fp32, tol=1e-4)
         assert torch.allclose(x.float(), x_ref, atol=2e-1, rtol=1e-1)
+
+    def test_ssor(self, dtype):
+        A_fp32 = _make_spd(16)
+        b_fp32 = torch.randn(16)
+        A = A_fp32.to(dtype)
+        b = b_fp32.to(dtype)
+        M = trnsolver.ssor_preconditioner(A)
+        x, iters, res = trnsolver.cg(A, b, M=M, tol=1e-4)
+        assert x.dtype == dtype
+        assert iters > 0

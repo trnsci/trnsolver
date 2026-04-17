@@ -135,6 +135,10 @@ class TestCG:
         M = trnsolver.jacobi_preconditioner(spd_matrix)
         benchmark(trnsolver.cg, spd_matrix, random_vector, M=M)
 
+    def test_cg_ssor_precond(self, benchmark, spd_matrix, random_vector):
+        M = trnsolver.ssor_preconditioner(spd_matrix)
+        benchmark(trnsolver.cg, spd_matrix, random_vector, M=M)
+
 
 class TestGMRES:
     def test_gmres(self, benchmark, random_matrix, random_vector):
