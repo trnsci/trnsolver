@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-04-17
+
 ### Changed
 
 - **`eigh_generalized` triangular solves use `trnblas.trsm`** when trnblas is
@@ -14,17 +16,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Trainium; falls back to `torch.linalg.solve_triangular` on CPU or when
   trnblas is absent. The inner `eigh` call already dispatches to NKI, so
   this closes the last remaining PyTorch-only step in the NKI generalized
-  eigensolver path. Closes #11.
+  eigensolver path. Validated on trn1.2xlarge: `test_eigh_generalized` passes
+  (n=16, rtol=1e-2) with trnblas installed. Closes #11.
 
 - **`matvec_kernel` Tensor Engine attempt reverted** (#36). `nisa.nc_matmul`
   requires the `moving` operand's free dimension to meet a minimum tile width
   that a (n, 1) vector (free_dim=1) does not satisfy. The neuronxcc-2.24
-  compiler and the NKI 0.3.0 simulator both reject the call. Kernel reverts
+  compiler and the NKI 0.3.0 simulator both reject the call with
+  "nc_matmul() missing value for required argument 'moving'". Kernel reverts
   to the Vector-Engine broadcast+sum idiom validated in v0.4.0. The
   `matvec_kernel_sim` alias is retained for dispatch clarity.
   Tensor Engine matvec is deferred until the SDK documents the minimum
   free-dim constraint or the algorithm batches multiple vectors per call.
   Investigation recorded in #36.
+
+- **Hardware re-validated** on trn1.2xlarge (NKI 0.3.0 / neuronxcc 2.24):
+  14/14 `@pytest.mark.neuron` tests pass in 36 s wall-clock. Includes
+  `test_eigh_generalized` with trnblas TRSM path. Closes #11. Closes #36
+  (matvec investigation complete; Vector Engine path retained).
 
 ## [0.4.0] — 2026-04-16
 
