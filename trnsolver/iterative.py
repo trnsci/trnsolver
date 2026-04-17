@@ -28,6 +28,56 @@ def jacobi_preconditioner(A: torch.Tensor) -> Callable[[torch.Tensor], torch.Ten
     return lambda r: r * inv_d
 
 
+def block_jacobi_preconditioner(
+    A: torch.Tensor,
+    block_size: int = 16,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Build a block-Jacobi preconditioner from diagonal blocks of A.
+
+    Each diagonal block of size `block_size` is Cholesky-factorized
+    independently. Applying the preconditioner solves the block-diagonal
+    system exactly via back-substitution. More effective than scalar Jacobi
+    for problems with localized coupling (FEM stiffness matrices,
+    density-fitting metric matrices with nearby-basis-function coupling).
+
+    Architecturally, per-block Cholesky solves are independent and map
+    naturally to NeuronCore-parallel execution on Trainium.
+
+    Args:
+        A: Symmetric positive definite matrix (n, n).
+        block_size: Diagonal block size. Last block may be smaller.
+            block_size >= n reduces to a full Cholesky preconditioner.
+
+    Returns:
+        Callable M(r) → approx A^{-1} @ r for use as M= argument to `cg`.
+
+    Raises:
+        ValueError: If any diagonal block is not positive definite.
+    """
+    n = A.shape[0]
+    blocks = []
+    start = 0
+    while start < n:
+        end = min(start + block_size, n)
+        block = A[start:end, start:end].clone()
+        try:
+            L = torch.linalg.cholesky(block)
+        except torch.linalg.LinAlgError as exc:
+            raise ValueError(
+                f"block_jacobi_preconditioner: block [{start}:{end}] is not positive definite"
+            ) from exc
+        blocks.append((start, end, L))
+        start = end
+
+    def apply(r: torch.Tensor) -> torch.Tensor:
+        z = torch.empty_like(r)
+        for s, e, L in blocks:
+            z[s:e] = torch.cholesky_solve(r[s:e].unsqueeze(1), L).squeeze(1)
+        return z
+
+    return apply
+
+
 def cg(
     A: torch.Tensor | Callable,
     b: torch.Tensor,

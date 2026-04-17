@@ -51,9 +51,13 @@ x = trnsolver.solve_spd(A, b)
 M = trnsolver.inv_sqrt_spd(A)                            # eigendecomposition-based
 M, iters, res = trnsolver.inv_sqrt_spd_ns(A, tol=1e-8)   # Newton-Schulz, all-GEMM
 
+# Pseudoinverse (Moore-Penrose, truncated SVD)
+Ap = trnsolver.pinv(A)
+
 # Iterative solvers with preconditioners
 precond = trnsolver.jacobi_preconditioner(A)
-x, iters, res = trnsolver.cg(A, b, M=precond, tol=1e-8)
+blk_precond = trnsolver.block_jacobi_preconditioner(A, block_size=16)
+x, iters, res = trnsolver.cg(A, b, M=blk_precond, tol=1e-8)
 x, iters, res = trnsolver.gmres(A, b, tol=1e-6)
 ```
 
@@ -72,22 +76,23 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 
 ## Status
 
-**v0.4.0** — NKI Householder-QR `eigh` validated on trn1.2xlarge (NKI 0.3.0). 14/14 hardware tests pass. `set_backend("auto")` dispatches to the NKI path for n ≤ 128 on Neuron devices.
+**v0.5.0** — Newton-Schulz `inv_sqrt_spd_ns` accelerated via `trnblas.gemm` (#14). FP64 inner products in CG/GMRES (#27). Rayleigh-quotient eigenvalue refinement (#27). Block-Jacobi preconditioner (#16). Moore-Penrose `pinv` via truncated SVD (#22). 14/14 hardware tests pass on trn1.2xlarge (NKI 0.3.0).
 
 **API coverage:**
 
-| Category | Shipped (v0.4.0) | Deferred |
+| Category | Shipped (v0.5.0) | Deferred |
 |----------|------------------|----------|
-| Eigensolvers | `eigh`, `eigh_generalized` | `svd` (Jacobi-SVD target for v0.5.0) |
-| Factorizations | `cholesky`, `lu`, `qr` | `schur`, `pinv` (see #22) |
+| Eigensolvers | `eigh`, `eigh_generalized` | `svd` (Jacobi-SVD, Phase 3) |
+| Factorizations | `cholesky`, `lu`, `qr`, `pinv` | `schur` (implicit-shift QR, Phase 3) |
 | Direct solvers | `solve`, `solve_spd`, `inv_spd`, `inv_sqrt_spd`, `inv_sqrt_spd_ns` | — |
-| Iterative | `cg` (w/ preconditioner), `gmres` | IC0/SSOR/block-Jacobi (#16) |
-| Preconditioners | `jacobi_preconditioner` | See #16 |
+| Iterative | `cg` (w/ preconditioner), `gmres` | SSOR (#16, v0.6.0) |
+| Preconditioners | `jacobi_preconditioner`, `block_jacobi_preconditioner` | SSOR (v0.6.0) |
 
 **Roadmap:**
-- **v0.4.0** — NKI Jacobi rotation kernel validated on trn1.2xlarge (#9, #12)
-- **v0.5.0** — Newton-Schulz NKI backend via trnblas GEMM (#14, #25), preconditioner expansion (#16), scipy.linalg parity audit (#22)
-- **v0.6.0+** — BF16/FP16 across the API (#19), multi-NeuronCore parallel Jacobi sweep (#20)
+- **v0.4.0** — NKI Householder-QR `eigh` validated on trn1.2xlarge (#9, #12, #38)
+- **v0.4.1** — `eigh_generalized` NKI triangular-solve path via `trnblas.trsm` (#11)
+- **v0.5.0** — Newton-Schulz trnblas.gemm (#14), FP64 CG/GMRES dots + Rayleigh refinement (#27), block-Jacobi (#16), `pinv` (#22)
+- **v0.6.0+** — SSOR preconditioner (#16), BF16/FP16 across the API (#19), multi-NeuronCore parallel Jacobi (#20)
 
 ## Operations
 
@@ -98,6 +103,7 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 | Factor | `cholesky` | `A = LL^T` |
 | Factor | `lu` | `PA = LU` |
 | Factor | `qr` | `A = QR` |
+| Factor | `pinv` | Moore-Penrose pseudoinverse (truncated SVD) |
 | Solve | `solve` | `Ax = b` (LU-based) |
 | Solve | `solve_spd` | `Ax = b` (Cholesky, A is SPD) |
 | Solve | `inv_spd` | `A^{-1}` for SPD A |
@@ -106,6 +112,7 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 | Iterative | `cg` | Conjugate Gradient (SPD systems) |
 | Iterative | `gmres` | GMRES (general systems) |
 | Iterative | `jacobi_preconditioner` | Diagonal preconditioner for CG |
+| Iterative | `block_jacobi_preconditioner` | Block-diagonal Cholesky preconditioner for CG |
 
 ## Benchmarks
 
@@ -121,7 +128,7 @@ All six siblings are on PyPI, along with the umbrella meta-package:
 | [trnfft](https://github.com/trnsci/trnfft) | FFT and complex-valued tensors | v0.8.0 |
 | [trnblas](https://github.com/trnsci/trnblas) | BLAS Level 1–3 | v0.4.0 |
 | [trnrand](https://github.com/trnsci/trnrand) | Philox / Sobol / Halton RNG | v0.1.0 |
-| trnsolver | Linear solvers and eigendecomposition | **v0.3.0** |
+| trnsolver | Linear solvers and eigendecomposition | **v0.5.0** |
 | [trnsparse](https://github.com/trnsci/trnsparse) | Sparse matrix operations | v0.1.1 |
 | [trntensor](https://github.com/trnsci/trntensor) | Tensor contractions (einsum, TT/Tucker) | v0.1.1 |
 

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-04-17
+
+### Added
+
+- **`block_jacobi_preconditioner(A, block_size=16)`** in `trnsolver.iterative`
+  (#16). Cholesky-factorizes each diagonal block of size `block_size`
+  independently; applying the preconditioner solves the block-diagonal system
+  exactly via `torch.cholesky_solve`. More effective than scalar Jacobi for
+  matrices with localized coupling (FEM stiffness, density-fitting metric).
+  `block_size=n` reduces to a full Cholesky preconditioner (exact solve).
+  `block_size=1` is numerically equivalent to `jacobi_preconditioner`.
+  Per-block Cholesky solves are independent and map naturally to
+  NeuronCore-parallel execution. Closes #16 (block-Jacobi item; IC0
+  degenerates to full Cholesky for dense matrices and is not added; SSOR
+  deferred to v0.6.0).
+
+- **`pinv(A, rcond=None)`** in `trnsolver.factor` (#22). Moore-Penrose
+  pseudoinverse via truncated SVD: `U, s, Vh = svd(A, full_matrices=False)`;
+  singular values ≤ `rcond * s[0]` are zeroed. Default `rcond = eps *
+  max(m, n)` matches numpy/scipy. Handles real and complex inputs via `.mH`
+  (conjugate transpose). Closes #22 (pinv item; schur decomposition requires a
+  full implicit-shift QR implementation and is deferred to Phase 3).
+
 ### Changed
 
 - **`inv_sqrt_spd_ns` uses `trnblas.gemm`** for the three O(n³) GEMMs in the

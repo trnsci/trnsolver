@@ -72,6 +72,49 @@ class TestCG:
         assert res < 1e-5
 
 
+class TestBlockJacobiPreconditioner:
+    def test_reduces_iterations_vs_diagonal(self):
+        # Block-tridiagonal-dominant matrix with 4×4 coupling blocks —
+        # scalar Jacobi misses off-diagonal coupling within the block.
+        torch.manual_seed(42)
+        n, bs = 64, 8
+        A = torch.zeros(n, n)
+        for i in range(0, n, bs):
+            e = min(i + bs, n)
+            blk = torch.randn(e - i, e - i)
+            blk = blk @ blk.T + bs * torch.eye(e - i)
+            A[i:e, i:e] = blk
+        b = torch.randn(n)
+
+        M_diag = trnsolver.jacobi_preconditioner(A)
+        M_blk = trnsolver.block_jacobi_preconditioner(A, block_size=bs)
+
+        _, iters_diag, _ = trnsolver.cg(A, b, tol=1e-8, maxiter=500, M=M_diag)
+        _, iters_blk, _ = trnsolver.cg(A, b, tol=1e-8, maxiter=500, M=M_blk)
+
+        assert iters_blk < iters_diag
+
+    def test_block_size_n_is_full_cholesky(self, spd_matrix):
+        # block_size=n → single block = full Cholesky → exact solve in 1 CG step
+        n = 16
+        A = spd_matrix(n)
+        b = torch.randn(n)
+        M = trnsolver.block_jacobi_preconditioner(A, block_size=n)
+        _, iters, res = trnsolver.cg(A, b, tol=1e-8, maxiter=50, M=M)
+        # Exact preconditioning → 1 step in theory; FP32 rounding allows 2.
+        assert iters <= 2
+        assert res < 1e-7
+
+    def test_block_size_1_matches_jacobi(self, spd_matrix):
+        # Single-element blocks == scalar Jacobi preconditioning
+        n = 16
+        A = spd_matrix(n)
+        r = torch.randn(n)
+        M_scalar = trnsolver.jacobi_preconditioner(A)
+        M_block1 = trnsolver.block_jacobi_preconditioner(A, block_size=1)
+        np.testing.assert_allclose(M_block1(r).numpy(), M_scalar(r).numpy(), atol=1e-6)
+
+
 class TestGMRES:
     def test_identity(self):
         A = torch.eye(4)

@@ -101,6 +101,35 @@ class TestInvSqrtSPD:
         np.testing.assert_allclose(product.numpy(), np.eye(n), atol=1e-3)
 
 
+class TestPinv:
+    def test_full_rank_square(self, spd_matrix):
+        n = 8
+        A = spd_matrix(n)
+        Ap = trnsolver.pinv(A)
+        # Moore-Penrose: A @ A^+ @ A == A
+        np.testing.assert_allclose((A @ Ap @ A).numpy(), A.numpy(), atol=1e-4)
+
+    def test_rank_deficient(self):
+        # Rank-1 matrix: outer product u v^T
+        u = torch.tensor([1.0, 2.0, 3.0])
+        v = torch.tensor([4.0, 5.0, 6.0])
+        A = u.unsqueeze(1) @ v.unsqueeze(0)  # (3, 3), rank 1
+        Ap = trnsolver.pinv(A)
+        # Moore-Penrose condition: A @ A^+ @ A == A
+        np.testing.assert_allclose((A @ Ap @ A).numpy(), A.numpy(), atol=1e-5)
+
+    def test_rcond_threshold(self):
+        # Two singular values: 1.0 and 1e-10; rcond=1e-6 zeroes the small one
+        U, _, Vh = torch.linalg.svd(torch.randn(4, 4))
+        s = torch.tensor([1.0, 0.5, 1e-10, 1e-12])
+        A = U[:, :4] @ torch.diag(s) @ Vh[:4, :]
+        Ap = trnsolver.pinv(A, rcond=1e-6)
+        # Pseudoinverse singular values should be ~1/1.0, ~1/0.5, then 0, 0
+        s_pinv = torch.linalg.svdvals(Ap)
+        assert s_pinv[0].item() > 1.5  # ~2.0 = 1/0.5
+        assert s_pinv[2].item() < 1e-3  # zeroed by rcond
+
+
 class TestInvSqrtSpdNS:
     def test_identity(self):
         A = 2.0 * torch.eye(4, dtype=torch.float64)

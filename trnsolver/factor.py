@@ -84,6 +84,30 @@ def inv_spd(A: torch.Tensor) -> torch.Tensor:
     return solve_spd(A, torch.eye(n, dtype=A.dtype, device=A.device))
 
 
+def pinv(A: torch.Tensor, rcond: float | None = None) -> torch.Tensor:
+    """Moore-Penrose pseudoinverse via truncated SVD.
+
+    For a full-rank square matrix this equals the ordinary inverse. For
+    rank-deficient or non-square matrices it gives the least-squares
+    minimum-norm solution operator.
+
+    Args:
+        A: Input matrix (m, n). Real or complex.
+        rcond: Singular value cutoff relative to the largest singular value.
+            Singular values s[i] <= rcond * s[0] are treated as zero.
+            Default: machine epsilon * max(m, n), matching numpy/scipy.
+
+    Returns:
+        A^+: Pseudoinverse (n, m).
+    """
+    U, s, Vh = torch.linalg.svd(A, full_matrices=False)
+    if rcond is None:
+        rcond = torch.finfo(s.dtype).eps * max(A.shape)
+    mask = s > rcond * s[0]
+    s_inv = torch.where(mask, 1.0 / s, torch.zeros_like(s))
+    return (Vh.mH * s_inv) @ U.mH
+
+
 def inv_sqrt_spd(A: torch.Tensor) -> torch.Tensor:
     """A^{-1/2} for symmetric positive definite A.
 
