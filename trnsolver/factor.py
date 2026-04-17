@@ -155,11 +155,11 @@ def inv_sqrt_spd_ns(
             # NKI-accelerated path: O(n³) GEMMs via trnblas (blocked NKI GEMM
             # on Trainium, torch.matmul fallback elsewhere). The O(n²) scalar
             # combination for T stays on the host — no systolic advantage there.
-            ZY = _tb.gemm(1.0, Z, Y)           # Z @ Y
-            T = 1.5 * eye_n - 0.5 * ZY         # 0.5*(3I - Z@Y), host O(n²)
-            Y = _tb.gemm(1.0, Y, T)             # Y @ T
-            Z = _tb.gemm(1.0, T, Z)             # T @ Z
-            YZ = _tb.gemm(1.0, Y, Z)            # Y @ Z  (convergence check)
+            ZY = _tb.gemm(1.0, Z, Y)  # Z @ Y
+            T = 1.5 * eye_n - 0.5 * ZY  # 0.5*(3I - Z@Y), host O(n²)
+            Y = _tb.gemm(1.0, Y, T)  # Y @ T
+            Z = _tb.gemm(1.0, T, Z)  # T @ Z
+            YZ = _tb.gemm(1.0, Y, Z)  # Y @ Z  (convergence check)
         else:
             T = 0.5 * (3.0 * eye_n - Z @ Y)
             Y = Y @ T
