@@ -59,10 +59,26 @@ def solve(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return torch.linalg.solve(A, B)
 
 
-def solve_spd(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+def solve_spd(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    iterative_refinement: bool = False,
+) -> torch.Tensor:
     """Solve A @ X = B where A is symmetric positive definite.
 
     Uses Cholesky factorization (faster than LU for SPD).
+
+    Args:
+        A: SPD matrix (n, n).
+        B: Right-hand side (n,) or (n, k).
+        iterative_refinement: If True, perform one step of iterative
+            refinement: compute the residual R = B - A @ X and apply a
+            second Cholesky solve for the correction dX = chol_solve(R).
+            Improves accuracy for ill-conditioned A at the cost of one
+            extra matvec and two triangular solves. Closes #32.
+
+    Returns:
+        X: Solution (same shape as B).
     """
     L = cholesky(A)
     squeeze = B.dim() == 1
@@ -70,6 +86,17 @@ def solve_spd(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         B = B.unsqueeze(1)
     Y = torch.linalg.solve_triangular(L, B, upper=False)
     X = torch.linalg.solve_triangular(L.T, Y, upper=True)
+    if iterative_refinement:
+        # Compute residual in FP64 to capture the low-order bits that the
+        # FP32 Cholesky solve missed. The correction dX is solved in FP32
+        # (reusing L), then cast back. This is standard mixed-precision
+        # iterative refinement: the FP64 residual is O(eps64 * cond(A))
+        # rather than O(eps32 * cond(A)), giving a reliable improvement
+        # for cond(A) up to ~1/eps32 ≈ 1e7.
+        R = (B.double() - A.double() @ X.double()).to(A.dtype)
+        dY = torch.linalg.solve_triangular(L, R, upper=False)
+        dX = torch.linalg.solve_triangular(L.T, dY, upper=True)
+        X = X + dX
     if squeeze:
         X = X.squeeze(1)
     return X

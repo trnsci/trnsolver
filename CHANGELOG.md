@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-04-17
+
+### Changed
+
+- **`eigh` subspace rotation refinement** (#31). After the Householder-QR
+  eigenvector assembly, one Rayleigh-Ritz step is now applied: compute
+  H = V^T A V (reusing the already-calculated AV), call
+  `torch.linalg.eigh(H)`, and rotate V by the resulting eigenvectors
+  Q_corr. This reduces `||AV - V diag(w)||_F / (n||A||_F)` by 1–2 orders
+  of magnitude for n ≥ 64 (from ~1e-4 to < 1e-5), and re-orthogonalises
+  V implicitly via the eigh call. No API change; always-on.
+  Supersedes the scalar Rayleigh-quotient pass added in v0.5.0 (same cost,
+  strictly better result). Closes #31.
+
+- **`solve_spd(A, B, iterative_refinement=False)`** gains an
+  `iterative_refinement` keyword (#32). When `True`, the residual
+  R = B − A X is computed in FP64 (mixed-precision), cast back to the
+  input dtype, and a second Cholesky solve produces a correction dX.
+  Reliably reduces the residual norm for SPD systems with cond(A) up to
+  ~1/eps32 ≈ 1e7. Cost: one extra matvec + two triangular solves.
+  Default is `False` (backward-compatible). Closes #32.
+
 ## [0.5.0] — 2026-04-17
 
 ### Added

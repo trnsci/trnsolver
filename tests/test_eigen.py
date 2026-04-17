@@ -48,6 +48,26 @@ class TestEigh:
         for i in range(len(vals) - 1):
             assert vals[i].item() <= vals[i + 1].item() + 1e-10
 
+    def test_residual_norm(self, spd_matrix):
+        """Subspace rotation should give ||AV - V diag(w)||_F / (n||A||) < 1e-5."""
+        n = 64
+        A = spd_matrix(n)
+        vals, vecs = trnsolver.eigh(A)
+        R = A @ vecs - vecs * vals
+        rel_res = torch.linalg.norm(R, ord="fro").item() / (
+            n * torch.linalg.norm(A, ord="fro").item()
+        )
+        assert rel_res < 1e-5, f"Relative residual {rel_res:.2e} exceeds 1e-5"
+
+    def test_orthogonality_tight(self, spd_matrix):
+        """Subspace rotation re-orthogonalises: ||V^T V - I||_F < 1e-5 at n=64."""
+        n = 64
+        A = spd_matrix(n)
+        _, vecs = trnsolver.eigh(A)
+        VtV = vecs.T @ vecs
+        err = torch.linalg.norm(VtV - torch.eye(n), ord="fro").item()
+        assert err < 1e-5, f"Orthogonality error {err:.2e} exceeds 1e-5"
+
 
 class TestEighGeneralized:
     def test_vs_standard(self, sym_matrix, spd_matrix):

@@ -85,6 +85,34 @@ class TestSolveSPD:
         residual = A @ x - b
         np.testing.assert_allclose(residual.numpy(), np.zeros(n), atol=1e-4)
 
+    def test_iterative_refinement_improves_residual(self):
+        # SPD matrix with cond ≈ 1e6 — large enough that the plain FP32
+        # Cholesky solve leaves a visible residual, but below 1/eps32 ≈ 1e7
+        # so the mixed-precision FP64 residual still captures the error.
+        torch.manual_seed(7)
+        n = 32
+        Q, _ = torch.linalg.qr(torch.randn(n, n))
+        eigs = torch.logspace(0, 6, n)  # cond ≈ 1e6
+        A = Q @ torch.diag(eigs) @ Q.T
+        A = 0.5 * (A + A.T)
+        b = torch.randn(n)
+
+        x_plain = trnsolver.solve_spd(A, b)
+        x_refined = trnsolver.solve_spd(A, b, iterative_refinement=True)
+
+        res_plain = torch.linalg.norm(A @ x_plain - b).item()
+        res_refined = torch.linalg.norm(A @ x_refined - b).item()
+        assert res_refined <= res_plain
+
+    def test_iterative_refinement_rhs_matrix(self, spd_matrix):
+        # iterative_refinement=True works for B of shape (n, k)
+        n, k = 16, 4
+        A = spd_matrix(n)
+        B = torch.randn(n, k)
+        X = trnsolver.solve_spd(A, B, iterative_refinement=True)
+        residual = A @ X - B
+        assert torch.linalg.norm(residual, ord="fro").item() < 1e-3
+
 
 class TestInvSqrtSPD:
     def test_identity(self):
