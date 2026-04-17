@@ -1,9 +1,9 @@
 """
 NKI dispatch for solver operations.
 
-Phase 3 kernels (option B from #38 — Householder-QR path for symmetric eigh):
+Phase 1 kernels (option B from #38 — Householder-QR path for symmetric eigh):
 
-    matvec_kernel(A, v)             → w = A @ v  [Tensor Engine via nc_matmul]
+    matvec_kernel(A, v)             → w = A @ v  [Vector Engine]
     rank2_update_kernel(A, u, v)    → A − u vᵀ − v uᵀ  [Vector Engine]
 
 Together they implement the per-step work of Householder tridiagonalization,
@@ -11,16 +11,19 @@ driven by `_householder_tridiag` in `trnsolver/eigen.py`. Eigenvalues +
 eigenvectors are finished by pure-host implicit-shift QR on the resulting
 tridiagonal (`_householder_qr_eigh`).
 
-matvec_kernel uses nisa.nc_matmul (Tensor Engine, PSUM FP32 accumulation).
-A is symmetric throughout tridiagonalization so A^T @ v = A @ v; the
-partition dim n is the contracting dim — exactly the case where the Tensor
-Engine wins over the Vector Engine.
+Both kernels use the Vector Engine broadcast+sum idiom, validated on
+hardware (trn1.2xlarge, NKI 0.3.0) in v0.4.0: 14/14 @pytest.mark.neuron
+tests pass at rtol=1e-3 for n ∈ {4, 8, 16, 32, 64, 128}.
 
-rank2_update_kernel stays on the Vector Engine: the outer products u @ vᵀ
-have contraction rank 1 (the partition dim = 1 path), which gives no
-systolic-array advantage. A future optimisation packs [u|v] into a (n, 2)
-tile and uses nc_matmul(X^T, Y^T) with partition=2 to compute the full
-rank-2 update in one call (tracked in #36).
+Tensor Engine investigation (#36): nisa.nc_matmul was attempted for
+matvec_kernel but rejected by both the simulator and neuronxcc-2.24 with
+"nc_matmul() missing value for required argument 'moving'". Root cause:
+NKI 0.3.0 requires the moving operand's free dimension to meet a minimum
+tile width (>> 1). A vector v of shape (n, 1) has free_dim=1, which is
+below that threshold. Tensor Engine matvec is deferred until the SDK
+documents the minimum free-dim constraint or the algorithm batches multiple
+vectors per call. rank2_update outer products (rank-1, partition=1) also
+offer no Tensor Engine advantage. #36 remains open as a tracking issue.
 
 Design-history note: the Jacobi path (`rotate_pairs_kernel`) that lived
 here before 2026-04-14 was replaced after the #9 post-mortem (classical
@@ -121,52 +124,7 @@ if HAS_NKI:
 
     @nki.jit
     def matvec_kernel(A, v):
-        """Matrix-vector product w = A @ v via the Tensor Engine.
-
-        nisa.nc_matmul(stationary, moving) computes stationary^T @ moving
-        using PSUM FP32 accumulation on the systolic array. The contraction
-        dimension is the partition dim of both tiles (n here), which is exactly
-        the case where the Tensor Engine wins over the Vector Engine.
-
-        A is symmetric throughout Householder tridiagonalization, so
-        A^T @ v = A @ v. We pass A as the stationary operand and v as the
-        moving operand; nc_matmul returns A^T @ v = A @ v directly.
-
-        Hardware path only. The NKI 0.3.0 simulator's context wrapper strips
-        the stationary operand before forwarding to the underlying nc_matmul
-        implementation, causing a TypeError. Use matvec_kernel_sim for the
-        nki.simulate path (see _call_matvec in eigen.py).
-
-        Args:
-            A : (n, n) FP32 in HBM. n ≤ 128 (single-tile).
-            v : (n, 1) FP32 in HBM.
-
-        Returns:
-            w : (n, 1) FP32 in HBM.
-        """
-        n = A.shape[0]
-
-        w = nl.ndarray((n, 1), dtype=A.dtype, buffer=nl.shared_hbm)
-
-        a_tile = nl.load(A[0:n, 0:n])  # (n, n): partition=n, free=n
-        v_tile = nl.load(v[0:n, 0:1])  # (n, 1): partition=n, free=1
-
-        # Tensor Engine: A^T @ v = A @ v (A symmetric). PSUM FP32 accumulation.
-        w_psum = nisa.nc_matmul(a_tile, v_tile)  # (n, 1)
-
-        nl.store(w[0:n, 0:1], value=w_psum)
-
-        return w
-
-    @nki.jit
-    def matvec_kernel_sim(A, v):
-        """Matrix-vector product w = A @ v via the Vector Engine.
-
-        Simulator-compatible path used by nki.simulate in _call_matvec.
-        The NKI 0.3.0 simulator context wrapper does not support
-        nisa.nc_matmul (it strips the stationary argument), so this kernel
-        uses the Vector-Engine broadcast+sum idiom that the simulator handles
-        correctly.  The result is numerically identical to matvec_kernel.
+        """Matrix-vector product w = A @ v.
 
         Args:
             A : (n, n) FP32 in HBM. n ≤ 128.
@@ -174,21 +132,42 @@ if HAS_NKI:
 
         Returns:
             w : (n, 1) FP32 in HBM.
+
+        Vector Engine broadcast+sum: load A (partition=n, free=n), load v
+        transposed to (partition=1, free=n), broadcast to (n, n), multiply
+        element-wise, sum along the free dim. Result shape (n, 1).
+
+        Tensor Engine note: nisa.nc_matmul is not used here because NKI 0.3.0
+        requires the moving operand's free dimension to meet a minimum tile
+        width (>> 1). A vector v of shape (n, 1) has free_dim=1, which falls
+        below that threshold — the compiler rejects the call on both the
+        simulator and hardware. Tensor Engine matvec is revisited in a later
+        phase when the SDK documents the minimum free-dim constraint or when
+        the algorithm is restructured to batch multiple vectors per call.
+        See #36 for the investigation record.
         """
         n = A.shape[0]
 
         w = nl.ndarray((n, 1), dtype=A.dtype, buffer=nl.shared_hbm)
 
         a_tile = nl.load(A[0:n, 0:n])  # (n, n), partition=n
+        # Load v transposed so partition=1, free=n; broadcast to match A.
         v_row = nl.load_transpose2d(v[0:n, 0:1])  # (1, n), partition=1
-        v_bc = nl.broadcast_to(v_row, (n, n))  # broadcast to match A
+        v_bc = nl.broadcast_to(v_row, (n, n))  # (n, n), partition=n
 
-        prod = nl.multiply(a_tile, v_bc)  # element-wise A[i,j] * v[j]
-        w_tile = nl.sum(prod, axis=1, keepdims=True)  # sum over j → (n, 1)
+        prod = nl.multiply(a_tile, v_bc)  # (n, n)
+        w_tile = nl.sum(prod, axis=1, keepdims=True)  # (n, 1) — free-dim reduce
 
         nl.store(w[0:n, 0:1], value=w_tile)
 
         return w
+
+    # matvec_kernel_sim is a simulator-compatible alias for nki.simulate dispatch.
+    # The NKI 0.3.0 simulator context wrapper cannot route calls through
+    # nisa.nc_matmul (it strips the stationary operand), so _call_matvec routes
+    # to this function under TRNSOLVER_USE_SIMULATOR=1. Both kernels are
+    # identical; the split keeps the dispatch logic explicit.
+    matvec_kernel_sim = matvec_kernel
 
     @nki.jit
     def rank2_update_kernel(A, u, v):

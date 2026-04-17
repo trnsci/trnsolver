@@ -107,23 +107,14 @@ def _torch_eigh(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _call_matvec(A, v):
-    """Dispatch matvec_kernel through torch_xla or the CPU simulator.
+    """Dispatch matvec_kernel through torch_xla or the CPU simulator."""
+    from .nki.dispatch import matvec_kernel
 
-    On hardware: matvec_kernel (Tensor Engine via nisa.nc_matmul).
-    On simulator: matvec_kernel_sim (Vector Engine broadcast+sum). The NKI
-    0.3.0 simulator context wrapper strips the stationary argument from
-    nc_matmul calls, so the Tensor Engine kernel cannot run under nki.simulate.
-    Both kernels compute the same result.
-    """
     if _use_simulator():
         import nki
 
-        from .nki.dispatch import matvec_kernel_sim
-
-        w = nki.simulate(matvec_kernel_sim)(A.detach().cpu().numpy(), v.detach().cpu().numpy())
+        w = nki.simulate(matvec_kernel)(A.detach().cpu().numpy(), v.detach().cpu().numpy())
         return torch.from_numpy(w).to(A.device)
-    from .nki.dispatch import matvec_kernel
-
     return matvec_kernel(A, v)
 
 

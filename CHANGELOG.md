@@ -16,15 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this closes the last remaining PyTorch-only step in the NKI generalized
   eigensolver path. Closes #11.
 
-- **`matvec_kernel` switched to Tensor Engine** (`nisa.nc_matmul`) (#36).
-  The previous Vector-Engine broadcast+sum path is replaced by
-  `nisa.nc_matmul(a_tile, v_tile)`, which computes `A^T @ v` via PSUM FP32
-  accumulation on the systolic array. Because A is symmetric throughout
-  Householder tridiagonalization, `A^T @ v = A @ v`. The contraction dim is
-  the partition dim (n ≤ 128) — the Tensor Engine's optimal case. The
-  `rank2_update_kernel` stays on the Vector Engine (rank-1 outer products,
-  partition=1, no systolic advantage); the packed-(n,2) path is tracked in
-  #36 for a later iteration.
+- **`matvec_kernel` Tensor Engine attempt reverted** (#36). `nisa.nc_matmul`
+  requires the `moving` operand's free dimension to meet a minimum tile width
+  that a (n, 1) vector (free_dim=1) does not satisfy. The neuronxcc-2.24
+  compiler and the NKI 0.3.0 simulator both reject the call. Kernel reverts
+  to the Vector-Engine broadcast+sum idiom validated in v0.4.0. The
+  `matvec_kernel_sim` alias is retained for dispatch clarity.
+  Tensor Engine matvec is deferred until the SDK documents the minimum
+  free-dim constraint or the algorithm batches multiple vectors per call.
+  Investigation recorded in #36.
 
 ## [0.4.0] — 2026-04-16
 
