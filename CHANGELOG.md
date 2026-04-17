@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`eigh_generalized` triangular solves use `trnblas.trsm`** when trnblas is
+  installed (#11). `trnblas.trsm` dispatches to a blocked NKI GEMM path on
+  Trainium; falls back to `torch.linalg.solve_triangular` on CPU or when
+  trnblas is absent. The inner `eigh` call already dispatches to NKI, so
+  this closes the last remaining PyTorch-only step in the NKI generalized
+  eigensolver path. Closes #11.
+
 - **`matvec_kernel` switched to Tensor Engine** (`nisa.nc_matmul`) (#36).
   The previous Vector-Engine broadcast+sum path is replaced by
   `nisa.nc_matmul(a_tile, v_tile)`, which computes `A^T @ v` via PSUM FP32

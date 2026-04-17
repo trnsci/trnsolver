@@ -64,16 +64,35 @@ def eigh_generalized(
         (L^{-1} A L^{-T}) y = λ y
         x = L^{-T} y
 
-    The Cholesky + triangular solves stay on the PyTorch path; the inner
-    eigh call dispatches per backend.
+    The triangular solves use trnblas.trsm (NKI-accelerated blocked path)
+    when trnblas is installed; they fall back to torch.linalg.solve_triangular
+    otherwise. The inner eigh call dispatches to NKI per backend setting.
+    Closes #11.
     """
-    L = torch.linalg.cholesky(B)
-    L_inv_A = torch.linalg.solve_triangular(L, A, upper=False)
-    A_prime = torch.linalg.solve_triangular(L, L_inv_A.T, upper=False).T
-    A_prime = 0.5 * (A_prime + A_prime.T)
+    try:
+        import trnblas as _tb
+    except ImportError:
+        _tb = None
 
+    L = torch.linalg.cholesky(B)
+
+    if _tb is not None:
+        # NKI path: trnblas.trsm dispatches to the blocked NKI GEMM path on
+        # Trainium; falls back to torch.linalg.solve_triangular on CPU.
+        L_inv_A = _tb.trsm(1.0, L, A, side="left", uplo="lower", trans=False)
+        A_prime = _tb.trsm(1.0, L, L_inv_A.T, side="left", uplo="lower", trans=False).T
+    else:
+        L_inv_A = torch.linalg.solve_triangular(L, A, upper=False)
+        A_prime = torch.linalg.solve_triangular(L, L_inv_A.T, upper=False).T
+
+    A_prime = 0.5 * (A_prime + A_prime.T)
     eigenvalues, V_prime = eigh(A_prime, tol)
-    eigenvectors = torch.linalg.solve_triangular(L.T, V_prime, upper=True)
+
+    if _tb is not None:
+        eigenvectors = _tb.trsm(1.0, L, V_prime, side="left", uplo="lower", trans=True)
+    else:
+        eigenvectors = torch.linalg.solve_triangular(L.T, V_prime, upper=True)
+
     return eigenvalues, eigenvectors
 
 
