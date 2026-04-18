@@ -53,6 +53,43 @@ class TestQR:
         np.testing.assert_allclose(QtQ.numpy(), np.eye(6), atol=1e-5)
 
 
+class TestSVD:
+    def test_reconstruction(self, random_matrix):
+        A = random_matrix(8, 6)
+        U, s, Vh = trnsolver.svd(A)
+        recon = U @ torch.diag(s) @ Vh
+        np.testing.assert_allclose(recon.numpy(), A.numpy(), atol=1e-5)
+
+    def test_left_orthogonality(self, random_matrix):
+        A = random_matrix(8, 6)
+        U, _, _ = trnsolver.svd(A)
+        np.testing.assert_allclose((U.T @ U).numpy(), np.eye(6), atol=1e-5)
+
+    def test_right_orthogonality(self, random_matrix):
+        A = random_matrix(8, 6)
+        _, _, Vh = trnsolver.svd(A)
+        np.testing.assert_allclose((Vh @ Vh.T).numpy(), np.eye(6), atol=1e-5)
+
+    def test_singular_values_descending(self, random_matrix):
+        A = random_matrix(8, 6)
+        _, s, _ = trnsolver.svd(A)
+        assert torch.all(s[:-1] >= s[1:])
+
+    def test_vs_torch(self, random_matrix):
+        A = random_matrix(8, 6)
+        _, s, _ = trnsolver.svd(A)
+        s_ref = torch.linalg.svdvals(A)
+        np.testing.assert_allclose(s.numpy(), s_ref.numpy(), atol=1e-5)
+
+    def test_full_matrices_shape(self, random_matrix):
+        m, n = 8, 6
+        A = random_matrix(m, n)
+        U_full, s_full, Vh_full = trnsolver.svd(A, full_matrices=True)
+        assert U_full.shape == (m, m)
+        assert Vh_full.shape == (n, n)
+        assert s_full.shape == (n,)
+
+
 class TestSolve:
     def test_identity(self):
         A = torch.eye(4)

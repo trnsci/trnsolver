@@ -76,6 +76,29 @@ def qr(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return _restore(Q, orig), _restore(R, orig)
 
 
+def svd(
+    A: torch.Tensor,
+    full_matrices: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Singular Value Decomposition: A = U @ diag(s) @ Vh
+
+    Args:
+        A: Input matrix (m, n). Real or complex.
+        full_matrices: If True, return full unitary U (m, m) and Vh (n, n).
+            If False (default), return economy/thin U (m, k) and Vh (k, n)
+            where k = min(m, n). Default False is memory-efficient and matches
+            the usage in `pinv`.
+
+    Returns:
+        U:  Left singular vectors (m, m) or (m, k)
+        s:  Singular values (k,) sorted descending
+        Vh: Right singular vectors conjugate-transposed (n, n) or (k, n)
+    """
+    A, orig = _to_fp32(A)
+    U, s, Vh = torch.linalg.svd(A, full_matrices=full_matrices)
+    return _restore(U, orig), _restore(s, orig), _restore(Vh, orig)
+
+
 def solve(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """Solve A @ X = B for X.
 

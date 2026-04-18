@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-04-17
+
+### Added
+
+- **`svd(A, full_matrices=False)`** in `trnsolver.factor`. Singular Value
+  Decomposition: returns `(U, s, Vh)` with `A = U @ diag(s) @ Vh`. Default
+  `full_matrices=False` returns the economy/thin decomposition (U is m×k,
+  Vh is k×n where k = min(m, n)), matching the convention used internally by
+  `pinv`. BF16/FP16 inputs are promoted to FP32 via the standard
+  `_to_fp32`/`_restore` shim. This closes the `svd` item from the Factorizations
+  row of the API table; the NKI-Jacobi SVD backend is a future Phase 3 perf
+  upgrade tracked in #28.
+
 ## [0.8.0] — 2026-04-17
 
 ### Added

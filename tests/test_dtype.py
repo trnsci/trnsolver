@@ -172,3 +172,14 @@ class TestLowPrecisionDtype:
         x, iters, res = trnsolver.cg(A, b, M=M, tol=1e-4)
         assert x.dtype == dtype
         assert iters > 0
+
+    def test_svd(self, dtype):
+        torch.manual_seed(5)
+        A_fp32 = torch.randn(8, 6)
+        A = A_fp32.to(dtype)
+        U, s, Vh = trnsolver.svd(A)
+        assert U.dtype == dtype
+        assert s.dtype == dtype
+        assert Vh.dtype == dtype
+        _, s_ref, _ = trnsolver.svd(A_fp32)
+        assert torch.allclose(s.float(), s_ref, atol=1e-1, rtol=1e-1)

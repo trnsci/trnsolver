@@ -99,6 +99,11 @@ class TestQR:
         benchmark(trnsolver.qr, random_matrix)
 
 
+class TestSVD:
+    def test_svd_trnsolver(self, benchmark, random_matrix):
+        benchmark(trnsolver.svd, random_matrix)
+
+
 class TestSolveSpd:
     def test_solve_spd_trnsolver(self, benchmark, spd_matrix, random_vector):
         benchmark(trnsolver.solve_spd, spd_matrix, random_vector)

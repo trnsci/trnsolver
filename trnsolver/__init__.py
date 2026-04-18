@@ -6,13 +6,24 @@ computing on Trainium. Complements trnblas (BLAS) and trnfft (FFT).
 Part of the trnsci scientific computing suite.
 """
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 # Eigenvalue decomposition
 from .eigen import eigh, eigh_generalized
 
 # Factorizations
-from .factor import cholesky, inv_spd, inv_sqrt_spd, inv_sqrt_spd_ns, lu, pinv, qr, solve, solve_spd
+from .factor import (
+    cholesky,
+    inv_spd,
+    inv_sqrt_spd,
+    inv_sqrt_spd_ns,
+    lu,
+    pinv,
+    qr,
+    solve,
+    solve_spd,
+    svd,
+)
 
 # Iterative solvers
 from .iterative import (
@@ -40,6 +51,7 @@ __all__ = [
     "inv_sqrt_spd",
     "inv_sqrt_spd_ns",
     "pinv",
+    "svd",
     # Iterative
     "cg",
     "gmres",
