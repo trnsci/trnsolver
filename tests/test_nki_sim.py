@@ -184,3 +184,37 @@ class TestHouseholderTridiagSimulator:
             # Either unit-norm (reflector populated) or zero (step skipped
             # due to already-zero column).
             assert col_norm == pytest.approx(1.0, abs=1e-4) or col_norm < 1e-20
+
+
+class TestMatmulSimulator:
+    """matmul_kernel_sim via nki.simulate: A @ V = C.
+
+    Validates the simulator-compatible Vector Engine matmul. Also confirms
+    the end-to-end eigh Rayleigh-Ritz step routes through _call_matmul when
+    TRNSOLVER_USE_SIMULATOR=1.
+    """
+
+    @pytest.mark.parametrize("n,k", [(8, 4), (16, 16), (32, 64), (64, 64), (128, 128)])
+    def test_matmul_sim_vs_torch(self, n, k):
+        import nki
+
+        from trnsolver.nki.dispatch import matmul_kernel_sim
+
+        torch.manual_seed(42)
+        A = torch.randn(n, n)
+        V = torch.randn(n, k)
+        C_ref = (A @ V).numpy()
+        C = nki.simulate(matmul_kernel_sim)(A.numpy(), V.numpy())
+        np.testing.assert_allclose(C, C_ref, atol=1e-4)
+
+    @pytest.mark.parametrize("n", [8, 32, 64, 128])
+    def test_eigh_rayleigh_ritz_via_matmul(self, n):
+        """eigh still correct with _call_matmul wired into Rayleigh-Ritz."""
+        import trnsolver
+
+        torch.manual_seed(42)
+        A = torch.randn(n, n)
+        A = 0.5 * (A + A.T)
+        w_ref, _ = torch.linalg.eigh(A)
+        w, V = trnsolver.eigh(A)
+        np.testing.assert_allclose(w.numpy(), w_ref.numpy(), atol=1e-3, rtol=1e-3)

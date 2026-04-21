@@ -111,7 +111,7 @@ class TestSchur:
         # Everything two or more below the diagonal must be zero
         for i in range(12):
             for j in range(i - 1):
-                assert abs(T[i, j].item()) < 1e-4, f"T[{i},{j}] = {T[i,j].item()}"
+                assert abs(T[i, j].item()) < 1e-4, f"T[{i},{j}] = {T[i, j].item()}"
 
     def test_symmetric_gives_diagonal(self, spd_matrix):
         A = spd_matrix(10)

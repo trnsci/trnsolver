@@ -172,7 +172,9 @@ def _francis_qr_sweep(
             break
 
         # Householder sign convention: maximize |p[0]| after reflection
-        sign_p0 = torch.sign(p[0]) if p[0] != .0 else torch.ones((), dtype=p.dtype, device=p.device)
+        sign_p0 = (
+            torch.sign(p[0]) if p[0] != 0.0 else torch.ones((), dtype=p.dtype, device=p.device)
+        )
         p = p.clone()
         p[0] = p[0] + sign_p0 * norm_p
         p = p / torch.linalg.norm(p)
@@ -254,7 +256,11 @@ def _schur_iterate(
                 # Real eigenvalue pair — apply one Givens rotation to split.
                 # Choose the eigenvalue of the 2×2 closest to d as the shift.
                 sq = disc**0.5
-                mu = (a + d) / 2 + sq if abs((a + d) / 2 + sq - d) < abs((a + d) / 2 - sq - d) else (a + d) / 2 - sq
+                mu = (
+                    (a + d) / 2 + sq
+                    if abs((a + d) / 2 + sq - d) < abs((a + d) / 2 - sq - d)
+                    else (a + d) / 2 - sq
+                )
                 # Givens rotation: zero H[lo+1, lo] in H-mu*I
                 x = a - mu
                 y = c
@@ -268,7 +274,9 @@ def _schur_iterate(
                     H[:, lo : lo + 2] = H[:, lo : lo + 2] @ G.T
                     Q[:, lo : lo + 2] = Q[:, lo : lo + 2] @ G.T
                 # Now H[lo+1, lo] should be near zero; deflate both as 1×1.
-                if abs(H[lo + 1, lo].item()) <= tol * (abs(H[lo, lo].item()) + abs(H[lo + 1, lo + 1].item())):
+                if abs(H[lo + 1, lo].item()) <= tol * (
+                    abs(H[lo, lo].item()) + abs(H[lo + 1, lo + 1].item())
+                ):
                     H[lo + 1, lo] = 0.0
                     hi -= 1  # deflate hi as 1×1; lo is next iteration's hi
                 # else: didn't converge (rare for real pair), let outer loop retry

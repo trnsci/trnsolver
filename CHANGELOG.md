@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-04-21
+
+### Added
+
+- **`matmul_kernel(A, V)` and `matmul_kernel_sim(A, V)`** in
+  `trnsolver.nki.dispatch`. Tensor Engine matrix-matrix product C = A @ V via
+  `nisa.nc_matmul` (hardware) and a Vector Engine per-column broadcast+sum loop
+  (simulator). The hardware kernel uses A^T as the SBUF stationary operand and V
+  as the moving operand (shape (n, k)), satisfying the NKI 0.3.0 free-dim
+  constraint (free_dim = k > 1) that blocked the earlier vector matvec attempt
+  (#36). The simulator kernel (`matmul_kernel_sim`) handles `TRNSOLVER_USE_SIMULATOR=1`
+  because `nki.simulate` strips the `nc_matmul` stationary operand and cannot
+  route the hardware kernel. Closes #36.
+
+- **`_call_matmul(A, V)`** dispatch helper in `trnsolver.eigen`. Routes to
+  `matmul_kernel` (hardware) or `matmul_kernel_sim` (simulator), handling the
+  full CPU→XLA→CPU device round-trip and `torch_xla.sync()` for NEFF cache
+  reuse.
+
+- **Rayleigh-Ritz refinement on NKI** (`trnsolver.eigen._householder_qr_eigh`).
+  The three GEMMs in the post-tridiagonalization subspace rotation step
+  (`A@V`, `V.T@AV`, `V@Q_corr`) now route through `_call_matmul` on the Tensor
+  Engine instead of PyTorch on CPU. This is the largest previously-unaccelerated
+  hot path in the NKI `eigh` call at n=128.
+
 ## [0.10.0] — 2026-04-18
 
 ### Added

@@ -76,3 +76,26 @@ class TestEighNKI:
         lhs = A @ V
         rhs = B @ V @ torch.diag(w)
         np.testing.assert_allclose(lhs.numpy(), rhs.numpy(), atol=1e-2)
+
+    def test_matmul_tensor_engine(self):
+        """matmul_kernel (nisa.nc_matmul) on XLA device matches torch.matmul.
+
+        Validates the Tensor Engine path directly: hardware NEFF compile +
+        on-chip dispatch. This is the signal that #36 (free_dim constraint)
+        is resolved — a square (n, k) moving operand with k=n satisfies
+        the NKI 0.3.0 minimum free-dim requirement.
+        """
+        import torch_xla
+
+        from trnsolver.nki.dispatch import matmul_kernel
+
+        torch.manual_seed(42)
+        n, k = 64, 64
+        A = torch.randn(n, n)
+        V = torch.randn(n, k)
+        C_ref = (A @ V).numpy()
+
+        xla = torch_xla.device()
+        C = matmul_kernel(A.to(xla), V.to(xla))
+        torch_xla.sync()
+        np.testing.assert_allclose(C.cpu().numpy(), C_ref, atol=1e-3)

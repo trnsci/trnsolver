@@ -139,6 +139,41 @@ def _call_rank2_update(A, u, v):
     return rank2_update_kernel(A, u, v)
 
 
+def _call_matmul(A, V):
+    """Dispatch matmul_kernel (Tensor Engine) or matmul_kernel_sim (Vector Engine).
+
+    Computes C = A @ V.  A: (n, n), V: (n, k), k > 1.
+
+    Simulator path routes through matmul_kernel_sim (nisa.nc_matmul is not
+    simulator-safe — nki.simulate strips the stationary operand). Hardware path
+    moves tensors to the XLA device, calls matmul_kernel, syncs to materialise
+    the result, and returns to orig_device.
+
+    To compute B.T @ C: call _call_matmul(B.T.contiguous(), C). The
+    `.contiguous()` is required because load_transpose2d in the kernel expects
+    a row-major HBM tensor; a transposed view has wrong strides.
+    """
+    orig_device = A.device
+
+    if _use_simulator():
+        import nki
+
+        from .nki.dispatch import matmul_kernel_sim
+
+        C = nki.simulate(matmul_kernel_sim)(A.detach().cpu().numpy(), V.detach().cpu().numpy())
+        return torch.from_numpy(C).to(orig_device)
+
+    import torch_neuronx  # noqa: F401
+    import torch_xla
+
+    from .nki.dispatch import matmul_kernel
+
+    work_device = torch_xla.device()
+    C = matmul_kernel(A.to(work_device), V.to(work_device))
+    torch_xla.sync()
+    return C.to(orig_device)
+
+
 # ----------------------------------------------------------------------
 # Householder tridiagonalization (stage 1, #38 option B)
 # ----------------------------------------------------------------------
@@ -445,10 +480,10 @@ def _householder_qr_eigh(
     # rotation and Householder-application steps, reducing
     # ||A V - V diag(w)||_F by ~1–2 orders of magnitude for n ≥ 64.
     # Cost: one extra n×n GEMM (V^T @ AV, reuses AV) + one n×n LAPACK call.
-    AV = A @ V
-    H = V.T @ AV
+    AV = _call_matmul(A, V)
+    H = _call_matmul(V.T.contiguous(), AV)
     H = 0.5 * (H + H.T)  # symmetrize for FP32 safety
     eigenvalues, Q_corr = torch.linalg.eigh(H)
-    V = V @ Q_corr
+    V = _call_matmul(V.contiguous(), Q_corr)
     # torch.linalg.eigh returns sorted ascending — no argsort needed.
     return eigenvalues, V

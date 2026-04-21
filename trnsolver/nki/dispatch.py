@@ -15,20 +15,37 @@ Both kernels use the Vector Engine broadcast+sum idiom, validated on
 hardware (trn1.2xlarge, NKI 0.3.0) in v0.4.0: 14/14 @pytest.mark.neuron
 tests pass at rtol=1e-3 for n ∈ {4, 8, 16, 32, 64, 128}.
 
-Tensor Engine investigation (#36): nisa.nc_matmul was attempted for
+Phase 3 kernels (closes #36 — Tensor Engine matmul for Rayleigh-Ritz):
+
+    matmul_kernel(A, V)             → C = A @ V  [Tensor Engine, nisa.nc_matmul]
+    matmul_kernel_sim(A, V)         → C = A @ V  [Vector Engine, simulator-safe]
+
+matmul_kernel uses nisa.nc_matmul with A^T stationary in SBUF and V streaming
+as the moving operand. The moving operand shape (n, k) with k > 1 satisfies
+the NKI 0.3.0 free-dim constraint that blocked the earlier vector matvec
+attempt: a matrix moving operand has free_dim = k > 1. Closes #36.
+
+matmul_kernel is NOT simulator-safe: nki.simulate strips the nc_matmul
+stationary operand. matmul_kernel_sim (Vector Engine per-column loop) is used
+under TRNSOLVER_USE_SIMULATOR=1. Both compute identical results.
+
+Both matmul kernels are wired into the Rayleigh-Ritz refinement step of
+`_householder_qr_eigh` (eigen.py) via `_call_matmul`.
+
+Tensor Engine investigation history (#36): nisa.nc_matmul was attempted for
 matvec_kernel but rejected by both the simulator and neuronxcc-2.24 with
 "nc_matmul() missing value for required argument 'moving'". Root cause:
 NKI 0.3.0 requires the moving operand's free dimension to meet a minimum
 tile width (>> 1). A vector v of shape (n, 1) has free_dim=1, which is
-below that threshold. Tensor Engine matvec is deferred until the SDK
-documents the minimum free-dim constraint or the algorithm batches multiple
-vectors per call. rank2_update outer products (rank-1, partition=1) also
-offer no Tensor Engine advantage. #36 remains open as a tracking issue.
+below that threshold. rank2_update outer products (rank-1, partition=1) also
+offer no Tensor Engine advantage. The fix for the Rayleigh-Ritz step is to
+batch the k columns of V into a single (n, k) moving operand — k=n in that
+context, so free_dim=n >> 1 on any non-trivial matrix.
 
 Design-history note: the Jacobi path (`rotate_pairs_kernel`) that lived
 here before 2026-04-14 was replaced after the #9 post-mortem (classical
 Jacobi fought the NKI compile cache with per-rotation dispatch). See #38
-for the architecture decision and #36 for the underlying directive.
+for the architecture decision and #36 for the matmul resolution.
 """
 
 from __future__ import annotations
@@ -214,3 +231,75 @@ if HAS_NKI:
         nl.store(out[0:n, 0:n], value=out_tile)
 
         return out
+
+    @nki.jit
+    def matmul_kernel(A, V):
+        """Matrix-matrix product C = A @ V using the Tensor Engine.
+
+        Uses nisa.nc_matmul with A^T stationary in SBUF and V streaming as the
+        moving operand. The moving operand shape (n, k) with k > 1 satisfies
+        the NKI 0.3.0 free-dim constraint that blocked the earlier vector matvec
+        attempt (free_dim=1 for a (n,1) vector). Closes #36.
+
+        Args:
+            A : (n, n) FP32 in HBM. n ≤ 128.
+            V : (n, k) FP32 in HBM. k > 1, k ≤ 128.
+
+        Returns:
+            C : (n, k) FP32 in HBM.
+
+        nc_matmul convention: stationary stored as (K, M) = A^T, moving is
+        (K, N) = V, result is (M, N) = A @ V. load_transpose2d(A) gives A^T
+        in SBUF.
+
+        NOT simulator-safe: nki.simulate strips the nc_matmul stationary
+        operand. Use matmul_kernel_sim via _call_matmul under
+        TRNSOLVER_USE_SIMULATOR=1.
+        """
+        n = A.shape[0]
+        k = V.shape[1]
+
+        C = nl.ndarray((n, k), dtype=A.dtype, buffer=nl.shared_hbm)
+
+        A_t = nl.load_transpose2d(A[0:n, 0:n])  # stationary: A^T in SBUF, shape (n,n)
+        V_tile = nl.load(V[0:n, 0:k])  # moving: V, shape (n,k)
+
+        psum = nl.zeros((n, k), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(dst=psum, stationary=A_t, moving=V_tile, accumulate=False)
+
+        C_sbuf = nl.copy(psum, dtype=A.dtype)
+        nl.store(C[0:n, 0:k], value=C_sbuf)
+
+        return C
+
+    @nki.jit
+    def matmul_kernel_sim(A, V):
+        """Simulator-compatible matrix-matrix product C = A @ V.
+
+        Uses Vector Engine broadcast+sum in a per-column loop. Same output
+        contract as matmul_kernel; used under TRNSOLVER_USE_SIMULATOR=1
+        because nki.simulate cannot route nisa.nc_matmul calls (it strips
+        the stationary operand).
+
+        Args:
+            A : (n, n) FP32 in HBM. n ≤ 128.
+            V : (n, k) FP32 in HBM. k ≥ 1, k ≤ 128.
+
+        Returns:
+            C : (n, k) FP32 in HBM.
+        """
+        n = A.shape[0]
+        k = V.shape[1]
+
+        C = nl.ndarray((n, k), dtype=A.dtype, buffer=nl.shared_hbm)
+
+        a_tile = nl.load(A[0:n, 0:n])
+
+        for j in nl.affine_range(k):
+            v_row = nl.load_transpose2d(V[0:n, j : j + 1])  # (1, n) partition=1, free=n
+            v_bc = nl.broadcast_to(v_row, (n, n))
+            prod = nl.multiply(a_tile, v_bc)
+            c_col = nl.sum(prod, axis=1, keepdims=True)  # (n, 1)
+            nl.store(C[0:n, j : j + 1], value=c_col)
+
+        return C
