@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-04-18
+
+### Added
+
+- **`schur(A, tol=1e-10)`** in `trnsolver.factor`. Schur decomposition returns
+  `(Q, T)` with `A = Q @ T @ Q.T`. T is quasi-upper triangular — upper triangular
+  with possible 2×2 blocks on the diagonal for complex-conjugate eigenvalue pairs
+  of real A; for symmetric A all diagonal blocks are 1×1 (T is the eigenvalue
+  matrix). Implemented via (1) upper Hessenberg reduction with successive Householder
+  reflectors accumulated into Q, then (2) Francis implicit double-shift QR with
+  deflation until the active window is exhausted. Host-only (no NKI dispatch);
+  BF16/FP16 inputs promoted to FP32 via the standard `_to_fp32`/`_restore` shim.
+  This closes the last item in the Factorizations "Deferred" column of the API table.
+
 ## [0.9.0] — 2026-04-17
 
 ### Added

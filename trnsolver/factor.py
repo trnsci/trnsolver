@@ -99,6 +99,218 @@ def svd(
     return _restore(U, orig), _restore(s, orig), _restore(Vh, orig)
 
 
+def _hessenberg_reduce(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce A to upper Hessenberg form via Householder reflectors.
+
+    Returns (H, Q) such that A = Q @ H @ Q.T, H is upper Hessenberg.
+    Operates on a copy; A is not modified.
+    """
+    n = A.shape[0]
+    H = A.clone()
+    Q = torch.eye(n, dtype=A.dtype, device=A.device)
+
+    for k in range(n - 2):
+        # Extract the column below the subdiagonal
+        x = H[k + 1 :, k].clone()
+        norm_x = torch.linalg.norm(x)
+        if norm_x < 1e-14:
+            continue
+
+        # Build Householder vector: v = x ± ||x|| e_1
+        v = x.clone()
+        v[0] = v[0] + torch.sign(v[0]) * norm_x if v[0] != 0 else norm_x
+        v = v / torch.linalg.norm(v)
+
+        # Apply from left: H[k+1:, k:] -= 2 v (v^T H[k+1:, k:])
+        H[k + 1 :, k:] -= 2.0 * torch.outer(v, v @ H[k + 1 :, k:])
+        # Apply from right: H[:, k+1:] -= 2 (H[:, k+1:] v) v^T
+        H[:, k + 1 :] -= 2.0 * torch.outer(H[:, k + 1 :] @ v, v)
+        # Accumulate Q: Q[:, k+1:] -= 2 (Q[:, k+1:] v) v^T
+        Q[:, k + 1 :] -= 2.0 * torch.outer(Q[:, k + 1 :] @ v, v)
+
+        # Zero out below-subdiagonal entries for numerical cleanliness
+        H[k + 2 :, k] = 0.0
+
+    return H, Q
+
+
+def _francis_qr_sweep(
+    H: torch.Tensor,
+    Q: torch.Tensor,
+    lo: int,
+    hi: int,
+) -> None:
+    """One Francis implicit double-shift QR sweep on H[lo:hi+1, lo:hi+1].
+
+    Modifies H and Q in-place. Uses the trailing 2×2 block to compute the
+    double shift (s, t), then chases the bulge with 3×3 (then 2×2)
+    Householder reflectors applied as full-column/full-row similarity transforms.
+    """
+    n = H.shape[0]
+    # Shift parameters from trailing 2×2
+    s = H[hi - 1, hi - 1] + H[hi, hi]
+    t = H[hi - 1, hi - 1] * H[hi, hi] - H[hi - 1, hi] * H[hi, hi - 1]
+
+    # Starting vector: first column of H^2 - sH + tI (restricted to active block)
+    h00 = H[lo, lo]
+    h10 = H[lo + 1, lo]
+    h01 = H[lo, lo + 1]
+    h11 = H[lo + 1, lo + 1]
+
+    p0 = h00 * h00 + h01 * h10 - s * h00 + t
+    p1 = h10 * (h00 + h11 - s)
+    if hi - lo >= 2:
+        p2 = h10 * H[lo + 2, lo + 1]
+    else:
+        p2 = torch.zeros((), dtype=H.dtype, device=H.device)
+
+    for k in range(lo, hi):
+        nr = min(3, hi - k + 1)  # 3 normally, 2 at the last step (k = hi-1)
+        p = torch.stack([p0, p1, p2] if nr == 3 else [p0, p1])
+        norm_p = torch.linalg.norm(p)
+        if norm_p < 1e-14:
+            break
+
+        # Householder sign convention: maximize |p[0]| after reflection
+        sign_p0 = torch.sign(p[0]) if p[0] != .0 else torch.ones((), dtype=p.dtype, device=p.device)
+        p = p.clone()
+        p[0] = p[0] + sign_p0 * norm_p
+        p = p / torch.linalg.norm(p)
+
+        # Left: restrict to col max(lo, k-1) onwards.  Columns < k-1 are
+        # zero (Hessenberg) so there's nothing to apply, but we must not
+        # touch col k-1 for k > lo because those rows are already zero there
+        # and applying P from the left would create nonzero fill in columns
+        # strictly left of the active block that are never corrected by the
+        # matching right application.
+        col_start = max(lo, k - 1)
+        H[k : k + nr, col_start:] -= 2.0 * torch.outer(p, p @ H[k : k + nr, col_start:])
+        # Right: restrict rows to those that can be non-zero (Hessenberg structure).
+        # Rows > k+nr are zero in cols k:k+nr for a Hessenberg matrix, except for
+        # the bulge at row k+nr introduced by this step's left application.
+        row_end = min(k + nr + 1, n)
+        H[:row_end, k : k + nr] -= 2.0 * torch.outer(H[:row_end, k : k + nr] @ p, p)
+        # Accumulate orthogonal factor (all rows of Q are always dense)
+        Q[:, k : k + nr] -= 2.0 * torch.outer(Q[:, k : k + nr] @ p, p)
+
+        # Read starting vector for next step from the bulge below the subdiagonal
+        if k + 1 <= hi - 2:
+            p0 = H[k + 1, k]
+            p1 = H[k + 2, k]
+            p2 = H[k + 3, k] if k + 3 <= hi else torch.zeros((), dtype=H.dtype, device=H.device)
+        else:
+            p0 = H[k + 1, k]
+            p1 = H[k + 2, k] if k + 2 <= hi else torch.zeros((), dtype=H.dtype, device=H.device)
+            p2 = torch.zeros((), dtype=H.dtype, device=H.device)
+
+
+def _schur_iterate(
+    H: torch.Tensor,
+    Q: torch.Tensor,
+    tol: float,
+    max_sweeps: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Drive the Francis QR iteration to convergence via deflation.
+
+    Returns (T, Q_total) where A = Q_total @ T @ Q_total.T.
+
+    Scans from hi downward each iteration to find the top of the current
+    unreduced block; zeros any small subdiagonal entry found and re-classifies
+    the window size before deciding whether to apply another sweep. Correctly
+    handles interior deflations by updating lo from the scan result.
+    """
+    n = H.shape[0]
+    hi = n - 1  # active upper boundary; shrinks as blocks are deflated
+    sweep = 0
+
+    while hi >= 1 and sweep < max_sweeps:
+        # Scan from hi downward to find top of current unreduced block [lo, hi]
+        lo = hi
+        while lo >= 1:
+            sub = abs(H[lo, lo - 1].item())
+            diag = abs(H[lo - 1, lo - 1].item()) + abs(H[lo, lo].item())
+            if sub <= tol * diag:
+                H[lo, lo - 1] = 0.0  # explicitly zero for numerical cleanliness
+                break
+            lo -= 1
+        # lo == 0: no interior deflation found; active window is [0, hi]
+
+        if lo >= hi:
+            # H[hi, hi-1] was already small: 1×1 block deflated at hi
+            hi -= 1
+            continue
+
+        if hi - lo == 1:
+            # 2×2 active block — resolve based on eigenvalue type.
+            a = H[lo, lo].item()
+            b = H[lo, lo + 1].item()
+            c = H[lo + 1, lo].item()
+            d = H[lo + 1, lo + 1].item()
+            disc = ((a - d) / 2) ** 2 + b * c
+            if disc < 0:
+                # Complex conjugate pair — leave as quasi-Schur 2×2 block.
+                hi -= 2
+            else:
+                # Real eigenvalue pair — apply one Givens rotation to split.
+                # Choose the eigenvalue of the 2×2 closest to d as the shift.
+                sq = disc**0.5
+                mu = (a + d) / 2 + sq if abs((a + d) / 2 + sq - d) < abs((a + d) / 2 - sq - d) else (a + d) / 2 - sq
+                # Givens rotation: zero H[lo+1, lo] in H-mu*I
+                x = a - mu
+                y = c
+                r = (x**2 + y**2) ** 0.5
+                if r > 1e-14:
+                    ct = x / r
+                    st = y / r
+                    G = torch.tensor([[ct, st], [-st, ct]], dtype=H.dtype, device=H.device)
+                    # Similarity: H[lo:lo+2, :] = G @ H[lo:lo+2, :]; H[:, lo:lo+2] = H[:, lo:lo+2] @ G.T
+                    H[lo : lo + 2, :] = G @ H[lo : lo + 2, :]
+                    H[:, lo : lo + 2] = H[:, lo : lo + 2] @ G.T
+                    Q[:, lo : lo + 2] = Q[:, lo : lo + 2] @ G.T
+                # Now H[lo+1, lo] should be near zero; deflate both as 1×1.
+                if abs(H[lo + 1, lo].item()) <= tol * (abs(H[lo, lo].item()) + abs(H[lo + 1, lo + 1].item())):
+                    H[lo + 1, lo] = 0.0
+                    hi -= 1  # deflate hi as 1×1; lo is next iteration's hi
+                # else: didn't converge (rare for real pair), let outer loop retry
+            continue
+
+        # Active window [lo, hi] with hi - lo >= 2: apply Francis double-shift sweep
+        _francis_qr_sweep(H, Q, lo, hi)
+        sweep += 1
+
+    return H, Q
+
+
+def schur(
+    A: torch.Tensor,
+    tol: float = 1e-10,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Schur decomposition: A = Q @ T @ Q.T
+
+    T is quasi-upper triangular — upper triangular with possible 2×2 blocks
+    on the diagonal corresponding to complex-conjugate eigenvalue pairs of
+    real A. For symmetric A all blocks are 1×1 (T is diagonal = eigenvalues).
+
+    Host-only (no NKI dispatch). Uses Householder Hessenberg reduction
+    followed by Francis implicit double-shift QR iteration with deflation.
+    NKI acceleration of the Hessenberg stage is deferred to Phase 3.
+
+    Args:
+        A: Square real matrix (n, n).
+        tol: Deflation tolerance (relative to sum of adjacent diagonal magnitudes).
+
+    Returns:
+        Q: Orthogonal matrix (n, n) such that A = Q @ T @ Q.T.
+        T: Quasi-upper triangular Schur form (n, n).
+    """
+    if A.shape[0] != A.shape[1]:
+        raise ValueError(f"schur: A must be square, got shape {tuple(A.shape)}")
+    A, orig = _to_fp32(A)
+    H, Q = _hessenberg_reduce(A)
+    T, Q = _schur_iterate(H, Q, tol, max_sweeps=30 * A.shape[0])
+    return _restore(Q, orig), _restore(T, orig)
+
+
 def solve(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """Solve A @ X = B for X.
 

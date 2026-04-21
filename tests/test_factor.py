@@ -90,6 +90,45 @@ class TestSVD:
         assert s_full.shape == (n,)
 
 
+class TestSchur:
+    def test_reconstruction(self):
+        torch.manual_seed(42)
+        A = torch.randn(12, 12)
+        Q, T = trnsolver.schur(A)
+        recon = Q @ T @ Q.T
+        np.testing.assert_allclose(recon.numpy(), A.numpy(), atol=1e-4)
+
+    def test_q_orthogonal(self):
+        torch.manual_seed(43)
+        A = torch.randn(12, 12)
+        Q, _ = trnsolver.schur(A)
+        np.testing.assert_allclose((Q.T @ Q).numpy(), np.eye(12), atol=1e-5)
+
+    def test_quasi_upper_triangular(self):
+        torch.manual_seed(44)
+        A = torch.randn(12, 12)
+        _, T = trnsolver.schur(A)
+        # Everything two or more below the diagonal must be zero
+        for i in range(12):
+            for j in range(i - 1):
+                assert abs(T[i, j].item()) < 1e-4, f"T[{i},{j}] = {T[i,j].item()}"
+
+    def test_symmetric_gives_diagonal(self, spd_matrix):
+        A = spd_matrix(10)
+        Q, T = trnsolver.schur(A)
+        # Off-diagonal of T should be small for symmetric A
+        off_diag = T - torch.diag(torch.diagonal(T))
+        np.testing.assert_allclose(off_diag.numpy(), np.zeros((10, 10)), atol=1e-3)
+
+    def test_eigenvalues_match(self, spd_matrix):
+        A = spd_matrix(10)
+        _, T = trnsolver.schur(A)
+        # Diagonal of T gives eigenvalues for symmetric A
+        schur_eigs = torch.sort(torch.diagonal(T)).values
+        ref_eigs = torch.sort(torch.linalg.eigvalsh(A)).values
+        np.testing.assert_allclose(schur_eigs.numpy(), ref_eigs.numpy(), atol=1e-3)
+
+
 class TestSolve:
     def test_identity(self):
         A = torch.eye(4)
