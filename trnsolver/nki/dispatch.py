@@ -42,6 +42,26 @@ offer no Tensor Engine advantage. The fix for the Rayleigh-Ritz step is to
 batch the k columns of V into a single (n, k) moving operand — k=n in that
 context, so free_dim=n >> 1 on any non-trivial matrix.
 
+Phase 2 kernel (v0.12.0 — fused Householder reflector application):
+
+    apply_reflectors_kernel(V_refs, Q_in)  → Q_T_out = (∏ Hₖ @ Q)ᵀ  [Vector Engine]
+
+Applies n-2 Householder reflectors stored in V_refs to Q in reverse order (the
+eigenvector assembly step of `_householder_qr_eigh`). Previously a pure-host
+Python loop with n-2 PyTorch rank-1 outer-product updates; the fused kernel
+does all n-2 steps in a single NKI dispatch with Q^T resident in SBUF.
+
+SBUF layout trick: the kernel maintains Q^T in SBUF (not Q) because the
+required reduction `p = v^T Q` reduces along the partition axis (axis=0 of Q),
+which NKI 0.3.0 does not support. With Q^T in SBUF, the same reduction becomes
+a free-dim sum (axis=1), matching the supported broadcast+sum idiom. The kernel
+returns Q^T; `_call_apply_reflectors` transposes the result back to Q before
+handing it to `_householder_qr_eigh`.
+
+All ops are Vector Engine only: load_transpose2d + broadcast_to + multiply +
+sum(axis=1). The kernel is therefore simulator-safe and has no separate _sim
+variant; `apply_reflectors_kernel_sim = apply_reflectors_kernel`.
+
 Design-history note: the Jacobi path (`rotate_pairs_kernel`) that lived
 here before 2026-04-14 was replaced after the #9 post-mortem (classical
 Jacobi fought the NKI compile cache with per-rotation dispatch). See #38
@@ -303,3 +323,77 @@ if HAS_NKI:
             nl.store(C[0:n, j : j + 1], value=c_col)
 
         return C
+
+    @nki.jit
+    def apply_reflectors_kernel(V_refs, Q_in):
+        """Fused Householder reflector application: Q_out = (∏ₖ Hₖ) @ Q_in.
+
+        Applies the n-2 Householder reflectors stored in V_refs to Q_in in
+        reverse order (k = n-3, n-4, …, 0), implementing the eigenvector
+        assembly step of _householder_qr_eigh without host round-trips.
+
+        Args:
+            V_refs : (n, n-2) FP32 in HBM. Column k is the unit-norm
+                     Householder vector vₖ used at step k of tridiagonalization.
+            Q_in   : (n, n) FP32 in HBM. Accumulated Givens-rotation matrix.
+
+        Returns:
+            Q_T_out : (n, n) FP32 in HBM. The TRANSPOSE of the updated Q.
+                      Caller transposes back with .T.contiguous().
+
+        SBUF layout:  Q^T is maintained in SBUF (partition=n, free=n) so that
+        the key reduction `p[j] = Σᵢ vₖ[i]·Q[i,j]` reduces along the free
+        axis (axis=1, supported), not the partition axis (axis=0, unsupported
+        in NKI 0.3.0). V_refs is also loaded transposed so row k of V_T
+        holds the k-th Householder vector — enabling static free-dim slices
+        V_T[k:k+1, 0:n] within the compile-time-unrolled affine_range loop.
+
+        All operations are Vector Engine (load_transpose2d, broadcast_to,
+        multiply, sum axis=1). The kernel is therefore simulator-safe; no
+        separate _sim variant is needed.
+
+        Shape constraint: n ≤ PMAX (128). SBUF usage: Q_T (n,n) + V_T (n-2,n)
+        ≈ 2 × 65 KB at n=128, well within the 512 KB SBUF per NeuronCore.
+        """
+        n = Q_in.shape[0]
+        n_refs = V_refs.shape[1]  # = n - 2
+
+        Q_T_out = nl.ndarray((n, n), dtype=Q_in.dtype, buffer=nl.shared_hbm)
+
+        # Load Q transposed: Q_T[j, i] = Q[i, j].
+        # Free-dim (axis=1) reduction of Q_T gives p[j] = Σᵢ v[i]*Q[i,j]. ✓
+        Q_T = nl.load_transpose2d(Q_in[0:n, 0:n])  # (n, n)
+
+        # Load V_refs transposed: V_T[k, i] = v_k[i].
+        # Static row-slice V_T[k:k+1, 0:n] in the unrolled loop gives v_k
+        # as a (1, n) row vector without an extra transpose op.
+        V_T = nl.load_transpose2d(V_refs[0:n, 0:n_refs])  # (n_refs, n)
+
+        # Apply reflectors in reverse order: Hₙ₋₃ · Hₙ₋₄ · … · H₀ @ Q_in.
+        # k = n_refs-1 down to 0.  nl.affine_range unrolls compile-time.
+        for k_rev in nl.affine_range(n_refs):
+            k = n_refs - 1 - k_rev
+
+            # v_k as row vector (1, n): v_row[0, i] = vₖ[i]
+            v_row = V_T[k : k + 1, 0:n]
+
+            # Broadcast v_k across partition dim: v_bc[j, i] = vₖ[i]
+            v_bc = nl.broadcast_to(v_row, (n, n))
+
+            # p[j] = Σᵢ vₖ[i] · Q[i,j] = Σᵢ vₖ[i] · Q_T[j,i]
+            prod = nl.multiply(Q_T, v_bc)  # prod[j,i] = Q_T[j,i] · vₖ[i]
+            p_col = nl.sum(prod, axis=1, keepdims=True)  # (n,1): p[j]
+
+            # outer[j,i] = vₖ[i] · p[j]  →  Q_T ← Q_T − 2·outer
+            p_bc = nl.broadcast_to(p_col, (n, n))  # p_bc[j,i] = p[j]
+            outer = nl.multiply(v_bc, p_bc)  # (n,n): vₖ[i]·p[j]
+            outer_2 = nl.add(outer, outer)  # 2·outer
+            Q_T = nl.subtract(Q_T, outer_2)
+
+        nl.store(Q_T_out[0:n, 0:n], value=Q_T)
+        return Q_T_out
+
+    # apply_reflectors_kernel_sim: all ops are Vector Engine, so the hardware
+    # kernel is already simulator-safe. The alias keeps the dispatch logic
+    # symmetric with the matmul pair.
+    apply_reflectors_kernel_sim = apply_reflectors_kernel

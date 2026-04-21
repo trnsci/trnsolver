@@ -174,6 +174,52 @@ def _call_matmul(A, V):
     return C.to(orig_device)
 
 
+def _call_apply_reflectors(V_refs: torch.Tensor, Q: torch.Tensor) -> torch.Tensor:
+    """Dispatch apply_reflectors_kernel for fused Householder eigenvector assembly.
+
+    Applies n-2 Householder reflectors (stored in V_refs) to Q in reverse order:
+
+        Q_out = H_{n-3} @ H_{n-4} @ … @ H_0 @ Q
+
+    where Hₖ = I − 2 vₖ vₖᵀ.
+
+    The kernel returns Q^T (SBUF layout trick — see dispatch.py docstring).
+    This function transposes the result back before returning.
+
+    Args:
+        V_refs : (n, n-2) unit-norm Householder vectors, one per column.
+        Q      : (n, n) matrix to left-multiply (Givens accumulation from QR).
+
+    Returns:
+        Q_out : (n, n) updated eigenvector matrix Q.
+    """
+    n_refs = V_refs.shape[1]
+    if n_refs == 0:
+        return Q  # n ≤ 2: no reflectors to apply
+
+    orig_device = Q.device
+
+    if _use_simulator():
+        import nki
+
+        from .nki.dispatch import apply_reflectors_kernel_sim
+
+        Q_T_out = nki.simulate(apply_reflectors_kernel_sim)(
+            V_refs.detach().cpu().numpy(), Q.detach().cpu().numpy()
+        )
+        return torch.from_numpy(Q_T_out).T.contiguous().to(orig_device)
+
+    import torch_neuronx  # noqa: F401
+    import torch_xla
+
+    from .nki.dispatch import apply_reflectors_kernel
+
+    work_device = torch_xla.device()
+    Q_T_out = apply_reflectors_kernel(V_refs.to(work_device), Q.to(work_device))
+    torch_xla.sync()
+    return Q_T_out.to(orig_device).T.contiguous()
+
+
 # ----------------------------------------------------------------------
 # Householder tridiagonalization (stage 1, #38 option B)
 # ----------------------------------------------------------------------
@@ -468,7 +514,7 @@ def _householder_qr_eigh(
     diag, subdiag, V_refs = _householder_tridiag(A)
 
     eigenvalues, Q_right = _qr_iterate(diag.clone(), subdiag.clone(), tol)
-    V = _apply_reflectors(V_refs, Q_right)
+    V = _call_apply_reflectors(V_refs, Q_right)
 
     # Subspace rotation refinement (#31): one step of Rayleigh-Ritz on the
     # current approximate eigenbasis V. Compute the n×n projected matrix

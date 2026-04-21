@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-04-21
+
+### Added
+
+- **`apply_reflectors_kernel(V_refs, Q_in)`** in `trnsolver.nki.dispatch`. Fused
+  Householder reflector application: applies n-2 reflectors to Q in a single NKI
+  dispatch instead of the previous host-driven Python loop (n-2 iterations of
+  `Q ← Q − 2 v (vᵀQ)` via `torch.outer`). Eliminates n-2 iterations of O(n²)
+  PyTorch calls for the eigenvector assembly step of `eigh`, replacing them with
+  one Vector Engine kernel resident entirely in SBUF.
+
+  SBUF layout: the kernel maintains Q^T in SBUF so the critical reduction
+  `p[j] = Σᵢ vₖ[i]·Q[i,j]` becomes a free-dim sum (axis=1, supported by NKI
+  0.3.0) rather than a partition-dim sum (axis=0, unsupported). V_refs is loaded
+  transposed (V_T[k, i] = vₖ[i]) enabling static row-slice access within the
+  compile-time-unrolled `nl.affine_range` loop. The kernel returns Q^T;
+  `_call_apply_reflectors` transposes back before returning to
+  `_householder_qr_eigh`.
+
+  All ops are Vector Engine (`load_transpose2d`, `broadcast_to`, `multiply`,
+  `sum(axis=1)`) — the kernel is simulator-safe with no separate `_sim` variant;
+  `apply_reflectors_kernel_sim = apply_reflectors_kernel`.
+
+- **`_call_apply_reflectors(V_refs, Q)`** dispatch helper in `trnsolver.eigen`.
+  Routes to `apply_reflectors_kernel` (hardware) or `apply_reflectors_kernel_sim`
+  (simulator), handling the CPU→XLA→CPU round-trip and result transpose.
+
+### Changed
+
+- `_householder_qr_eigh` in `trnsolver.eigen` now routes the eigenvector assembly
+  step through `_call_apply_reflectors` (NKI) instead of the host-only
+  `_apply_reflectors` loop.
+
 ## [0.11.0] — 2026-04-21
 
 ### Added

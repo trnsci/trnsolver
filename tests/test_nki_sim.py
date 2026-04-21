@@ -218,3 +218,58 @@ class TestMatmulSimulator:
         w_ref, _ = torch.linalg.eigh(A)
         w, V = trnsolver.eigh(A)
         np.testing.assert_allclose(w.numpy(), w_ref.numpy(), atol=1e-3, rtol=1e-3)
+
+
+class TestApplyReflectorsSimulator:
+    """apply_reflectors_kernel via nki.simulate: fused eigenvector assembly.
+
+    Validates both the raw kernel output contract (Q_T_out = (∏Hₖ @ Q)^T)
+    and the end-to-end eigh eigenvector correctness when _call_apply_reflectors
+    replaces the host-driven _apply_reflectors loop.
+    """
+
+    @pytest.mark.parametrize("n", [4, 8, 16, 32, 64, 128])
+    def test_apply_reflectors_vs_host(self, n):
+        """apply_reflectors_kernel output matches _apply_reflectors (host loop).
+
+        The kernel returns Q^T; transpose before comparing to the host result.
+        """
+        import nki
+
+        from trnsolver.eigen import _apply_reflectors, _householder_tridiag
+        from trnsolver.nki.dispatch import apply_reflectors_kernel_sim
+
+        torch.manual_seed(42)
+        A = torch.randn(n, n)
+        A = 0.5 * (A + A.T)
+
+        # Build realistic V_refs from an actual tridiagonalization
+        _, _, V_refs = _householder_tridiag(A)
+        Q = torch.eye(n)
+
+        # Host reference
+        Q_ref = _apply_reflectors(V_refs, Q.clone())
+
+        # Kernel (returns Q^T)
+        if V_refs.shape[1] == 0:
+            return  # n ≤ 2: no reflectors, skip
+        Q_T_out = nki.simulate(apply_reflectors_kernel_sim)(V_refs.numpy(), Q.numpy())
+        Q_kernel = torch.from_numpy(Q_T_out).T.contiguous()
+        np.testing.assert_allclose(Q_kernel.numpy(), Q_ref.numpy(), atol=1e-4)
+
+    @pytest.mark.parametrize("n", [8, 32, 64, 128])
+    def test_eigh_eigenvectors_via_apply_reflectors(self, n):
+        """eigh eigenvectors correct with _call_apply_reflectors wired in."""
+        import trnsolver
+
+        torch.manual_seed(42)
+        A = torch.randn(n, n)
+        A = 0.5 * (A + A.T)
+        w_ref, V_ref = torch.linalg.eigh(A)
+        w, V = trnsolver.eigh(A)
+
+        # Eigenvalues sorted ascending
+        np.testing.assert_allclose(w.numpy(), w_ref.numpy(), atol=1e-3, rtol=1e-3)
+        # Reconstruction: A ≈ V diag(w) V^T
+        A_reconstructed = V @ torch.diag(w) @ V.T
+        np.testing.assert_allclose(A_reconstructed.numpy(), A.numpy(), atol=1e-2)

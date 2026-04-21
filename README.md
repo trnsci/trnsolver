@@ -78,6 +78,8 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 
 ## Status
 
+**v0.12.0** — `apply_reflectors_kernel`. Fused Householder reflector application: the eigenvector assembly step of `eigh` (n-2 iterations of `Q ← Q − 2 v (vᵀQ)`) is now a single NKI dispatch resident entirely in SBUF. SBUF layout trick: maintain Q^T in SBUF so the reduction `p = v^T Q` uses free-dim sum (axis=1, supported) instead of partition-dim sum (unsupported in NKI 0.3.0). All Vector Engine ops; simulator-safe.
+
 **v0.11.0** — `matmul_kernel` (Tensor Engine via `nisa.nc_matmul`) + `matmul_kernel_sim` (Vector Engine, simulator-safe). The Rayleigh-Ritz refinement step in `eigh` now routes all three GEMMs through the Tensor Engine on hardware. Resolves the NKI 0.3.0 free-dim constraint that blocked the earlier vector matvec attempt (#36): a matrix moving operand (n, k) with k > 1 satisfies the constraint. Closes #36.
 
 **v0.10.0** — `schur(A, tol=1e-10)`. Schur decomposition: returns `(Q, T)` with `A = Q @ T @ Q.T`. T is quasi-upper triangular (2×2 blocks for complex eigenvalue pairs). Implemented via Householder Hessenberg reduction + Francis implicit double-shift QR with deflation. Closes the last Factorizations "Deferred" item.
@@ -110,7 +112,8 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 - **v0.9.0** — `svd` factorization ✓
 - **v0.10.0** — `schur` (implicit-shift QR via Householder + Francis double-shift) ✓
 - **v0.11.0** — Tensor Engine matmul kernel (`nisa.nc_matmul`), Rayleigh-Ritz on NKI (#36) ✓
-- **v0.12.0+** — NKI Hessenberg reduction kernel, multi-NeuronCore parallel Jacobi (#20)
+- **v0.12.0** — Fused Householder reflector application (`apply_reflectors_kernel`) ✓
+- **v0.13.0+** — NKI Hessenberg reduction kernel, multi-NeuronCore parallel Jacobi (#20)
 
 ## Operations
 
@@ -148,7 +151,7 @@ All six siblings are on PyPI, along with the umbrella meta-package:
 | [trnfft](https://github.com/trnsci/trnfft) | FFT and complex-valued tensors | v0.8.0 |
 | [trnblas](https://github.com/trnsci/trnblas) | BLAS Level 1–3 | v0.4.0 |
 | [trnrand](https://github.com/trnsci/trnrand) | Philox / Sobol / Halton RNG | v0.1.0 |
-| trnsolver | Linear solvers and eigendecomposition | **v0.11.0** |
+| trnsolver | Linear solvers and eigendecomposition | **v0.12.0** |
 | [trnsparse](https://github.com/trnsci/trnsparse) | Sparse matrix operations | v0.1.1 |
 | [trntensor](https://github.com/trnsci/trntensor) | Tensor contractions (einsum, TT/Tucker) | v0.1.1 |
 
