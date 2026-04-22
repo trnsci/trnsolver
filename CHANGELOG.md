@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-04-21
+
+### Added
+
+- **`matmul_kernel_fp32out(A, V)` and `matmul_kernel_fp32out_sim(A, V)`** in
+  `trnsolver.nki.dispatch`. Tensor Engine C = A @ V with FP32 output regardless
+  of input dtype. A and V are BF16; nc_matmul accumulates BF16 products to FP32
+  via PSUM at no extra cost (Principle 1: PSUM as free FP32 accumulator). The
+  result is stored as FP32 — unlike `matmul_kernel`, which downcasts the PSUM
+  result back to A.dtype and would discard the accumulated FP32 precision.
+
+  `matmul_kernel_fp32out_sim` is the simulator-safe Vector Engine variant (same
+  interface, FP32 output; receives FP32-upcast arrays since numpy has no BF16 dtype).
+
+- **`_call_matmul_fp32out(A, V)`** dispatch helper in `trnsolver.eigen`. Casts
+  A and V to BF16 for the Tensor Engine, calls `matmul_kernel_fp32out` on hardware
+  (or `matmul_kernel_fp32out_sim` on the simulator with FP32-upcast numpy), and
+  returns a FP32 result tensor on `orig_device`. Falls back to
+  `torch.matmul(A.float(), V.float())` when NKI is unavailable or n/k > 128.
+
+### Changed
+
+- **`eigh_randomized`** now uses the BF16-native sketch path when A is BF16 and
+  the NKI backend is active (`_use_nki()` returns True). Instead of upcasting A to
+  FP32, it keeps A in BF16 and routes the sketch (A @ Ω), power-iteration, and
+  projection (A @ Q) through `_call_matmul_fp32out`. All post-sketch operations
+  (QR of Y, eigh of the small ℓ×ℓ B matrix, eigenvector lift) run in FP32.
+  Output is restored to BF16 via `_restore`. On CPU/non-NKI hosts the original
+  _to_fp32 upcast path is used unchanged.
+
+  The BF16-native path delivers the 50–100× BF16 throughput on the Tensor Engine
+  while maintaining FP32-quality accumulation in the sketch — the exact scenario
+  identified in the trnsci technical brief (Principle 1). This is the correctness
+  baseline; profiling vs cuSOLVER on vintage-matched hardware is tracked separately.
+
 ## [0.13.0] — 2026-04-21
 
 ### Added

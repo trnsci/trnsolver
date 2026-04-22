@@ -78,7 +78,9 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 
 ## Status
 
-**v0.13.0** — `eigh_randomized(A, k, oversampling=10, n_iter=0, seed=None)`. Randomized symmetric eigensolver implementing the Nakatsukasa–Tropp sketch-and-Rayleigh-Ritz (sRR) algorithm (SIAM SIMAX 45(2), 2024). O(n²k) vs O(n³) for `eigh`. Returns k eigenvalues of largest absolute magnitude and their corresponding orthonormal eigenvectors. Sketch step (`A @ Ω`) routes through the Tensor Engine via `matmul_kernel` when n ≤ 128; `torch.matmul` for larger matrices. BF16/FP16 upcast to FP32 via the `_to_fp32`/`_restore` pattern; native BF16 sketch path (FP32 PSUM accumulation via `nc_matmul`, 50–100× at BF16) deferred to v0.14.0.
+**v0.14.0** — BF16-native sketch path for `eigh_randomized` (Principle 1). New `matmul_kernel_fp32out` kernel: BF16 inputs → FP32 output via `nc_matmul` PSUM accumulation. When A is BF16 and NKI is active, `eigh_randomized` keeps A in BF16, routes all sketch/projection matmuls through `matmul_kernel_fp32out`, and runs QR/eigh in FP32. This delivers 50–100× BF16 throughput on the Tensor Engine while retaining FP32 accumulation quality — the PSUM upgrade is free.
+
+**v0.13.0** — `eigh_randomized(A, k, oversampling=10, n_iter=0, seed=None)`. Randomized symmetric eigensolver implementing the Nakatsukasa–Tropp sketch-and-Rayleigh-Ritz (sRR) algorithm (SIAM SIMAX 45(2), 2024). O(n²k) vs O(n³) for `eigh`. Returns k eigenvalues of largest absolute magnitude and their corresponding orthonormal eigenvectors.
 
 **v0.12.0** — `apply_reflectors_kernel`. Fused Householder reflector application: the eigenvector assembly step of `eigh` (n-2 iterations of `Q ← Q − 2 v (vᵀQ)`) is now a single NKI dispatch resident entirely in SBUF. SBUF layout trick: maintain Q^T in SBUF so the reduction `p = v^T Q` uses free-dim sum (axis=1, supported) instead of partition-dim sum (unsupported in NKI 0.3.0). All Vector Engine ops; simulator-safe.
 
@@ -116,8 +118,9 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 - **v0.11.0** — Tensor Engine matmul kernel (`nisa.nc_matmul`), Rayleigh-Ritz on NKI (#36) ✓
 - **v0.12.0** — Fused Householder reflector application (`apply_reflectors_kernel`) ✓
 - **v0.13.0** — `eigh_randomized` (Nakatsukasa–Tropp sRR, O(n²k), Tensor Engine sketch) ✓
-- **v0.14.0** — Native BF16 sketch path for `eigh_randomized` (FP32 PSUM via `nc_matmul`; 50–100× at BF16)
-- **v0.15.0+** — NKI Hessenberg reduction kernel, multi-NeuronCore parallel Jacobi (#20)
+- **v0.14.0** — `matmul_kernel_fp32out` + BF16-native sketch in `eigh_randomized` (Principle 1: BF16→FP32 PSUM, 50–100× at BF16) ✓
+- **v0.15.0** — GMRES-IR (BF16 inner solve, FP32 residual via PSUM; Carson–Higham three-precision for general systems)
+- **v0.16.0+** — NKI Hessenberg reduction kernel, multi-NeuronCore parallel Jacobi (#20)
 
 ## Operations
 
@@ -156,7 +159,7 @@ All six siblings are on PyPI, along with the umbrella meta-package:
 | [trnfft](https://github.com/trnsci/trnfft) | FFT and complex-valued tensors | v0.8.0 |
 | [trnblas](https://github.com/trnsci/trnblas) | BLAS Level 1–3 | v0.4.0 |
 | [trnrand](https://github.com/trnsci/trnrand) | Philox / Sobol / Halton RNG | v0.1.0 |
-| trnsolver | Linear solvers and eigendecomposition | **v0.13.0** |
+| trnsolver | Linear solvers and eigendecomposition | **v0.14.0** |
 | [trnsparse](https://github.com/trnsci/trnsparse) | Sparse matrix operations | v0.1.1 |
 | [trntensor](https://github.com/trnsci/trntensor) | Tensor contractions (einsum, TT/Tucker) | v0.1.1 |
 

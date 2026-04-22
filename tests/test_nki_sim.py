@@ -220,6 +220,54 @@ class TestMatmulSimulator:
         np.testing.assert_allclose(w.numpy(), w_ref.numpy(), atol=1e-3, rtol=1e-3)
 
 
+class TestMatmulFp32OutSimulator:
+    """matmul_kernel_fp32out_sim via nki.simulate: A @ V → FP32.
+
+    Validates the BF16-native sketch kernel's simulator-safe variant.
+    The simulator receives FP32-upcast arrays (BF16 is not a numpy dtype),
+    so these tests verify the FP32-output contract and dispatch wiring.
+    Hardware BF16→FP32 PSUM fidelity is covered by test_eigh_neuron.py.
+    """
+
+    @pytest.mark.parametrize("n,k", [(8, 4), (16, 8), (32, 16), (64, 32), (128, 64)])
+    def test_fp32out_vs_torch(self, n, k):
+        """matmul_kernel_fp32out_sim output matches torch.matmul, dtype=float32."""
+        import nki
+
+        from trnsolver.nki.dispatch import matmul_kernel_fp32out_sim
+
+        torch.manual_seed(42)
+        A = torch.randn(n, n)
+        V = torch.randn(n, k)
+        C_ref = torch.matmul(A, V).numpy()
+        C = nki.simulate(matmul_kernel_fp32out_sim)(A.numpy(), V.numpy())
+        np.testing.assert_allclose(C, C_ref, atol=1e-4)
+        assert C.dtype == np.float32, f"Expected float32 output, got {C.dtype}"
+
+    def test_eigh_randomized_via_bf16_path(self):
+        """eigh_randomized with BF16 input exercises _call_matmul_fp32out on sim.
+
+        On the simulator, _use_nki()=True and A.dtype=BF16 → _bf16_native=True.
+        _call_matmul_fp32out routes through matmul_kernel_fp32out_sim, upcasting
+        to FP32 for numpy. The result should still match the FP32-path output.
+        """
+        import trnsolver
+
+        torch.manual_seed(42)
+        n, k = 32, 5
+        A = torch.randn(n, n)
+        A = 0.5 * (A + A.T) + n * torch.eye(n)  # SPD
+
+        w_fp32, _ = trnsolver.eigh_randomized(A, k, oversampling=15, n_iter=2, seed=0)
+        w_bf16, _ = trnsolver.eigh_randomized(
+            A.to(torch.bfloat16), k, oversampling=15, n_iter=2, seed=0
+        )
+
+        # BF16 path should produce BF16 output and be within 5% of FP32 path
+        assert w_bf16.dtype == torch.bfloat16
+        np.testing.assert_allclose(w_bf16.float().numpy(), w_fp32.numpy(), rtol=5e-2, atol=1e-1)
+
+
 class TestApplyReflectorsSimulator:
     """apply_reflectors_kernel via nki.simulate: fused eigenvector assembly.
 

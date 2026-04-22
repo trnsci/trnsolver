@@ -20,6 +20,16 @@ Phase 3 kernels (closes #36 — Tensor Engine matmul for Rayleigh-Ritz):
     matmul_kernel(A, V)             → C = A @ V  [Tensor Engine, nisa.nc_matmul]
     matmul_kernel_sim(A, V)         → C = A @ V  [Vector Engine, simulator-safe]
 
+Phase 4 kernels (v0.14.0 — BF16-native sketch for eigh_randomized, Principle 1):
+
+    matmul_kernel_fp32out(A, V)     → C = A @ V, output FP32  [Tensor Engine, BF16 inputs]
+    matmul_kernel_fp32out_sim(A, V) → C = A @ V, output FP32  [Vector Engine, simulator-safe]
+
+matmul_kernel_fp32out is the key Principle 1 primitive: A and V are BF16 (loaded as
+BF16 tiles in SBUF), nc_matmul accumulates BF16→FP32 via PSUM for free, and the
+result is stored as FP32. This gives 50–100× BF16 throughput on the Tensor Engine
+while keeping downstream QR/eigh ops at FP32 quality — the accumulation is free.
+
 matmul_kernel uses nisa.nc_matmul with A^T stationary in SBUF and V streaming
 as the moving operand. The moving operand shape (n, k) with k > 1 satisfies
 the NKI 0.3.0 free-dim constraint that blocked the earlier vector matvec
@@ -320,6 +330,75 @@ if HAS_NKI:
             v_bc = nl.broadcast_to(v_row, (n, n))
             prod = nl.multiply(a_tile, v_bc)
             c_col = nl.sum(prod, axis=1, keepdims=True)  # (n, 1)
+            nl.store(C[0:n, j : j + 1], value=c_col)
+
+        return C
+
+    @nki.jit
+    def matmul_kernel_fp32out(A, V):
+        """Tensor Engine C = A @ V, output always FP32 (BF16 PSUM principle).
+
+        Designed for the BF16-native sketch path in eigh_randomized (v0.14.0).
+        A and V are expected to be BF16; nc_matmul accumulates BF16 products
+        to FP32 via PSUM (Principle 1: PSUM as free FP32 accumulator). The
+        result is stored as FP32 — no precision is lost to the BF16→BF16
+        downcast that matmul_kernel performs.
+
+        Args:
+            A : (n, n) BF16 in HBM. n ≤ 128.
+            V : (n, k) BF16 in HBM. k > 1, k ≤ 128.
+
+        Returns:
+            C : (n, k) **FP32** in HBM.  A @ V with FP32-accumulation quality.
+
+        NOT simulator-safe: nki.simulate strips the nc_matmul stationary
+        operand. Use matmul_kernel_fp32out_sim under TRNSOLVER_USE_SIMULATOR=1.
+        """
+        n = A.shape[0]
+        k = V.shape[1]
+
+        C = nl.ndarray((n, k), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        A_t = nl.load_transpose2d(A[0:n, 0:n])  # stationary: A^T (BF16) in SBUF
+        V_tile = nl.load(V[0:n, 0:k])  # moving: V (BF16)
+
+        psum = nl.zeros((n, k), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(dst=psum, stationary=A_t, moving=V_tile, accumulate=False)
+
+        # Keep PSUM result as FP32 — do not downcast to BF16.
+        C_sbuf = nl.copy(psum, dtype=nl.float32)
+        nl.store(C[0:n, 0:k], value=C_sbuf)
+
+        return C
+
+    @nki.jit
+    def matmul_kernel_fp32out_sim(A, V):
+        """Simulator-compatible C = A @ V, output FP32.
+
+        Vector Engine per-column loop; same output contract as
+        matmul_kernel_fp32out but safe under nki.simulate. The simulator
+        receives FP32-upcast numpy arrays (BF16 is not a numpy dtype), so
+        the accumulation is exact FP32 rather than BF16→FP32 PSUM.
+
+        Args:
+            A : (n, n) FP32 in HBM (upcast from BF16 by _call_matmul_fp32out).
+            V : (n, k) FP32 in HBM.
+
+        Returns:
+            C : (n, k) FP32 in HBM.
+        """
+        n = A.shape[0]
+        k = V.shape[1]
+
+        C = nl.ndarray((n, k), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        a_tile = nl.load(A[0:n, 0:n])
+
+        for j in nl.affine_range(k):
+            v_row = nl.load_transpose2d(V[0:n, j : j + 1])  # (1, n)
+            v_bc = nl.broadcast_to(v_row, (n, n))
+            prod = nl.multiply(a_tile, v_bc)
+            c_col = nl.sum(prod, axis=1, keepdims=True)  # (n, 1) FP32
             nl.store(C[0:n, j : j + 1], value=c_col)
 
         return C

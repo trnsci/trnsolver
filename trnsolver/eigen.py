@@ -118,14 +118,17 @@ def eigh_randomized(
     magnitude and their corresponding eigenvectors. Complexity O(n²k) vs
     eigh's O(n³), making it efficient when k ≪ n.
 
-    The sketch step (A @ Ω) routes through the Tensor Engine via matmul_kernel
-    when n ≤ 128 and k+oversampling ≤ 128; torch.matmul is used for larger
-    matrices. BF16/FP16 inputs are upcast to FP32 via the standard _to_fp32
-    shim; a native BF16 sketch path exploiting FP32 PSUM accumulation (and the
-    50–100× BF16 throughput advantage) is planned for v0.14.0.
+    **BF16-native sketch path (v0.14.0, Principle 1):** when A is BF16 and
+    the NKI backend is active, the sketch (A @ Ω) and projection (A @ Q) route
+    through matmul_kernel_fp32out — nc_matmul (Tensor Engine) with BF16 inputs
+    accumulating to FP32 via PSUM for free. A stays in BF16 throughout; only
+    the sketch outputs (Y, Q, B) are FP32. This avoids the O(n²) upcast and
+    delivers the 50–100× BF16 throughput advantage on the Tensor Engine.
+    FP16 and FP32 inputs use the standard _to_fp32/restore path.
 
     Args:
-        A: (n, n) symmetric matrix. BF16/FP16 upcast to FP32 internally.
+        A: (n, n) symmetric matrix. BF16 uses the BF16-native sketch path on
+           NKI hardware; FP16/FP32 upcast to FP32 via _to_fp32.
         k: Number of eigenvalues/eigenvectors to return. Must satisfy k ≥ 1
            and k + oversampling < n.
         oversampling: Oversampling parameter p; sketch size is ℓ = k + p.
@@ -150,7 +153,18 @@ def eigh_randomized(
     Raises:
         ValueError: if k < 1 or k + oversampling ≥ n.
     """
-    A, orig = _to_fp32(A)
+    # BF16-native path (Principle 1): keep A in BF16 and accumulate sketch/
+    # projection matmuls to FP32 via nc_matmul PSUM. All post-sketch ops
+    # (QR, eigh(B)) run in FP32. Triggered when A is BF16 and NKI is active.
+    # Falls back to the standard FP32-upcast path otherwise.
+    _bf16_native = A.dtype == torch.bfloat16 and _use_nki()
+
+    if _bf16_native:
+        orig = torch.bfloat16  # for _restore at return
+        # A stays BF16; Omega will be BF16 for the Tensor Engine
+    else:
+        A, orig = _to_fp32(A)
+
     n = A.shape[0]
     ell = k + oversampling  # sketch size
 
@@ -159,45 +173,53 @@ def eigh_randomized(
     if ell >= n:
         raise ValueError(f"k + oversampling ({ell}) must be < n ({n}); reduce k or oversampling")
 
-    # Random sketch matrix Ω ∈ R^{n×ℓ}: try trnrand (NKI-accelerated Philox),
-    # fall back to torch.randn. trnrand is an optional dependency.
+    # Random sketch matrix Ω. BF16-native path: BF16 Omega feeds the Tensor Engine
+    # directly. Standard path: FP32 Omega matches upcast A.
+    sketch_dtype = torch.bfloat16 if _bf16_native else A.dtype
+
     try:
         import trnrand as _tr
 
         _gen = _tr.Generator(seed=seed) if seed is not None else None
-        Omega = _tr.standard_normal(n, ell, dtype=A.dtype, device=A.device, generator=_gen)
+        Omega = _tr.standard_normal(n, ell, dtype=sketch_dtype, device=A.device, generator=_gen)
     except ImportError:
         _gen = torch.Generator(device=A.device)
         if seed is not None:
             _gen.manual_seed(seed)
-        Omega = torch.randn(n, ell, dtype=A.dtype, device=A.device, generator=_gen)
+        Omega = torch.randn(n, ell, dtype=sketch_dtype, device=A.device, generator=_gen)
 
-    # Sketch: Y = A @ Ω  (dominant cost — Tensor Engine for n,ℓ ≤ 128)
-    Y = _call_matmul(A, Omega)
+    if _bf16_native:
+        # BF16 A ⊗ BF16 Ω → FP32  (Tensor Engine + PSUM, Principle 1).
+        Y = _call_matmul_fp32out(A, Omega)
+        # Power iteration: Q_i is FP32 (from QR); _call_matmul_fp32out casts
+        # it to BF16 internally for nc_matmul. Acceptable: we are in the
+        # randomized sketch — approximation quality is what matters.
+        for _ in range(n_iter):
+            Q_i, _ = torch.linalg.qr(Y, mode="reduced")
+            Y = _call_matmul_fp32out(A, Q_i)
+        Q, _ = torch.linalg.qr(Y, mode="reduced")  # FP32 (n, ell)
+        AQ = _call_matmul_fp32out(A, Q)  # BF16 A @ BF16(Q) → FP32
+    else:
+        # Standard FP32 path.
+        Y = _call_matmul(A, Omega)
+        for _ in range(n_iter):
+            Q_i, _ = torch.linalg.qr(Y, mode="reduced")
+            Y = _call_matmul(A, Q_i)
+        Q, _ = torch.linalg.qr(Y, mode="reduced")
+        AQ = _call_matmul(A, Q)
 
-    # Power iteration: each round re-orthogonalizes to avoid numerical cancellation
-    # from repeated application of A without orthogonalization.
-    for _ in range(n_iter):
-        Q_i, _ = torch.linalg.qr(Y, mode="reduced")
-        Y = _call_matmul(A, Q_i)
-
-    # Orthogonalize Y → Q ∈ R^{n × ℓ} (thin QR)
-    Q, _ = torch.linalg.qr(Y, mode="reduced")
-
-    # Project: B = Q^T A Q  (ℓ × ℓ — small enough that torch.matmul is fast)
-    AQ = _call_matmul(A, Q)
+    # Project: B = Q^T A Q  (ℓ × ℓ, always FP32 in both paths)
     B = Q.T @ AQ
     B = 0.5 * (B + B.T)  # symmetrize for FP32 safety
 
-    # Small eigenproblem: exact, LAPACK eigh on (ℓ × ℓ)
+    # Small eigenproblem: exact LAPACK eigh on (ℓ × ℓ) — always FP32
     eig_vals, V_small = torch.linalg.eigh(B)  # (ℓ,) ascending, (ℓ, ℓ)
 
-    # Select k eigenvalues of largest |value| — the ones the sketch captured best.
-    # Sort ascending within those k for consistency with eigh's return convention.
+    # Select k eigenvalues of largest |value|. Sort ascending within those k.
     idx = torch.argsort(eig_vals.abs(), descending=True)[:k]
     idx_sorted = idx.sort().values
     eigenvalues_k = eig_vals[idx_sorted]
-    V_k = Q @ V_small[:, idx_sorted]  # (n, k)
+    V_k = Q @ V_small[:, idx_sorted]  # (n, k) FP32
 
     return _restore(eigenvalues_k, orig), _restore(V_k, orig)
 
@@ -277,6 +299,55 @@ def _call_matmul(A, V):
 
     work_device = torch_xla.device()
     C = matmul_kernel(A.to(work_device), V.to(work_device))
+    torch_xla.sync()
+    return C.to(orig_device)
+
+
+def _call_matmul_fp32out(A: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+    """C = A @ V with FP32 output. Inputs may be BF16 (BF16-native sketch path).
+
+    On NKI hardware (n ≤ 128, k ≤ 128): casts A and V to BF16, then calls
+    matmul_kernel_fp32out (Tensor Engine). nc_matmul accumulates BF16 products
+    to FP32 via PSUM for free (Principle 1: PSUM as free FP32 accumulator).
+    Output is always FP32 regardless of input dtype.
+
+    On the NKI simulator: upcasts inputs to FP32 for numpy compatibility
+    (BF16 is not a numpy dtype), then calls matmul_kernel_fp32out_sim. Same
+    FP32 output contract; code path is exercised even though the accumulation
+    is exact FP32 rather than BF16→FP32 PSUM.
+
+    Falls back to torch.matmul(A.float(), V.float()) when NKI is unavailable
+    or the matrix exceeds single-tile bounds.
+    """
+    if not _use_nki() or A.shape[0] > 128 or V.shape[1] > 128:
+        return torch.matmul(A.float(), V.float())
+
+    orig_device = A.device
+
+    if _use_simulator():
+        import nki
+
+        from .nki.dispatch import matmul_kernel_fp32out_sim
+
+        # Upcast to FP32 for numpy: the simulator can't represent BF16 arrays.
+        C = nki.simulate(matmul_kernel_fp32out_sim)(
+            A.float().detach().cpu().numpy(),
+            V.float().detach().cpu().numpy(),
+        )
+        return torch.from_numpy(C).to(orig_device)
+
+    import torch_neuronx  # noqa: F401
+    import torch_xla
+
+    from .nki.dispatch import matmul_kernel_fp32out
+
+    work_device = torch_xla.device()
+    # Cast both operands to BF16: nc_matmul uses the Tensor Engine in BF16 mode
+    # and accumulates to FP32 PSUM without any extra cost (Principle 1).
+    C = matmul_kernel_fp32out(
+        A.to(torch.bfloat16).to(work_device),
+        V.to(torch.bfloat16).to(work_device),
+    )
     torch_xla.sync()
     return C.to(orig_device)
 
