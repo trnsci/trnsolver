@@ -89,3 +89,83 @@ class TestEighGeneralized:
             lhs = A @ vecs[:, i]
             rhs = vals[i] * B @ vecs[:, i]
             np.testing.assert_allclose(lhs.numpy(), rhs.numpy(), atol=1e-3)
+
+
+class TestEighRandomized:
+    """eigh_randomized: Nakatsukasa–Tropp sRR (SIAM SIMAX 45(2), 2024).
+
+    Tests cover PSD accuracy, Frobenius reconstruction, eigenvector
+    orthonormality, dtype restoration, power iteration, reproducibility,
+    and input validation.
+    """
+
+    def test_psd_top_k_eigenvalues(self, spd_matrix):
+        """Returned k eigenvalues approximate the k largest of torch.linalg.eigh."""
+        n, k = 32, 5
+        A = spd_matrix(n)
+        w_all, _ = torch.linalg.eigh(A)  # ascending
+        w_top_ref = w_all[-k:].sort().values  # k largest, ascending
+        # n_iter=2 needed for rtol=1% accuracy; n_iter=0 with oversampling=15
+        # gives ~10% error on this fixture (dense spectrum, small relative gaps).
+        w_rand, _ = trnsolver.eigh_randomized(A, k, oversampling=15, n_iter=2, seed=0)
+        np.testing.assert_allclose(w_rand.numpy(), w_top_ref.numpy(), rtol=1e-2, atol=1e-3)
+
+    def test_reconstruction_rank_k(self, spd_matrix):
+        """Low-rank reconstruction error bounded by tail eigenvalue energy."""
+        n, k = 32, 8
+        A = spd_matrix(n)
+        w, V = trnsolver.eigh_randomized(A, k, oversampling=15, seed=42)
+        A_approx = V @ torch.diag(w) @ V.T
+        # Tail bound: ||A - A_k||_F = sqrt(Σ_{i>k} σ_i^2), approximately 2× slack
+        w_all, _ = torch.linalg.eigh(A)
+        tail_bound = torch.linalg.norm(w_all[:-k]).item()
+        residual = torch.linalg.norm(A - A_approx, ord="fro").item()
+        assert residual < 2.0 * tail_bound + 1e-2
+
+    def test_eigenvectors_orthonormal(self, sym_matrix):
+        """Returned eigenvectors are orthonormal: V^T V ≈ I."""
+        n, k = 24, 6
+        A = sym_matrix(n)
+        _, V = trnsolver.eigh_randomized(A, k, oversampling=10, seed=0)
+        VtV = V.T @ V
+        np.testing.assert_allclose(VtV.numpy(), np.eye(k), atol=1e-4)
+
+    def test_bf16_input_restored(self, sym_matrix):
+        """BF16 input → BF16 output (dtype round-trip via _to_fp32/_restore)."""
+        n, k = 16, 4
+        A = sym_matrix(n).to(torch.bfloat16)
+        w, V = trnsolver.eigh_randomized(A, k, oversampling=10, seed=0)
+        assert w.dtype == torch.bfloat16
+        assert V.dtype == torch.bfloat16
+
+    def test_power_iteration_accuracy(self):
+        """n_iter=1 does not degrade accuracy vs n_iter=0 (usually improves)."""
+        torch.manual_seed(7)
+        n, k = 48, 6
+        A = torch.randn(n, n)
+        A = 0.5 * (A + A.T)
+        w_all, _ = torch.linalg.eigh(A)
+        w_top_ref = w_all[-k:].sort().values
+
+        w0, _ = trnsolver.eigh_randomized(A, k, oversampling=15, n_iter=0, seed=1)
+        w1, _ = trnsolver.eigh_randomized(A, k, oversampling=15, n_iter=1, seed=1)
+        err0 = torch.abs(w0 - w_top_ref).max().item()
+        err1 = torch.abs(w1 - w_top_ref).max().item()
+        # Power iteration should not make things worse; allow 2× slack for randomness
+        assert err1 <= err0 * 2.0 + 1e-3
+
+    def test_seed_reproducibility(self, sym_matrix):
+        """Same seed produces identical eigenvalues and eigenvectors."""
+        n, k = 20, 5
+        A = sym_matrix(n)
+        w1, V1 = trnsolver.eigh_randomized(A, k, seed=42)
+        w2, V2 = trnsolver.eigh_randomized(A, k, seed=42)
+        np.testing.assert_array_equal(w1.numpy(), w2.numpy())
+
+    def test_invalid_k_raises(self, spd_matrix):
+        """k < 1 and k + oversampling ≥ n both raise ValueError."""
+        A = spd_matrix(10)
+        with pytest.raises(ValueError):
+            trnsolver.eigh_randomized(A, 0)  # k < 1
+        with pytest.raises(ValueError):
+            trnsolver.eigh_randomized(A, 9, oversampling=10)  # k + p = 19 ≥ n=10

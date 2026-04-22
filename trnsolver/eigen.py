@@ -103,6 +103,105 @@ def eigh_generalized(
     return _restore(eigenvalues, orig), _restore(eigenvectors, orig)
 
 
+def eigh_randomized(
+    A: torch.Tensor,
+    k: int,
+    *,
+    oversampling: int = 10,
+    n_iter: int = 0,
+    seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Randomized symmetric eigensolver: k dominant eigenvalues/eigenvectors.
+
+    Implements the Nakatsukasa–Tropp sketch-and-Rayleigh-Ritz (sRR) algorithm
+    (SIAM SIMAX 45(2), 2024). Returns the k eigenvalues of largest absolute
+    magnitude and their corresponding eigenvectors. Complexity O(n²k) vs
+    eigh's O(n³), making it efficient when k ≪ n.
+
+    The sketch step (A @ Ω) routes through the Tensor Engine via matmul_kernel
+    when n ≤ 128 and k+oversampling ≤ 128; torch.matmul is used for larger
+    matrices. BF16/FP16 inputs are upcast to FP32 via the standard _to_fp32
+    shim; a native BF16 sketch path exploiting FP32 PSUM accumulation (and the
+    50–100× BF16 throughput advantage) is planned for v0.14.0.
+
+    Args:
+        A: (n, n) symmetric matrix. BF16/FP16 upcast to FP32 internally.
+        k: Number of eigenvalues/eigenvectors to return. Must satisfy k ≥ 1
+           and k + oversampling < n.
+        oversampling: Oversampling parameter p; sketch size is ℓ = k + p.
+                      Larger values improve accuracy at O(n²p) extra cost.
+                      Default 10.
+        n_iter: Power-iteration rounds for improved accuracy when the spectral
+                gap between eigenvalues k and k+1 is small. Default 0 (pure
+                sRR). Each round adds one A@ call with re-orthogonalization.
+        seed: RNG seed for the sketch matrix Ω. None = unseeded.
+
+    Returns:
+        eigenvalues: (k,) Rayleigh quotients sorted ascending. These approximate
+                     the k eigenvalues of A with largest absolute value.
+        eigenvectors: (n, k) corresponding eigenvectors (columns), orthonormal.
+
+    Note:
+        This algorithm targets eigenvalues of **largest magnitude**, not the
+        smallest. For SCF's k occupied orbitals (k smallest eigenvalues of the
+        Fock matrix), use ``eigh`` instead. A shift strategy for smallest
+        eigenvalues is planned for a future release.
+
+    Raises:
+        ValueError: if k < 1 or k + oversampling ≥ n.
+    """
+    A, orig = _to_fp32(A)
+    n = A.shape[0]
+    ell = k + oversampling  # sketch size
+
+    if k < 1:
+        raise ValueError(f"k must be ≥ 1, got {k}")
+    if ell >= n:
+        raise ValueError(f"k + oversampling ({ell}) must be < n ({n}); reduce k or oversampling")
+
+    # Random sketch matrix Ω ∈ R^{n×ℓ}: try trnrand (NKI-accelerated Philox),
+    # fall back to torch.randn. trnrand is an optional dependency.
+    try:
+        import trnrand as _tr
+
+        _gen = _tr.Generator(seed=seed) if seed is not None else None
+        Omega = _tr.standard_normal(n, ell, dtype=A.dtype, device=A.device, generator=_gen)
+    except ImportError:
+        _gen = torch.Generator(device=A.device)
+        if seed is not None:
+            _gen.manual_seed(seed)
+        Omega = torch.randn(n, ell, dtype=A.dtype, device=A.device, generator=_gen)
+
+    # Sketch: Y = A @ Ω  (dominant cost — Tensor Engine for n,ℓ ≤ 128)
+    Y = _call_matmul(A, Omega)
+
+    # Power iteration: each round re-orthogonalizes to avoid numerical cancellation
+    # from repeated application of A without orthogonalization.
+    for _ in range(n_iter):
+        Q_i, _ = torch.linalg.qr(Y, mode="reduced")
+        Y = _call_matmul(A, Q_i)
+
+    # Orthogonalize Y → Q ∈ R^{n × ℓ} (thin QR)
+    Q, _ = torch.linalg.qr(Y, mode="reduced")
+
+    # Project: B = Q^T A Q  (ℓ × ℓ — small enough that torch.matmul is fast)
+    AQ = _call_matmul(A, Q)
+    B = Q.T @ AQ
+    B = 0.5 * (B + B.T)  # symmetrize for FP32 safety
+
+    # Small eigenproblem: exact, LAPACK eigh on (ℓ × ℓ)
+    eig_vals, V_small = torch.linalg.eigh(B)  # (ℓ,) ascending, (ℓ, ℓ)
+
+    # Select k eigenvalues of largest |value| — the ones the sketch captured best.
+    # Sort ascending within those k for consistency with eigh's return convention.
+    idx = torch.argsort(eig_vals.abs(), descending=True)[:k]
+    idx_sorted = idx.sort().values
+    eigenvalues_k = eig_vals[idx_sorted]
+    V_k = Q @ V_small[:, idx_sorted]  # (n, k)
+
+    return _restore(eigenvalues_k, orig), _restore(V_k, orig)
+
+
 def _torch_eigh(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """PyTorch backend path — delegates to torch.linalg.eigh (LAPACK)."""
     return torch.linalg.eigh(A)
@@ -152,7 +251,15 @@ def _call_matmul(A, V):
     To compute B.T @ C: call _call_matmul(B.T.contiguous(), C). The
     `.contiguous()` is required because load_transpose2d in the kernel expects
     a row-major HBM tensor; a transposed view has wrong strides.
+
+    Falls back to torch.matmul when: NKI is not available (_use_nki() is False),
+    n > 128, or k > 128 (single-tile limits). This makes _call_matmul safe for
+    callers such as eigh_randomized that call it unconditionally — on non-Neuron
+    hardware the NKI guard ensures torch.matmul is used transparently.
     """
+    if not _use_nki() or A.shape[0] > 128 or V.shape[1] > 128:
+        return torch.matmul(A, V)
+
     orig_device = A.device
 
     if _use_simulator():

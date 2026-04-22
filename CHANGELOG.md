@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-04-21
+
+### Added
+
+- **`eigh_randomized(A, k, *, oversampling=10, n_iter=0, seed=None)`** — Randomized
+  symmetric eigensolver implementing the Nakatsukasa–Tropp sketch-and-Rayleigh-Ritz
+  (sRR) algorithm (SIAM SIMAX 45(2), 2024). Returns the k eigenvalues of largest
+  absolute magnitude and their corresponding eigenvectors. Complexity O(n²k) vs
+  `eigh`'s O(n³), with 50–100× speedup potential at BF16 on Trainium once the
+  native BF16 sketch path lands (v0.14.0 target).
+
+  Algorithm: sketch Ω ∈ R^{n×(k+p)} ~ N(0,1); Y = A@Ω; optional power iteration
+  (A@Q each round with re-orthogonalization); Q = orth(Y); B = Q^T A Q (small
+  (k+p)×(k+p) matrix); exact eigh(B); select k eigenvalues of largest |value|; lift
+  V_k = Q @ V_small. Output eigenvalues are Rayleigh quotients sorted ascending.
+
+  - `_call_matmul` shape guard extended to also short-circuit when `_use_nki()` is
+    False, making it safe for callers such as `eigh_randomized` that call it
+    unconditionally on arbitrary-size inputs (previously only dimension bounds were
+    checked; non-NKI hardware would attempt `import torch_neuronx`).
+  - Optional `trnrand` import for the sketch matrix Ω (NKI-accelerated Philox RNG);
+    falls back to `torch.randn` when `trnrand` is not installed.
+  - `seed` parameter enables reproducible runs; `None` = unseeded.
+
+  **Note:** Targets eigenvalues of largest magnitude, not smallest. For SCF's
+  k occupied orbitals (k smallest eigenvalues), use `eigh`. v0.14.0 will add a
+  native BF16 sketch path (BF16 A → FP32 PSUM via `nc_matmul`, Principle 1).
+
+### Changed
+
+- `_call_matmul` dispatch helper now short-circuits with `torch.matmul` when
+  `_use_nki()` is False (in addition to the existing n > 128 / k > 128 dimension
+  guards). This is a pure correctness fix for CPU-only environments; NKI-hardware
+  behavior is unchanged.
+
 ## [0.12.0] — 2026-04-21
 
 ### Added
