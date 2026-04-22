@@ -6,7 +6,7 @@ computing on Trainium. Complements trnblas (BLAS) and trnfft (FFT).
 Part of the trnsci scientific computing suite.
 """
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 # Eigenvalue decomposition
 from .eigen import eigh, eigh_generalized, eigh_randomized
@@ -31,6 +31,7 @@ from .iterative import (
     block_jacobi_preconditioner,
     cg,
     gmres,
+    gmres_ir,
     jacobi_preconditioner,
     ssor_preconditioner,
 )
@@ -58,6 +59,7 @@ __all__ = [
     # Iterative
     "cg",
     "gmres",
+    "gmres_ir",
     "jacobi_preconditioner",
     "block_jacobi_preconditioner",
     "ssor_preconditioner",

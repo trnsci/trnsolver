@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-04-22
+
+### Added
+
+- **`gmres_ir(A, b, tol=1e-10, max_outer=5, inner_tol=1e-1, inner_maxiter=50, inner_restart=20)`**
+  — GMRES with iterative refinement for general (non-symmetric) Ax = b. Implements
+  the Carson–Higham two-precision framework, extending the `solve_spd` iterative
+  refinement path (Cholesky, SPD only, one correction step) to GMRES + multiple outer
+  iterations over any invertible A.
+
+  Algorithm: compute FP32 LU(A) once; outer loop computes the FP64 residual
+  r = b − Ax, then solves the left-preconditioned correction system
+  (U⁻¹ L⁻¹ Pᵀ A) δx = U⁻¹ L⁻¹ Pᵀ r via the existing `gmres` callable interface,
+  and accumulates x += δx. When the FP32 LU is accurate, the preconditioned
+  system is near-identity and the inner GMRES converges in very few steps.
+
+  Precision tiers:
+  - **Factorization:** FP32 LU via `torch.linalg.lu` (once, reused per outer step)
+  - **Inner GMRES:** FP32 Krylov vectors and modified Gram-Schmidt
+  - **Outer residual:** FP64 — captures errors below FP32 machine epsilon
+  - **Correction solve:** FP32 triangular solves reusing stored L, U
+  - **Reliable for:** cond(A) ≲ 1/eps32 ≈ 1e7
+
+  Returns `(x, total_inner, residual)` where `total_inner` is the total GMRES
+  matvec count across all outer steps and `residual` is the final FP64 relative
+  residual. BF16/FP16 inputs upcast to FP32 via `_to_fp32`; output restored.
+
+  **Honest non-fits and deferred work:**
+  - **BF16 inner path deferred (v0.16.0).** The inner matvec A@v could use
+    `matmul_kernel_fp32out` (BF16 Tensor Engine → FP32 PSUM, Principle 1) for
+    50–100× throughput. However, Gram-Schmidt dot products need SR (Principle 3,
+    Connolly–Higham–Mary 2021) for BF16 stability at n ≥ ~300. Deferred until
+    `trnrand` SR lands.
+  - **Single-RHS only.** Block RHS (n × k) via column iteration is v0.16.0.
+  - **Callable A not supported.** LU requires a concrete matrix; raises `TypeError`
+    for callable matvec operators. Use `gmres` directly for matrix-free problems.
+
 ## [0.14.0] — 2026-04-21
 
 ### Added
