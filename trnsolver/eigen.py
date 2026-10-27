@@ -25,7 +25,7 @@ import math
 
 import torch
 
-from .factor import _restore, _to_fp32
+from .factor import _cholesky_lower, _restore, _to_fp32
 from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki, _use_simulator
 
 
@@ -42,6 +42,14 @@ def eigh(
     Returns:
         eigenvalues: (n,) sorted ascending
         eigenvectors: (n, n) columns are eigenvectors
+
+    The NKI path (Householder tridiagonalization + implicit-shift QR) is
+    eager-only: deflation and shift selection are data-dependent Python
+    control flow on ``.item()`` scalars. :func:`_householder_qr_eigh` is
+    wrapped in ``torch.compiler.disable``, so under ``torch.compile`` it runs
+    eagerly behind a single graph break (an error under ``fullgraph=True``)
+    rather than splitting into dozens of subgraphs (#41). The PyTorch path
+    traces as one ``torch.linalg.eigh`` call.
     """
     A, orig = _to_fp32(A)
     if _use_nki():
@@ -81,7 +89,7 @@ def eigh_generalized(
     except ImportError:
         _tb = None
 
-    L = torch.linalg.cholesky(B)
+    L = _cholesky_lower(B)
 
     if _tb is not None:
         # NKI path: trnblas.trsm dispatches to the blocked NKI GEMM path on
@@ -668,6 +676,7 @@ def _apply_reflectors(V_refs: torch.Tensor, Q: torch.Tensor) -> torch.Tensor:
 # ----------------------------------------------------------------------
 
 
+@torch.compiler.disable
 def _householder_qr_eigh(
     A: torch.Tensor,
     tol: float = 1e-10,

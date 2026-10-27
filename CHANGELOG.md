@@ -24,8 +24,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NotImplementedError` for n > 128, so the 256 and 512 cases failed on
   hardware rather than measuring anything. The PyTorch and torch baselines
   still run at every size.
+- **`cholesky`, `solve`, `solve_spd`, `inv_spd` and `eigh_generalized` trace
+  under `torch.compile` without side-effecting ops.** `torch.linalg.cholesky`
+  and `torch.linalg.solve` decompose to their `*_ex` kernel followed by
+  `aten._linalg_check_errors(info)`, an output-less op that exists only to
+  raise `LinAlgError`. Newer PyTorch wraps it in the `with_effects`
+  higher-order op, which TorchNeuron's FxImporter does not implement, so
+  `cholesky` and `solve` failed with `BackendCompilerFailed` on Trn2. Inside a
+  compiled region (`torch.compiler.is_compiling()`) these now call
+  `torch.linalg.cholesky_ex` / `torch.linalg.solve_ex` directly. Same kernel
+  and numerics; only the error check is gone, so under `torch.compile` a
+  non-SPD or singular input returns an invalid result instead of raising.
+  Eager calls still raise. (#41)
+- **`qr` traces to StableHLO-lowerable ops under `torch.compile`.**
+  `aten.linalg_qr` has no StableHLO lowering on Neuron. When compiling, real
+  inputs now use `_householder_qr`, a reduced Householder QR made of
+  elementwise ops, `where` masks, `mm` and `triu`. It has no `.item()`, no
+  data-dependent control flow and no in-place slice assignment, and its
+  static column loop unrolls at trace time. It uses LAPACK's sign convention
+  (`R[k, k] = -sign(A[k, k]) * ||A[k:, k]||`, and the reflector is skipped
+  when the sub-column is already zero), so Q and R match `torch.linalg.qr` to
+  rounding. Supports batch dimensions. Eager calls and complex inputs still
+  use `torch.linalg.qr`. (#41)
+- **`eigh` (NKI path), `cg`, `gmres` and `gmres_ir` are documented as
+  eager-only and wrapped in `torch.compiler.disable`.** Their convergence and
+  deflation logic is data-dependent Python control flow on `.item()` scalars,
+  and they return Python numbers. Under `torch.compile` this split the graph
+  into many pieces (26 graph breaks for `eigh` at n=128, 4 for `cg`). They now
+  run eagerly behind one graph break, and `fullgraph=True` raises a clear
+  `Unsupported` error. The algorithms are unchanged. (#41)
 
 ### Added
+
+- **`tests/test_compile.py`**: CPU checks with `torch.compile(backend="aot_eager",
+  fullgraph=True)` that `cholesky`, `solve`, `solve_spd` and `qr` trace with
+  zero graph breaks and match eager results, that the traced aten graph has no
+  `_linalg_check_errors` and no `linalg_qr`, and that eager `cholesky`/`solve`
+  still raise `LinAlgError`. Also tests `_householder_qr` against LAPACK
+  (including zero columns and batches) and the eager-only fallback for `cg`.
 
 - **`tests/test_nki_compile.py`** (marker `nki_simulator`): runs the NKI
   frontend (trace → MLIR → `verify()`) on CPU for every `@nki.jit` kernel at

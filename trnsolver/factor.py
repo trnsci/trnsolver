@@ -38,13 +38,98 @@ def _restore(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return x.to(dtype) if dtype in _LOW_PRECISION else x
 
 
+# ----------------------------------------------------------------------
+# torch.compile support (#41)
+# ----------------------------------------------------------------------
+#
+# ``torch.linalg.cholesky`` and ``torch.linalg.solve`` decompose to their
+# ``*_ex`` variant followed by ``aten._linalg_check_errors(info)``. That check
+# has no outputs; it exists only to raise ``LinAlgError``. Newer PyTorch
+# treats it as a side-effecting op, so a compiled graph wraps it in the
+# ``with_effects`` higher-order op, which TorchNeuron's FxImporter cannot
+# lower. Inside a compiled region we therefore call the ``*_ex`` variants
+# directly (``check_errors=False``). The factorization kernel is the same;
+# only the ``info`` check is skipped, so a non-SPD / singular input returns
+# an invalid result instead of raising. Eager calls keep the raising path.
+
+
+def _cholesky_lower(A: torch.Tensor) -> torch.Tensor:
+    """Lower Cholesky factor; no error-check side effect when compiling."""
+    if torch.compiler.is_compiling():
+        L, _info = torch.linalg.cholesky_ex(A)
+        return L
+    return torch.linalg.cholesky(A)
+
+
+def _solve_general(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """LU-based solve; no error-check side effect when compiling."""
+    if torch.compiler.is_compiling():
+        X, _info = torch.linalg.solve_ex(A, B)
+        return X
+    return torch.linalg.solve(A, B)
+
+
+def _householder_qr(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduced Householder QR built from elementwise ops, matmuls and ``where``.
+
+    Used by :func:`qr` inside ``torch.compile``: ``aten.linalg_qr`` has no
+    StableHLO lowering on Neuron (#41). This builds the same factorization
+    LAPACK's ``geqrf`` + ``orgqr`` compute, with the same sign convention
+    (``R[k, k] = -sign(A[k, k]) * ||A[k:, k]||``, reflector skipped when the
+    sub-column is already zero). No data-dependent Python control flow, no
+    ``.item()``, no in-place slice assignment: the column loop is a static
+    Python loop over ``min(m, n)`` that unrolls at trace time, and every
+    per-column restriction is a row/column mask. Supports leading batch dims.
+    Real dtypes only.
+    """
+    m, n = A.shape[-2], A.shape[-1]
+    kk = min(m, n)
+    R = A
+    rows = torch.arange(m, device=A.device).unsqueeze(-1)  # (m, 1)
+    cols = torch.arange(n, device=A.device)  # (n,)
+    one = torch.ones((), dtype=A.dtype, device=A.device)
+    vs = []
+    taus = []
+    for k in range(kk):
+        below = rows >= k  # (m, 1)
+        x = torch.where(below, R[..., :, k : k + 1], 0.0)  # (..., m, 1)
+        alpha = R[..., k : k + 1, k : k + 1]  # (..., 1, 1)
+        tail = torch.where(rows > k, x, 0.0)
+        tail_sq = (tail * tail).sum(dim=-2, keepdim=True)  # (..., 1, 1)
+        norm_x = torch.sqrt(alpha * alpha + tail_sq)
+        sign = torch.where(alpha >= 0, one, -one)
+        beta = -sign * norm_x
+        active = tail_sq > 0
+        denom = torch.where(active, alpha - beta, one)
+        tau = torch.where(active, (beta - alpha) / torch.where(active, beta, one), 0.0)
+        # v[k] = 1, v[k+1:] = x[k+1:] / (alpha - beta), v[:k] = 0
+        v = torch.where(rows == k, one, tail / denom)
+        # R <- (I - tau v v^T) R, restricted to columns k: (columns < k are
+        # already reduced and would only pick up rounding noise).
+        w = (v.transpose(-2, -1) @ R) * (cols >= k)  # (..., 1, n)
+        R = R - tau * (v @ w)
+        vs.append(v)
+        taus.append(tau)
+    # Q = H_0 H_1 ... H_{kk-1} I[:, :kk], accumulated backward (orgqr order).
+    Q = torch.eye(m, kk, dtype=A.dtype, device=A.device).expand(*A.shape[:-2], m, kk)
+    for k in reversed(range(kk)):
+        v, tau = vs[k], taus[k]
+        Q = Q - tau * (v @ (v.transpose(-2, -1) @ Q))
+    R = torch.triu(R[..., :kk, :])
+    return Q, R
+
+
 def cholesky(A: torch.Tensor, upper: bool = False) -> torch.Tensor:
     """Cholesky factorization: A = L @ L^T (or A = U^T @ U if upper=True).
 
     A must be symmetric positive definite.
+
+    Under ``torch.compile`` the ``LinAlgError`` check for a non-SPD input is
+    skipped: a non-SPD input returns an invalid factor instead of raising
+    (#41).
     """
     A, orig = _to_fp32(A)
-    L = torch.linalg.cholesky(A)
+    L = _cholesky_lower(A)
     if upper:
         return _restore(L.T, orig)
     return _restore(L, orig)
@@ -70,9 +155,18 @@ def qr(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     Returns:
         Q: Orthogonal matrix (m, min(m,n))
         R: Upper triangular (min(m,n), n)
+
+    Eager calls use ``torch.linalg.qr`` (LAPACK / MAGMA). Under
+    ``torch.compile`` real inputs go through :func:`_householder_qr`, a
+    Householder formulation in standard aten ops, because ``aten.linalg_qr``
+    does not lower to StableHLO on Neuron (#41). Both follow LAPACK's sign
+    convention; results agree to rounding.
     """
     A, orig = _to_fp32(A)
-    Q, R = torch.linalg.qr(A)
+    if torch.compiler.is_compiling() and not A.is_complex():
+        Q, R = _householder_qr(A)
+    else:
+        Q, R = torch.linalg.qr(A)
     return _restore(Q, orig), _restore(R, orig)
 
 
@@ -322,11 +416,12 @@ def schur(
 def solve(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """Solve A @ X = B for X.
 
-    Uses LU factorization internally.
+    Uses LU factorization internally. Under ``torch.compile`` the
+    ``LinAlgError`` check for a singular A is skipped (#41).
     """
     A, orig = _to_fp32(A)
     B = B.to(A.dtype)
-    X = torch.linalg.solve(A, B)
+    X = _solve_general(A, B)
     return _restore(X, orig)
 
 

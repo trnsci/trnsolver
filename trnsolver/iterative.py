@@ -134,6 +134,7 @@ def ssor_preconditioner(
     return apply
 
 
+@torch.compiler.disable
 def cg(
     A: torch.Tensor | Callable,
     b: torch.Tensor,
@@ -158,6 +159,12 @@ def cg(
         x: Solution vector
         iters: Number of iterations
         residual: Final relative residual norm
+
+    Eager-only: convergence is a data-dependent Python loop that reads
+    scalars with ``.item()``, and the returned iteration count and residual
+    are Python numbers. The function is wrapped in ``torch.compiler.disable``,
+    so inside a compiled region it runs eagerly behind a single graph break
+    (an error under ``fullgraph=True``) instead of fragmenting the graph (#41).
     """
     b, orig = _to_fp32(b)
     if not callable(A):
@@ -210,6 +217,7 @@ def cg(
     return _restore(x, orig), maxiter, torch.linalg.norm(r).item() / b_norm
 
 
+@torch.compiler.disable
 def gmres(
     A: torch.Tensor | Callable,
     b: torch.Tensor,
@@ -236,6 +244,8 @@ def gmres(
         x: Solution vector
         total_iters: Total matvec count
         residual: Final relative residual norm
+
+    Eager-only (``torch.compiler.disable``); see :func:`cg` (#41).
     """
     b, orig = _to_fp32(b)
     if not callable(A):
@@ -292,6 +302,7 @@ def gmres(
     return _restore(x, orig), total_iters, torch.linalg.norm(r).item() / b_norm
 
 
+@torch.compiler.disable
 def gmres_ir(
     A: torch.Tensor,
     b: torch.Tensor,
@@ -350,6 +361,8 @@ def gmres_ir(
     Raises:
         TypeError: if A is callable (matrix required for LU factorization).
         torch.linalg.LinAlgError: if A is singular or factorization fails.
+
+    Eager-only (``torch.compiler.disable``); see :func:`cg` (#41).
     """
     if callable(A):
         raise TypeError(
