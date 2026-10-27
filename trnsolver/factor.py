@@ -42,30 +42,112 @@ def _restore(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
 # torch.compile support (#41)
 # ----------------------------------------------------------------------
 #
-# ``torch.linalg.cholesky`` and ``torch.linalg.solve`` decompose to their
-# ``*_ex`` variant followed by ``aten._linalg_check_errors(info)``. That check
-# has no outputs; it exists only to raise ``LinAlgError``. Newer PyTorch
-# treats it as a side-effecting op, so a compiled graph wraps it in the
-# ``with_effects`` higher-order op, which TorchNeuron's FxImporter cannot
-# lower. Inside a compiled region we therefore call the ``*_ex`` variants
-# directly (``check_errors=False``). The factorization kernel is the same;
-# only the ``info`` check is skipped, so a non-SPD / singular input returns
-# an invalid result instead of raising. Eager calls keep the raising path.
+# Inside a compiled region (``torch.compiler.is_compiling()``) real inputs
+# take traceable implementations built only from ops the Neuron backend can
+# lower to StableHLO: elementwise ops, ``where`` masks, ``mm``/``matmul``,
+# ``sqrt``, ``sum``, ``argmax``, ``gather``, ``eye`` and ``triu``. Each is a
+# static Python loop over the matrix dimension that unrolls at trace time,
+# with no ``.item()``, no data-dependent control flow and no in-place slice
+# assignment. Two reasons:
+#
+# - ``torch.linalg.cholesky`` / ``torch.linalg.solve`` decompose to a
+#   ``*_ex`` kernel plus ``aten._linalg_check_errors(info)``. That check is
+#   side-effecting (it only raises), and newer PyTorch wraps it in the
+#   ``with_effects`` HOP, which TorchNeuron's FxImporter cannot import.
+# - Neuron has no lowering for ``linalg_cholesky_ex``, ``linalg_solve_ex`` or
+#   ``linalg_qr`` themselves.
+#
+# Consequence: under ``torch.compile`` a non-SPD / singular input returns NaN
+# or inf instead of raising ``LinAlgError``. Eager calls are unchanged and
+# keep using LAPACK / MAGMA.
+
+
+def _traceable(A: torch.Tensor) -> bool:
+    return torch.compiler.is_compiling() and not A.is_complex()
+
+
+def _cholesky_traceable(A: torch.Tensor) -> torch.Tensor:
+    """Lower Cholesky factor by right-looking column elimination.
+
+    Reads only the lower triangle of A, like LAPACK ``potrf``. Step k takes
+    ``l_k = S[:, k] / sqrt(S[k, k])`` (rows >= k) from the Schur complement S
+    and subtracts the rank-1 update ``l_k l_k^T``. Supports batch dims. A
+    non-SPD input gives NaN from ``sqrt`` of a negative pivot.
+    """
+    n = A.shape[-1]
+    S = torch.tril(A) + torch.tril(A, diagonal=-1).transpose(-2, -1)
+    rows = torch.arange(n, device=A.device).unsqueeze(-1)  # (n, 1)
+    cols = torch.arange(n, device=A.device)  # (n,)
+    L = torch.zeros_like(A)
+    for k in range(n):
+        d = torch.sqrt(S[..., k : k + 1, k : k + 1])  # (..., 1, 1)
+        col = torch.where(rows >= k, S[..., :, k : k + 1] / d, 0.0)  # (..., n, 1)
+        L = torch.where(cols == k, col, L)
+        S = S - col @ col.transpose(-2, -1)
+    return L
+
+
+def _solve_triangular_traceable(T: torch.Tensor, B: torch.Tensor, upper: bool) -> torch.Tensor:
+    """Solve T X = B by forward (lower) or back (upper) substitution. B is (..., n, k)."""
+    n = T.shape[-1]
+    T = torch.triu(T) if upper else torch.tril(T)
+    rows = torch.arange(n, device=T.device).unsqueeze(-1)
+    X = torch.zeros(
+        torch.broadcast_shapes(T.shape[:-2], B.shape[:-2]) + B.shape[-2:],
+        dtype=B.dtype,
+        device=B.device,
+    )
+    for k in reversed(range(n)) if upper else range(n):
+        # Rows of X not yet solved are still zero, so T[k, :] @ X only picks
+        # up the already-solved entries.
+        r = B[..., k : k + 1, :] - T[..., k : k + 1, :] @ X
+        X = torch.where(rows == k, r / T[..., k : k + 1, k : k + 1], X)
+    return X
+
+
+def _solve_lu_traceable(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """Solve A X = B by Gaussian elimination with partial pivoting (GEPP).
+
+    Same pivot choice as LAPACK ``getrf`` (first row of maximal ``|a_ik|``,
+    i >= k). The row swap is a ``gather`` with a permutation index built from
+    ``argmax``; elimination runs on the augmented ``[A | B]`` so no L factor
+    or pivot vector is kept, then back substitution on the upper triangle.
+    B is (..., n, k). A singular A gives inf/NaN.
+    """
+    n = A.shape[-1]
+    batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
+    M = torch.cat([A.expand(*batch, n, n), B.expand(*batch, n, B.shape[-1])], dim=-1)
+    rows = torch.arange(n, device=A.device)
+    for k in range(n):
+        mag = torch.where(rows >= k, M[..., :, k].abs(), -1.0)  # (..., n)
+        p = torch.argmax(mag, dim=-1, keepdim=True)  # (..., 1)
+        perm = torch.where(rows == k, p, torch.where(rows == p, k, rows))  # (..., n)
+        M = torch.gather(M, -2, perm.unsqueeze(-1).expand(M.shape))
+        factors = torch.where(rows > k, M[..., :, k] / M[..., k : k + 1, k], 0.0)
+        M = M - factors.unsqueeze(-1) * M[..., k : k + 1, :]
+    return _solve_triangular_traceable(M[..., :n], M[..., n:], upper=True)
 
 
 def _cholesky_lower(A: torch.Tensor) -> torch.Tensor:
-    """Lower Cholesky factor; no error-check side effect when compiling."""
-    if torch.compiler.is_compiling():
-        L, _info = torch.linalg.cholesky_ex(A)
-        return L
+    """Lower Cholesky factor; traceable formulation when compiling."""
+    if _traceable(A):
+        return _cholesky_traceable(A)
     return torch.linalg.cholesky(A)
 
 
+def _solve_triangular(T: torch.Tensor, B: torch.Tensor, upper: bool) -> torch.Tensor:
+    """``torch.linalg.solve_triangular``; traceable formulation when compiling."""
+    if _traceable(T):
+        return _solve_triangular_traceable(T, B, upper)
+    return torch.linalg.solve_triangular(T, B, upper=upper)
+
+
 def _solve_general(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    """LU-based solve; no error-check side effect when compiling."""
-    if torch.compiler.is_compiling():
-        X, _info = torch.linalg.solve_ex(A, B)
-        return X
+    """LU-based solve; traceable formulation when compiling."""
+    if _traceable(A):
+        vector = B.dim() == A.dim() - 1
+        X = _solve_lu_traceable(A, B.unsqueeze(-1) if vector else B)
+        return X.squeeze(-1) if vector else X
     return torch.linalg.solve(A, B)
 
 
@@ -124,9 +206,10 @@ def cholesky(A: torch.Tensor, upper: bool = False) -> torch.Tensor:
 
     A must be symmetric positive definite.
 
-    Under ``torch.compile`` the ``LinAlgError`` check for a non-SPD input is
-    skipped: a non-SPD input returns an invalid factor instead of raising
-    (#41).
+    Eager calls use ``torch.linalg.cholesky``. Under ``torch.compile`` real
+    inputs use :func:`_cholesky_traceable`, a right-looking column Cholesky in
+    lowerable ops, because Neuron cannot lower ``linalg_cholesky_ex`` (#41).
+    There a non-SPD input yields NaN instead of raising ``LinAlgError``.
     """
     A, orig = _to_fp32(A)
     L = _cholesky_lower(A)
@@ -163,7 +246,7 @@ def qr(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     convention; results agree to rounding.
     """
     A, orig = _to_fp32(A)
-    if torch.compiler.is_compiling() and not A.is_complex():
+    if _traceable(A):
         Q, R = _householder_qr(A)
     else:
         Q, R = torch.linalg.qr(A)
@@ -416,8 +499,11 @@ def schur(
 def solve(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """Solve A @ X = B for X.
 
-    Uses LU factorization internally. Under ``torch.compile`` the
-    ``LinAlgError`` check for a singular A is skipped (#41).
+    Uses LU factorization with partial pivoting. Eager calls use
+    ``torch.linalg.solve``. Under ``torch.compile`` real inputs use
+    :func:`_solve_lu_traceable` (Gaussian elimination with partial pivoting
+    in lowerable ops), because Neuron cannot lower ``linalg_solve_ex`` (#41).
+    There a singular A yields inf/NaN instead of raising ``LinAlgError``.
     """
     A, orig = _to_fp32(A)
     B = B.to(A.dtype)
@@ -452,8 +538,8 @@ def solve_spd(
     squeeze = B.dim() == 1
     if squeeze:
         B = B.unsqueeze(1)
-    Y = torch.linalg.solve_triangular(L, B, upper=False)
-    X = torch.linalg.solve_triangular(L.T, Y, upper=True)
+    Y = _solve_triangular(L, B, upper=False)
+    X = _solve_triangular(L.T, Y, upper=True)
     if iterative_refinement:
         # Compute residual in FP64 to capture the low-order bits that the
         # FP32 Cholesky solve missed. The correction dX is solved in FP32
@@ -462,8 +548,8 @@ def solve_spd(
         # rather than O(eps32 * cond(A)), giving a reliable improvement
         # for cond(A) up to ~1/eps32 ≈ 1e7.
         R = (B.double() - A.double() @ X.double()).to(A.dtype)
-        dY = torch.linalg.solve_triangular(L, R, upper=False)
-        dX = torch.linalg.solve_triangular(L.T, dY, upper=True)
+        dY = _solve_triangular(L, R, upper=False)
+        dX = _solve_triangular(L.T, dY, upper=True)
         X = X + dX
     if squeeze:
         X = X.squeeze(1)

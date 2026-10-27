@@ -24,18 +24,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NotImplementedError` for n > 128, so the 256 and 512 cases failed on
   hardware rather than measuring anything. The PyTorch and torch baselines
   still run at every size.
-- **`cholesky`, `solve`, `solve_spd`, `inv_spd` and `eigh_generalized` trace
-  under `torch.compile` without side-effecting ops.** `torch.linalg.cholesky`
-  and `torch.linalg.solve` decompose to their `*_ex` kernel followed by
-  `aten._linalg_check_errors(info)`, an output-less op that exists only to
-  raise `LinAlgError`. Newer PyTorch wraps it in the `with_effects`
-  higher-order op, which TorchNeuron's FxImporter does not implement, so
-  `cholesky` and `solve` failed with `BackendCompilerFailed` on Trn2. Inside a
-  compiled region (`torch.compiler.is_compiling()`) these now call
-  `torch.linalg.cholesky_ex` / `torch.linalg.solve_ex` directly. Same kernel
-  and numerics; only the error check is gone, so under `torch.compile` a
-  non-SPD or singular input returns an invalid result instead of raising.
-  Eager calls still raise. (#41)
+- **`cholesky`, `solve`, `solve_spd`, `inv_spd` and `eigh_generalized` use
+  only Neuron-lowerable ops under `torch.compile`.** On Trn2 there were two
+  separate failures:
+  - `torch.linalg.cholesky` and `torch.linalg.solve` decompose to a `*_ex`
+    kernel followed by `aten._linalg_check_errors(info)`. That op only
+    raises, and newer PyTorch wraps it in the `with_effects` higher-order op,
+    which TorchNeuron's FxImporter does not implement (`BackendCompilerFailed`).
+  - The Neuron backend has no lowering for `linalg_cholesky_ex` or
+    `linalg_solve_ex` themselves.
+
+  Inside a compiled region (`torch.compiler.is_compiling()`), real inputs now
+  use traceable implementations built from elementwise ops, `where`, `mm`,
+  `sqrt`, `argmax`, `gather` and `tril`/`triu`. Each is a static loop that
+  unrolls at trace time, with no `.item()`:
+  - `_cholesky_traceable`: right-looking column Cholesky that reads only the
+    lower triangle, like `potrf`.
+  - `_solve_lu_traceable`: Gaussian elimination with partial pivoting on
+    `[A | B]`. It picks the same pivot as `getrf` (`argmax |a_ik|`) and swaps
+    rows with a `gather` permutation.
+  - `_solve_triangular_traceable`: forward and back substitution, used by
+    `solve_spd` in place of `torch.linalg.solve_triangular`.
+
+  Compiled results match eager to about 1e-6 in fp32 and 1e-13 in fp64 at
+  n = 128. Under `torch.compile`, a non-SPD or singular input yields NaN or
+  inf instead of raising. Eager calls and complex inputs are unchanged. (#41)
 - **`qr` traces to StableHLO-lowerable ops under `torch.compile`.**
   `aten.linalg_qr` has no StableHLO lowering on Neuron. When compiling, real
   inputs now use `_householder_qr`, a reduced Householder QR made of
@@ -57,11 +70,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`tests/test_compile.py`**: CPU checks with `torch.compile(backend="aot_eager",
-  fullgraph=True)` that `cholesky`, `solve`, `solve_spd` and `qr` trace with
-  zero graph breaks and match eager results, that the traced aten graph has no
-  `_linalg_check_errors` and no `linalg_qr`, and that eager `cholesky`/`solve`
-  still raise `LinAlgError`. Also tests `_householder_qr` against LAPACK
-  (including zero columns and batches) and the eager-only fallback for `cg`.
+  fullgraph=True)`:
+  - `cholesky`, `solve` (including a case that needs pivoting and a vector
+    right-hand side), `solve_spd`, `inv_spd` and `qr` trace with zero graph
+    breaks and match eager in fp32 and fp64.
+  - The traced aten graph contains none of `_linalg_check_errors`,
+    `linalg_cholesky_ex`, `linalg_solve_ex`, `linalg_solve_triangular`,
+    `linalg_lu` or `linalg_qr`.
+  - Eager `cholesky` and `solve` still raise `LinAlgError`.
+  - The traceable kernels match LAPACK in fp64, including batches, pivoting
+    and zero columns.
+  - `cg` falls back to eager. With `fullgraph=True` it raises `Unsupported`
+    on torch 2.11 and `UserError` on 2.14.
 
 - **`tests/test_nki_compile.py`** (marker `nki_simulator`): runs the NKI
   frontend (trace → MLIR → `verify()`) on CPU for every `@nki.jit` kernel at
