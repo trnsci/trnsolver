@@ -49,6 +49,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Compiled results match eager to about 1e-6 in fp32 and 1e-13 in fp64 at
   n = 128. Under `torch.compile`, a non-SPD or singular input yields NaN or
   inf instead of raising. Eager calls and complex inputs are unchanged. (#41)
+- **The compile paths are blocked, with panel width nb = 32.** On Trn2, the
+  first compile at n = 128 took 50–143 s. Each of the n unrolled steps
+  operated on the whole n×n matrix.
+  - `cholesky`: right-looking. Each nb-column panel is factored column by
+    column, which yields L11 and L21 together. The trailing update is then
+    one GEMM.
+  - `solve`: right-looking GEPP. Pivot search is still per column, but only
+    over the (m, nb) panel. One `gather` applies the panel's row swaps to
+    the rest of `[A | B]`. Each panel then needs a unit-lower solve for U12
+    and one GEMM trailing update.
+  - Triangular solves: blocked substitution.
+  - `qr`: compact WY (`larft`-style T, then three GEMMs per panel), with
+    Q accumulated one panel at a time.
+
+  n ≤ nb keeps the unblocked kernels. The traced graphs use the same aten
+  ops that lowered on Trn2 in the previous change.
+
+  The unrolled graph still has one short step per column. At n = 128 the
+  node count is about the same as before (cholesky 1669 → 1825, solve
+  4362 → 6528). The steps now act on (m, nb) panels instead of n×n
+  matrices, so ops with an output of 128×128 or larger drop from 387–772
+  per function to 4–12. Total op output volume drops 5–8×. (#41)
 - **`qr` traces to StableHLO-lowerable ops under `torch.compile`.**
   `aten.linalg_qr` has no StableHLO lowering on Neuron. When compiling, real
   inputs now use `_householder_qr`, a reduced Householder QR made of
@@ -78,8 +100,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `linalg_cholesky_ex`, `linalg_solve_ex`, `linalg_solve_triangular`,
     `linalg_lu` or `linalg_qr`.
   - Eager `cholesky` and `solve` still raise `LinAlgError`.
-  - The traceable kernels match LAPACK in fp64, including batches, pivoting
-    and zero columns.
+  - The traceable kernels match LAPACK in fp64 at n ∈ {1, 7, 64, 100, 128,
+    257}, including batches, pivoting, zero columns, and sizes that are not a
+    multiple of nb. With a small nb, the blocked kernels match the unblocked
+    ones.
+  - Every traced aten op is in the allow-list of ops that lowered on Trn2.
   - `cg` falls back to eager. With `fullgraph=True` it raises `Unsupported`
     on torch 2.11 and `UserError` on 2.14.
 

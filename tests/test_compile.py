@@ -14,10 +14,18 @@ from torch.fx.experimental.proxy_tensor import make_fx
 import trnsolver
 from trnsolver.factor import (
     _cholesky_traceable,
+    _cholesky_unblocked,
     _householder_qr,
+    _householder_qr_unblocked,
     _solve_lu_traceable,
+    _solve_lu_unblocked,
     _solve_triangular_traceable,
+    _trsm_unblocked,
 )
+
+# 1 and 7 take the unblocked path; 64 and 128 are whole panels (nb = 32);
+# 100 and 257 leave a ragged last panel.
+_SIZES = [1, 7, 64, 100, 128, 257]
 
 
 def _compile(fn):
@@ -63,14 +71,61 @@ _UNLOWERABLE = (
 )
 
 
+# Every aten op the compile paths may emit: the set that lowered on Trn2
+# (#41, round 2). A new op here needs a Neuron run before it is added.
+_ALLOWED = {
+    "<built-in function getitem>",
+    *(
+        f"aten.{op}"
+        for op in (
+            "abs.default",
+            "add.Tensor",
+            "alias.default",
+            "arange.default",
+            "argmax.default",
+            "cat.default",
+            "div.Tensor",
+            "eq.Scalar",
+            "eq.Tensor",
+            "expand.default",
+            "eye.default",  # inv_spd's torch.eye(n)
+            "eye.m",
+            "gather.default",
+            "ge.Scalar",
+            "gt.Scalar",
+            "mm.default",
+            "mul.Tensor",
+            "neg.default",
+            "ones.default",
+            "permute.default",
+            "scalar_tensor.default",
+            "select.int",
+            "slice.Tensor",
+            "sqrt.default",
+            "sub.Tensor",
+            "sum.dim_IntList",
+            "transpose.int",
+            "tril.default",
+            "triu.default",
+            "unsqueeze.default",
+            "where.self",
+            "zeros.default",
+            "zeros_like.default",
+        )
+    ),
+}
+
+
 def _assert_lowerable(ops):
     bad = sorted(op for op in ops if any(name in op for name in _UNLOWERABLE))
     assert not bad, bad
+    unknown = sorted(set(ops) - _ALLOWED)
+    assert not unknown, unknown
 
 
 class TestCompileFactor:
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-    @pytest.mark.parametrize("n", [8, 128])
+    @pytest.mark.parametrize("n", [8, 100, 128])
     def test_cholesky(self, spd_matrix, n, dtype):
         A = spd_matrix(n, dtype=dtype)
         assert _graph_breaks(trnsolver.cholesky, A) == 0
@@ -83,7 +138,7 @@ class TestCompileFactor:
         torch.testing.assert_close(fn(A), trnsolver.cholesky(A, upper=True), **_TOL[A.dtype])
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-    @pytest.mark.parametrize("n", [8, 128])
+    @pytest.mark.parametrize("n", [8, 100, 128])
     def test_solve(self, spd_matrix, rng, n, dtype):
         A = spd_matrix(n, dtype=dtype)
         B = torch.randn(n, 3, generator=rng, dtype=dtype)
@@ -92,9 +147,9 @@ class TestCompileFactor:
         torch.testing.assert_close(X, trnsolver.solve(A, B), **_TOL[dtype])
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-    def test_solve_requires_pivoting(self, rng, dtype):
+    @pytest.mark.parametrize("n", [16, 100])
+    def test_solve_requires_pivoting(self, rng, dtype, n):
         """Zero diagonal: elimination without row swaps would divide by zero."""
-        n = 16
         # Cyclic shift (zero diagonal, well-conditioned) plus small noise.
         shift = torch.roll(torch.eye(n, dtype=dtype), 1, dims=1)
         A = 4 * shift + 0.1 * torch.randn(n, n, generator=rng, dtype=dtype)
@@ -135,9 +190,10 @@ class TestCompileFactor:
         ],
         ids=["cholesky", "solve", "solve_spd", "inv_spd"],
     )
-    def test_traced_graph_is_lowerable(self, spd_matrix, rng, fn):
-        A = spd_matrix(16)
-        B = torch.randn(16, 2, generator=rng)
+    @pytest.mark.parametrize("n", [16, 48])  # unblocked, blocked
+    def test_traced_graph_is_lowerable(self, spd_matrix, rng, fn, n):
+        A = spd_matrix(n)
+        B = torch.randn(n, 2, generator=rng)
         _assert_lowerable(_traced_aten_ops(fn, A, B))
 
     def test_eager_still_raises_on_non_spd(self):
@@ -147,7 +203,9 @@ class TestCompileFactor:
         with pytest.raises(torch.linalg.LinAlgError):
             trnsolver.solve(torch.zeros(4, 4), torch.ones(4, 1))
 
-    @pytest.mark.parametrize("shape", [(8, 8), (128, 128), (12, 5), (5, 12), (3, 7, 4)])
+    @pytest.mark.parametrize(
+        "shape", [(8, 8), (100, 100), (128, 128), (12, 5), (5, 12), (3, 7, 4), (2, 70, 40)]
+    )
     def test_qr(self, rng, shape):
         A = torch.randn(*shape, generator=rng)
         assert _graph_breaks(trnsolver.qr, A) == 0
@@ -158,8 +216,9 @@ class TestCompileFactor:
         torch.testing.assert_close(Q, Qe, atol=1e-5, rtol=1e-4)
         torch.testing.assert_close(R, Re, atol=1e-4, rtol=1e-4)
 
-    def test_qr_no_linalg_qr_in_graph(self, random_matrix):
-        _assert_lowerable(_traced_aten_ops(trnsolver.qr, random_matrix(16, 16)))
+    @pytest.mark.parametrize("n", [16, 48])  # unblocked, blocked
+    def test_qr_no_linalg_qr_in_graph(self, random_matrix, n):
+        _assert_lowerable(_traced_aten_ops(trnsolver.qr, random_matrix(n, n)))
 
     def test_qr_bf16(self, random_matrix):
         A = random_matrix(16, 16).bfloat16()
@@ -173,7 +232,22 @@ class TestCompileFactor:
 class TestHouseholderQR:
     """The compile-path QR, exercised eagerly (fp64 for tight tolerances)."""
 
-    @pytest.mark.parametrize("shape", [(1, 1), (6, 6), (10, 4), (4, 10), (2, 5, 5)])
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (1, 1),
+            (6, 6),
+            (10, 4),
+            (4, 10),
+            (2, 5, 5),
+            (100, 100),
+            (128, 128),
+            (257, 257),
+            (257, 64),
+            (64, 257),
+            (2, 70, 70),
+        ],
+    )
     def test_matches_lapack(self, rng, shape):
         A = torch.randn(*shape, generator=rng, dtype=torch.float64)
         Q, R = _householder_qr(A)
@@ -199,10 +273,11 @@ class TestHouseholderQR:
 
 
 class TestTraceableKernels:
-    """The compile-path Cholesky / LU / triangular solves, run eagerly in fp64."""
+    """The compile-path Cholesky / LU / triangular solves, run eagerly in fp64
+    against LAPACK, on both the unblocked (n <= nb) and blocked paths."""
 
     @pytest.mark.parametrize("batch", [(), (3,)])
-    @pytest.mark.parametrize("n", [1, 7, 64])
+    @pytest.mark.parametrize("n", _SIZES)
     def test_cholesky(self, rng, n, batch):
         G = torch.randn(*batch, n, n, generator=rng, dtype=torch.float64)
         A = G @ G.transpose(-2, -1) + n * torch.eye(n, dtype=torch.float64)
@@ -217,11 +292,21 @@ class TestTraceableKernels:
         assert torch.isnan(_cholesky_traceable(-torch.eye(3, dtype=torch.float64))).any()
 
     @pytest.mark.parametrize("batch", [(), (4,)])
-    @pytest.mark.parametrize("n", [1, 6, 64])
+    @pytest.mark.parametrize("n", _SIZES)
     def test_lu_solve(self, rng, n, batch):
+        # Plain Gaussian matrix: not diagonally dominant, so pivoting matters.
         A = torch.randn(*batch, n, n, generator=rng, dtype=torch.float64)
-        A = A + n * torch.eye(n, dtype=torch.float64)
         B = torch.randn(*batch, n, 3, generator=rng, dtype=torch.float64)
+        X, Xe = _solve_lu_traceable(A, B), torch.linalg.solve(A, B)
+        assert ((X - Xe).norm() / Xe.norm()).item() < 1e-10
+
+    def test_lu_solve_blocked_pivoting(self, rng):
+        """Zero diagonal at a size that takes the blocked path."""
+        n = 100
+        A = 4 * torch.roll(torch.eye(n, dtype=torch.float64), 1, dims=1)
+        A = A + 0.1 * torch.randn(n, n, generator=rng, dtype=torch.float64)
+        A = A - torch.diag(torch.diagonal(A))
+        B = torch.randn(n, 2, generator=rng, dtype=torch.float64)
         torch.testing.assert_close(_solve_lu_traceable(A, B), torch.linalg.solve(A, B))
 
     def test_lu_solve_pivots(self):
@@ -230,9 +315,9 @@ class TestTraceableKernels:
         eye = torch.eye(3, dtype=torch.float64)
         torch.testing.assert_close(_solve_lu_traceable(A, eye), torch.linalg.inv(A))
 
+    @pytest.mark.parametrize("n", [20, 100, 257])
     @pytest.mark.parametrize("upper", [False, True])
-    def test_triangular(self, rng, upper):
-        n = 20
+    def test_triangular(self, rng, upper, n):
         T = torch.randn(n, n, generator=rng, dtype=torch.float64) + n * torch.eye(
             n, dtype=torch.float64
         )
@@ -242,6 +327,27 @@ class TestTraceableKernels:
             _solve_triangular_traceable(T, B, upper),
             torch.linalg.solve_triangular(T, B, upper=upper),
         )
+
+    @pytest.mark.parametrize("batch", [(), (2,)])
+    @pytest.mark.parametrize("n", [9, 20, 24])
+    def test_blocked_matches_unblocked(self, rng, n, batch):
+        """Small nb drives several panels (incl. a ragged last one) at small n."""
+        nb = 8
+        G = torch.randn(*batch, n, n, generator=rng, dtype=torch.float64)
+        S = G @ G.transpose(-2, -1) + n * torch.eye(n, dtype=torch.float64)
+        B = torch.randn(*batch, n, 3, generator=rng, dtype=torch.float64)
+        torch.testing.assert_close(_cholesky_traceable(S, nb=nb), _cholesky_unblocked(S))
+        torch.testing.assert_close(_solve_lu_traceable(G, B, nb=nb), _solve_lu_unblocked(G, B))
+        L = torch.tril(S)
+        for upper, T in [(False, L), (True, L.transpose(-2, -1))]:
+            torch.testing.assert_close(
+                _solve_triangular_traceable(T, B, upper, nb=nb), _trsm_unblocked(T, B, upper)
+            )
+        for A in [G, G[..., :, : n // 2], G[..., : n // 2, :]]:
+            Q, R = _householder_qr(A, nb=nb)
+            Qu, Ru = _householder_qr_unblocked(A)
+            torch.testing.assert_close(Q, Qu)
+            torch.testing.assert_close(R, Ru)
 
 
 class TestEagerOnly:

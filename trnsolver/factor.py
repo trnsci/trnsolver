@@ -66,7 +66,22 @@ def _traceable(A: torch.Tensor) -> bool:
     return torch.compiler.is_compiling() and not A.is_complex()
 
 
-def _cholesky_traceable(A: torch.Tensor) -> torch.Tensor:
+# Panel width for the blocked compile paths. The unrolled graph still has one
+# short step per column, but blocking confines that per-column work to an
+# (m, nb) panel and leaves one (m, m) GEMM per panel for the trailing update.
+# Total per-column traffic is about n^2 * nb + n^3 / nb, which is near its
+# minimum for nb ~ sqrt(n) and stays close to it for nb = 32 at n in
+# [128, 512]. 32 is also a legal Trainium partition start (0/32/64/96, #40),
+# so the panel slices stay aligned.
+_NB = 32
+
+
+def _zeros(x: torch.Tensor, *shape: int) -> torch.Tensor:
+    """``torch.zeros`` with x's dtype/device (aten.zeros, already known to lower)."""
+    return torch.zeros(*shape, dtype=x.dtype, device=x.device)
+
+
+def _cholesky_unblocked(A: torch.Tensor) -> torch.Tensor:
     """Lower Cholesky factor by right-looking column elimination.
 
     Reads only the lower triangle of A, like LAPACK ``potrf``. Step k takes
@@ -74,20 +89,56 @@ def _cholesky_traceable(A: torch.Tensor) -> torch.Tensor:
     and subtracts the rank-1 update ``l_k l_k^T``. Supports batch dims. A
     non-SPD input gives NaN from ``sqrt`` of a negative pivot.
     """
-    n = A.shape[-1]
     S = torch.tril(A) + torch.tril(A, diagonal=-1).transpose(-2, -1)
-    rows = torch.arange(n, device=A.device).unsqueeze(-1)  # (n, 1)
-    cols = torch.arange(n, device=A.device)  # (n,)
-    L = torch.zeros_like(A)
-    for k in range(n):
-        d = torch.sqrt(S[..., k : k + 1, k : k + 1])  # (..., 1, 1)
-        col = torch.where(rows >= k, S[..., :, k : k + 1] / d, 0.0)  # (..., n, 1)
+    return _cholesky_panel(S)
+
+
+def _cholesky_panel(P: torch.Tensor) -> torch.Tensor:
+    """Unblocked Cholesky of a tall panel P (..., m, w), m >= w.
+
+    P holds the first w columns of a symmetric Schur complement; its top w×w
+    block is the diagonal block. Returns the matching (m, w) panel of L.
+    """
+    m, w = P.shape[-2], P.shape[-1]
+    rows = torch.arange(m, device=P.device).unsqueeze(-1)  # (m, 1)
+    cols = torch.arange(w, device=P.device)  # (w,)
+    L = torch.zeros_like(P)
+    for k in range(w):
+        d = torch.sqrt(P[..., k : k + 1, k : k + 1])  # (..., 1, 1)
+        col = torch.where(rows >= k, P[..., :, k : k + 1] / d, 0.0)  # (..., m, 1)
         L = torch.where(cols == k, col, L)
-        S = S - col @ col.transpose(-2, -1)
+        if k < w - 1:
+            P = P - col @ col[..., :w, :].transpose(-2, -1)
     return L
 
 
-def _solve_triangular_traceable(T: torch.Tensor, B: torch.Tensor, upper: bool) -> torch.Tensor:
+def _cholesky_traceable(A: torch.Tensor, nb: int = _NB) -> torch.Tensor:
+    """Blocked right-looking Cholesky (unblocked for n <= nb).
+
+    For each panel of nb columns: an unrolled column Cholesky of the (m, nb)
+    panel, which yields the diagonal block L11 and the panel below,
+    L21 = A21 L11^{-T}, in one pass. Then one GEMM trailing update,
+    S <- S22 - L21 L21^T. Reads only the lower triangle of A.
+    """
+    n = A.shape[-1]
+    if n <= nb:
+        return _cholesky_unblocked(A)
+    batch = A.shape[:-2]
+    S = torch.tril(A) + torch.tril(A, diagonal=-1).transpose(-2, -1)
+    blocks = []
+    for k0 in range(0, n, nb):
+        w = min(nb, n - k0)
+        Lp = _cholesky_panel(S[..., :, :w])  # (..., n - k0, w)
+        if k0 + w < n:
+            L21 = Lp[..., w:, :]
+            S = S[..., w:, w:] - L21 @ L21.transpose(-2, -1)
+        if k0:
+            Lp = torch.cat([_zeros(Lp, *batch, k0, w), Lp], dim=-2)
+        blocks.append(Lp)
+    return torch.cat(blocks, dim=-1)
+
+
+def _trsm_unblocked(T: torch.Tensor, B: torch.Tensor, upper: bool) -> torch.Tensor:
     """Solve T X = B by forward (lower) or back (upper) substitution. B is (..., n, k)."""
     n = T.shape[-1]
     T = torch.triu(T) if upper else torch.tril(T)
@@ -105,7 +156,31 @@ def _solve_triangular_traceable(T: torch.Tensor, B: torch.Tensor, upper: bool) -
     return X
 
 
-def _solve_lu_traceable(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+def _solve_triangular_traceable(
+    T: torch.Tensor, B: torch.Tensor, upper: bool, nb: int = _NB
+) -> torch.Tensor:
+    """Blocked substitution for T X = B (unblocked for n <= nb). B is (..., n, k).
+
+    Walks nb-row blocks in solve order. Each block takes one GEMM against
+    the rows already solved, then an unrolled substitution with its nb×nb
+    diagonal block.
+    """
+    n = T.shape[-1]
+    if n <= nb:
+        return _trsm_unblocked(T, B, upper)
+    starts = list(range(0, n, nb))
+    X = None  # solved rows so far: [0, k0) for lower, [k1, n) for upper
+    for k0 in reversed(starts) if upper else starts:
+        k1 = min(k0 + nb, n)
+        R = B[..., k0:k1, :]
+        if X is not None:
+            R = R - (T[..., k0:k1, k1:] if upper else T[..., k0:k1, :k0]) @ X
+        Xb = _trsm_unblocked(T[..., k0:k1, k0:k1], R, upper)
+        X = Xb if X is None else torch.cat([Xb, X] if upper else [X, Xb], dim=-2)
+    return X
+
+
+def _solve_lu_unblocked(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """Solve A X = B by Gaussian elimination with partial pivoting (GEPP).
 
     Same pivot choice as LAPACK ``getrf`` (first row of maximal ``|a_ik|``,
@@ -125,7 +200,71 @@ def _solve_lu_traceable(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         M = torch.gather(M, -2, perm.unsqueeze(-1).expand(M.shape))
         factors = torch.where(rows > k, M[..., :, k] / M[..., k : k + 1, k], 0.0)
         M = M - factors.unsqueeze(-1) * M[..., k : k + 1, :]
-    return _solve_triangular_traceable(M[..., :n], M[..., n:], upper=True)
+    return _trsm_unblocked(M[..., :n], M[..., n:], upper=True)
+
+
+def _lu_panel(P: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """GEPP on a tall panel P (..., m, w), m >= w, LAPACK ``getf2`` style.
+
+    Returns (F, perm). F is the row-permuted panel holding U11 on and above
+    the diagonal of its top w×w block and the multipliers (L11 strictly
+    below the diagonal, then L21) below it. perm (..., m) is the row order
+    applied, so row i of F came from row perm[i] of P.
+    """
+    m, w = P.shape[-2], P.shape[-1]
+    rows = torch.arange(m, device=P.device)  # (m,)
+    rows_c = rows.unsqueeze(-1)  # (m, 1)
+    cols = torch.arange(w, device=P.device)  # (w,)
+    perm = rows.expand(*P.shape[:-2], m)
+    for k in range(w):
+        mag = torch.where(rows >= k, P[..., :, k].abs(), -1.0)  # (..., m)
+        p = torch.argmax(mag, dim=-1, keepdim=True)  # (..., 1)
+        swap = torch.where(rows == k, p, torch.where(rows == p, k, rows))  # (..., m)
+        P = torch.gather(P, -2, swap.unsqueeze(-1).expand(P.shape))
+        perm = torch.gather(perm, -1, swap)
+        f = torch.where(rows_c > k, P[..., :, k : k + 1] / P[..., k : k + 1, k : k + 1], 0.0)
+        if k < w - 1:
+            # Update columns > k only; columns < k hold earlier multipliers.
+            P = P - f * torch.where(cols > k, P[..., k : k + 1, :], 0.0)
+        P = torch.where(cols == k, torch.where(rows_c > k, f, P), P)
+    return P, perm
+
+
+def _solve_lu_traceable(A: torch.Tensor, B: torch.Tensor, nb: int = _NB) -> torch.Tensor:
+    """Solve A X = B by blocked right-looking GEPP (unblocked for n <= nb).
+
+    Works on the augmented trailing matrix T = [A | B]. For each panel of nb
+    columns:
+      1. ``_lu_panel``: column-by-column partial pivoting on the (m, nb)
+         panel only (argmax + gather, same pivot choice as ``getrf``).
+      2. One ``gather`` applies the panel's row permutation to the rest of T.
+      3. U12 = L11^{-1} T12 by unit-lower substitution on nb rows.
+      4. One GEMM trailing update, T <- T22 - L21 U12.
+    The U rows (with B carried along) are then back-substituted, blocked.
+    B is (..., n, k). A singular A gives inf/NaN.
+    """
+    n = A.shape[-1]
+    if n <= nb:
+        return _solve_lu_unblocked(A, B)
+    batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
+    T = torch.cat([A.expand(*batch, n, n), B.expand(*batch, n, B.shape[-1])], dim=-1)
+    eye = torch.eye(nb, nb, dtype=A.dtype, device=A.device)
+    u_rows = []
+    for k0 in range(0, n, nb):
+        w = min(nb, n - k0)
+        F, perm = _lu_panel(T[..., :, :w])
+        rest = T[..., :, w:]
+        rest = torch.gather(rest, -2, perm.unsqueeze(-1).expand(rest.shape))
+        L11 = torch.tril(F[..., :w, :], diagonal=-1) + eye[:w, :w]
+        U12 = _trsm_unblocked(L11, rest[..., :w, :], upper=False)
+        row = torch.cat([torch.triu(F[..., :w, :]), U12], dim=-1)
+        if k0:
+            row = torch.cat([_zeros(row, *batch, w, k0), row], dim=-1)
+        u_rows.append(row)
+        if k0 + w < n:
+            T = rest[..., w:, :] - F[..., w:, :] @ U12
+    M = torch.cat(u_rows, dim=-2)
+    return _solve_triangular_traceable(M[..., :n], M[..., n:], upper=True, nb=nb)
 
 
 def _cholesky_lower(A: torch.Tensor) -> torch.Tensor:
@@ -151,32 +290,22 @@ def _solve_general(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return torch.linalg.solve(A, B)
 
 
-def _householder_qr(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reduced Householder QR built from elementwise ops, matmuls and ``where``.
+def _householder_panel(P: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Householder-reduce the columns of P (..., m, w) in place of ``geqr2``.
 
-    Used by :func:`qr` inside ``torch.compile``: ``aten.linalg_qr`` has no
-    StableHLO lowering on Neuron (#41). This builds the same factorization
-    LAPACK's ``geqrf`` + ``orgqr`` compute, with the same sign convention
-    (``R[k, k] = -sign(A[k, k]) * ||A[k:, k]||``, reflector skipped when the
-    sub-column is already zero). No data-dependent Python control flow, no
-    ``.item()``, no in-place slice assignment: the column loop is a static
-    Python loop over ``min(m, n)`` that unrolls at trace time, and every
-    per-column restriction is a row/column mask. Supports leading batch dims.
-    Real dtypes only.
+    Returns (P_reduced, V, tau): V (..., m, kw) holds unit reflectors (zero
+    above their pivot row) and tau (..., 1, kw), with kw = min(m, w).
     """
-    m, n = A.shape[-2], A.shape[-1]
-    kk = min(m, n)
-    R = A
-    rows = torch.arange(m, device=A.device).unsqueeze(-1)  # (m, 1)
-    cols = torch.arange(n, device=A.device)  # (n,)
-    one = torch.ones((), dtype=A.dtype, device=A.device)
+    m, w = P.shape[-2], P.shape[-1]
+    kw = min(m, w)
+    rows = torch.arange(m, device=P.device).unsqueeze(-1)  # (m, 1)
+    cols = torch.arange(w, device=P.device)  # (w,)
+    one = torch.ones((), dtype=P.dtype, device=P.device)
     vs = []
     taus = []
-    for k in range(kk):
-        below = rows >= k  # (m, 1)
-        x = torch.where(below, R[..., :, k : k + 1], 0.0)  # (..., m, 1)
-        alpha = R[..., k : k + 1, k : k + 1]  # (..., 1, 1)
-        tail = torch.where(rows > k, x, 0.0)
+    for k in range(kw):
+        alpha = P[..., k : k + 1, k : k + 1]  # (..., 1, 1)
+        tail = torch.where(rows > k, P[..., :, k : k + 1], 0.0)  # (..., m, 1)
         tail_sq = (tail * tail).sum(dim=-2, keepdim=True)  # (..., 1, 1)
         norm_x = torch.sqrt(alpha * alpha + tail_sq)
         sign = torch.where(alpha >= 0, one, -one)
@@ -186,18 +315,88 @@ def _householder_qr(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         tau = torch.where(active, (beta - alpha) / torch.where(active, beta, one), 0.0)
         # v[k] = 1, v[k+1:] = x[k+1:] / (alpha - beta), v[:k] = 0
         v = torch.where(rows == k, one, tail / denom)
-        # R <- (I - tau v v^T) R, restricted to columns k: (columns < k are
+        # P <- (I - tau v v^T) P, restricted to columns k: (columns < k are
         # already reduced and would only pick up rounding noise).
-        w = (v.transpose(-2, -1) @ R) * (cols >= k)  # (..., 1, n)
-        R = R - tau * (v @ w)
+        y = (v.transpose(-2, -1) @ P) * (cols >= k)  # (..., 1, w)
+        P = P - tau * (v @ y)
         vs.append(v)
         taus.append(tau)
+    return P, torch.cat(vs, dim=-1), torch.cat(taus, dim=-1)
+
+
+def _householder_qr_unblocked(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduced Householder QR, one reflector at a time (``geqr2`` + ``org2r``)."""
+    m, n = A.shape[-2], A.shape[-1]
+    kk = min(m, n)
+    R, V, tau = _householder_panel(A)
     # Q = H_0 H_1 ... H_{kk-1} I[:, :kk], accumulated backward (orgqr order).
     Q = torch.eye(m, kk, dtype=A.dtype, device=A.device).expand(*A.shape[:-2], m, kk)
     for k in reversed(range(kk)):
-        v, tau = vs[k], taus[k]
-        Q = Q - tau * (v @ (v.transpose(-2, -1) @ Q))
-    R = torch.triu(R[..., :kk, :])
+        v, t = V[..., :, k : k + 1], tau[..., :, k : k + 1]
+        Q = Q - t * (v @ (v.transpose(-2, -1) @ Q))
+    return Q, torch.triu(R[..., :kk, :])
+
+
+def _wy_t(V: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
+    """Upper-triangular T with H_0 ... H_{k-1} = I - V T V^T (``larft``, forward)."""
+    k = V.shape[-1]
+    G = V.transpose(-2, -1) @ V  # (..., k, k)
+    rows = torch.arange(k, device=V.device).unsqueeze(-1)
+    cols = torch.arange(k, device=V.device)
+    T = _zeros(V, *V.shape[:-2], k, k)
+    for j in range(k):
+        t = tau[..., :, j : j + 1]  # (..., 1, 1)
+        # Column j: -tau_j T[:, :j] V[:, :j]^T v_j above the diagonal, tau_j on
+        # it. T's columns >= j are still zero, so T @ G[:, j] uses only :j.
+        z = -t * (T @ G[..., :, j : j + 1]) + torch.where(rows == j, t, 0.0)
+        T = torch.where(cols == j, z, T)
+    return T
+
+
+def _householder_qr(A: torch.Tensor, nb: int = _NB) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduced Householder QR built from elementwise ops, matmuls and ``where``.
+
+    Used by :func:`qr` inside ``torch.compile``: ``aten.linalg_qr`` has no
+    StableHLO lowering on Neuron (#41). Computes what LAPACK's ``geqrf`` +
+    ``orgqr`` compute, with the same sign convention
+    (``R[k, k] = -sign(A[k, k]) * ||A[k:, k]||``; the reflector is skipped
+    when the sub-column is already zero).
+
+    For min(m, n) > nb it is blocked (compact WY, as in ``geqrf``/``larft``).
+    Each nb-column panel is reduced one reflector at a time. Its reflectors
+    are then combined into ``I - V T V^T`` and applied to the trailing
+    columns with three GEMMs, and Q is accumulated backward one panel at a
+    time. It has no ``.item()``, no data-dependent control flow and no
+    in-place slice assignment. It supports batch dims and real dtypes only.
+    """
+    m, n = A.shape[-2], A.shape[-1]
+    kk = min(m, n)
+    if kk <= nb:
+        return _householder_qr_unblocked(A)
+    batch = A.shape[:-2]
+    W = A  # trailing matrix, rows/cols k0:
+    r_rows = []
+    panels = []
+    for k0 in range(0, kk, nb):
+        w = min(nb, kk - k0)
+        P, V, tau = _householder_panel(W[..., :, :w])
+        T = _wy_t(V, tau)
+        C = W[..., :, w:]
+        if C.shape[-1]:
+            # Q_panel^T C = (I - V T V^T)^T C
+            C = C - V @ (T.transpose(-2, -1) @ (V.transpose(-2, -1) @ C))
+        top = torch.cat([P[..., :w, :], C[..., :w, :]], dim=-1)  # (..., w, n - k0)
+        if k0:
+            top = torch.cat([_zeros(top, *batch, w, k0), top], dim=-1)
+        r_rows.append(top)
+        if k0:
+            V = torch.cat([_zeros(V, *batch, k0, V.shape[-1]), V], dim=-2)
+        panels.append((V, T))
+        W = C[..., w:, :]
+    R = torch.triu(torch.cat(r_rows, dim=-2))
+    Q = torch.eye(m, kk, dtype=A.dtype, device=A.device).expand(*batch, m, kk)
+    for V, T in reversed(panels):
+        Q = Q - V @ (T @ (V.transpose(-2, -1) @ Q))
     return Q, R
 
 
