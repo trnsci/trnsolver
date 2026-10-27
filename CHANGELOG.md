@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`apply_reflectors_kernel` now compiles under NKI 0.7.0 / neuronx-cc 2.28
+  (Trn2).** The kernel loaded all Householder vectors as an SBUF `V^T` and
+  sliced row `V_T[k:k+1, :]` per step. That is a 1-partition access at
+  partition k, and the newer verifier only allows those to start at partition
+  0, 32, 64 or 96 (`'nisa.tensor_copy' op Expected 'src' partition start in
+  {0, 32, 64, 96}`). This failed all 19 `TestEighNKI` hardware tests. Each
+  vector is now loaded per step with `load_transpose2d(V_refs[:, k:k+1])`, so
+  it lands at partition 0, the same idiom `matmul_kernel_sim` uses. The
+  algorithm is unchanged and simulator output is bit-identical to the old
+  kernel for n ∈ {4, 8, 16, 33, 64, 128}. (#40)
+- **`benchmarks/bench_solver.py::TestEigh::test_eigh_nki` skips n > 128.**
+  The NKI eigh path is single-tile, and `_householder_tridiag` raises
+  `NotImplementedError` for n > 128, so the 256 and 512 cases failed on
+  hardware rather than measuring anything. The PyTorch and torch baselines
+  still run at every size.
+
+### Added
+
+- **`tests/test_nki_compile.py`** (marker `nki_simulator`): runs the NKI
+  frontend (trace → MLIR → `verify()`) on CPU for every `@nki.jit` kernel at
+  n ∈ {8, 16, 32, 128} for both trn1 and trn2. `nki.simulate` does not run
+  the MLIR verifier, so this catches hardware-only lowering errors like #40
+  without a Neuron device. Needs `nki`, but not `neuronx-cc`.
+
 ## [0.15.0] — 2026-04-22
 
 ### Added

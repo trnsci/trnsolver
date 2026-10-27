@@ -423,16 +423,16 @@ if HAS_NKI:
         SBUF layout:  Q^T is maintained in SBUF (partition=n, free=n) so that
         the key reduction `p[j] = Σᵢ vₖ[i]·Q[i,j]` reduces along the free
         axis (axis=1, supported), not the partition axis (axis=0, unsupported
-        in NKI 0.3.0). V_refs is also loaded transposed so row k of V_T
-        holds the k-th Householder vector — enabling static free-dim slices
-        V_T[k:k+1, 0:n] within the compile-time-unrolled affine_range loop.
+        in NKI 0.3.0). Each Householder vector vₖ is loaded per step with
+        load_transpose2d(V_refs[:, k:k+1]) so it lands as a (1, n) row at
+        partition 0 (see #40 for why it is not sliced out of an SBUF V^T).
 
         All operations are Vector Engine (load_transpose2d, broadcast_to,
         multiply, sum axis=1). The kernel is therefore simulator-safe; no
         separate _sim variant is needed.
 
-        Shape constraint: n ≤ PMAX (128). SBUF usage: Q_T (n,n) + V_T (n-2,n)
-        ≈ 2 × 65 KB at n=128, well within the 512 KB SBUF per NeuronCore.
+        Shape constraint: n ≤ PMAX (128). SBUF usage: Q_T (n,n) ≈ 65 KB at
+        n=128 plus one (1, n) row per step, well within SBUF per NeuronCore.
         """
         n = Q_in.shape[0]
         n_refs = V_refs.shape[1]  # = n - 2
@@ -443,18 +443,17 @@ if HAS_NKI:
         # Free-dim (axis=1) reduction of Q_T gives p[j] = Σᵢ v[i]*Q[i,j]. ✓
         Q_T = nl.load_transpose2d(Q_in[0:n, 0:n])  # (n, n)
 
-        # Load V_refs transposed: V_T[k, i] = v_k[i].
-        # Static row-slice V_T[k:k+1, 0:n] in the unrolled loop gives v_k
-        # as a (1, n) row vector without an extra transpose op.
-        V_T = nl.load_transpose2d(V_refs[0:n, 0:n_refs])  # (n_refs, n)
-
         # Apply reflectors in reverse order: Hₙ₋₃ · Hₙ₋₄ · … · H₀ @ Q_in.
         # k = n_refs-1 down to 0.  nl.affine_range unrolls compile-time.
         for k_rev in nl.affine_range(n_refs):
             k = n_refs - 1 - k_rev
 
-            # v_k as row vector (1, n): v_row[0, i] = vₖ[i]
-            v_row = V_T[k : k + 1, 0:n]
+            # v_k as row vector (1, n) at partition 0: v_row[0, i] = vₖ[i].
+            # Loaded straight from HBM rather than sliced out of an SBUF
+            # V^T (V_T[k:k+1, :]): NKI 0.7.0 only allows a 1-partition
+            # access starting at partition 0/32/64/96, and k is arbitrary
+            # (#40). Same values, so the update is bit-identical.
+            v_row = nl.load_transpose2d(V_refs[0:n, k : k + 1])  # (1, n)
 
             # Broadcast v_k across partition dim: v_bc[j, i] = vₖ[i]
             v_bc = nl.broadcast_to(v_row, (n, n))

@@ -41,6 +41,10 @@ def _warm(fn, *args, **kwargs):
 class TestEigh:
     @pytest.mark.neuron
     def test_eigh_nki(self, benchmark, symmetric_matrix):
+        if symmetric_matrix.shape[0] > 128:
+            # _householder_tridiag is single-tile (n ≤ 128) and raises
+            # NotImplementedError above that; blocked variants are not built yet.
+            pytest.skip("NKI eigh path is single-tile: n ≤ 128")
         _set("nki")
         try:
             _warm(trnsolver.eigh, symmetric_matrix)
