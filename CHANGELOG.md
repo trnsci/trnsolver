@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`eigh` on the native `neuron` device uses `torch.linalg.eigh` below
+  `TRNSOLVER_EIGH_NKI_MIN_N` (default 512).** On Trn2 the NKI path took
+  0.4 s at n=16 and 21 s at n=128, against 0.4-1.1 ms for aten on the same
+  device, and grew about 4x per doubling of n. It is launch-bound, not
+  compute-bound. Tridiagonalization makes n-2 host-driven steps, each with
+  two kernel launches, about six `.item()` reads and an XLA sync. The
+  implicit-shift QR iteration then ran element by element on the input's
+  device: O(n^2) Givens rotations, each with about 20 single-element reads,
+  writes and column updates, so at ~0.2 ms per eager launch the QR stage
+  dominated. Tensors on the `neuron` device with n below the threshold now
+  go to `torch.linalg.eigh`, and the result stays on the input's device.
+  `TRNSOLVER_EIGH_NKI_MIN_N=0` turns the cutover off, and
+  `TRNSOLVER_REQUIRE_NKI=1` bypasses it, so the hardware suite still runs the
+  kernels. Other devices, including CPU inputs with the NKI backend, are not
+  affected. The NKI path is single-tile (n <= 128), so with the default every
+  size it supports uses aten. Under `torch.compile` the cutover runs eagerly
+  behind the same single graph break as the NKI path. (#42)
+- **The NKI `eigh` path runs its QR iteration on CPU tensors.** `diag`,
+  `subdiag` and the Givens accumulator are copied to the host before
+  `_qr_iterate`, and the accumulator is moved back to the input's device
+  before `apply_reflectors_kernel`. CPU inputs already took this path, so
+  their results are unchanged. Device-resident inputs no longer pay one
+  launch or sync per scalar. (#42)
 - **`apply_reflectors_kernel` now compiles under NKI 0.7.0 / neuronx-cc 2.28
   (Trn2).** The kernel loaded all Householder vectors as an SBUF `V^T` and
   sliced row `V_T[k:k+1, :]` per step. That is a 1-partition access at

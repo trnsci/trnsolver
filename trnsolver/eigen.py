@@ -22,6 +22,7 @@ for the Householder-QR pivot rationale.
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -50,9 +51,18 @@ def eigh(
     eagerly behind a single graph break (an error under ``fullgraph=True``)
     rather than splitting into dozens of subgraphs (#41). The PyTorch path
     traces as one ``torch.linalg.eigh`` call.
+
+    On the native ``neuron`` device, inputs with n below
+    ``TRNSOLVER_EIGH_NKI_MIN_N`` (default 512) skip the NKI path and run
+    ``torch.linalg.eigh`` on the input's device (#42). The NKI path is
+    host-driven and launch-bound: on Trn2 it took 0.4 s at n=16 and 21 s at
+    n=128, against about 1 ms for aten at every measured size. Setting
+    ``TRNSOLVER_REQUIRE_NKI=1`` disables the cutover so the kernels still run.
     """
     A, orig = _to_fp32(A)
-    if _use_nki():
+    if _use_nki() and _eigh_aten_cutover(A):
+        w, V = _aten_eigh_on_device(A)
+    elif _use_nki():
         try:
             w, V = _householder_qr_eigh(A, tol)
         except Exception:
@@ -235,6 +245,61 @@ def eigh_randomized(
 def _torch_eigh(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """PyTorch backend path — delegates to torch.linalg.eigh (LAPACK)."""
     return torch.linalg.eigh(A)
+
+
+# Native-device cutover (#42). The NKI eigh path costs O(n) host-synchronised
+# steps in tridiagonalization plus O(n^2) scalar steps in the QR iteration,
+# about 0.4 s at n=16 and 21 s at n=128 on Trn2. aten eigh on the neuron
+# device takes 0.4-1.1 ms over the same range. The NKI path is single-tile
+# (n <= 128), so any threshold above 128 routes every size it supports to
+# aten; 512 leaves room for a blocked kernel to be measured against it.
+_EIGH_NKI_MIN_N_DEFAULT = 512
+_NATIVE_DEVICE_TYPE = "neuron"
+
+
+def _eigh_nki_min_n() -> int:
+    """Smallest n for which eigh on the ``neuron`` device uses the NKI path.
+
+    Read from ``TRNSOLVER_EIGH_NKI_MIN_N`` on every call (default 512).
+    ``0`` disables the cutover. Unparseable values fall back to the default.
+    """
+    raw = os.environ.get("TRNSOLVER_EIGH_NKI_MIN_N", "").strip()
+    if not raw:
+        return _EIGH_NKI_MIN_N_DEFAULT
+    try:
+        return int(raw)
+    except ValueError:
+        return _EIGH_NKI_MIN_N_DEFAULT
+
+
+def _eigh_aten_cutover(A: torch.Tensor) -> bool:
+    """True iff eigh should use aten instead of the NKI kernels for A.
+
+    Applies only to tensors on the native ``neuron`` device with
+    n < ``_eigh_nki_min_n()``. ``TRNSOLVER_REQUIRE_NKI=1`` disables it, so
+    the hardware suite keeps exercising the kernels.
+    """
+    if _REQUIRE_NKI:
+        return False
+    if A.device.type != _NATIVE_DEVICE_TYPE:
+        return False
+    return A.shape[-1] < _eigh_nki_min_n()
+
+
+@torch.compiler.disable
+def _aten_eigh_on_device(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """torch.linalg.eigh with the result on A's device.
+
+    Eager-only, like the NKI path it replaces, so the traced graph under
+    ``torch.compile`` is unchanged (one graph break). If the backend computes
+    eigh on the host, the result is moved back to A's device.
+    """
+    w, V = torch.linalg.eigh(A)
+    if w.device != A.device:
+        w = w.to(A.device)
+    if V.device != A.device:
+        V = V.to(A.device)
+    return w, V
 
 
 # ----------------------------------------------------------------------
@@ -700,7 +765,15 @@ def _householder_qr_eigh(
 
     diag, subdiag, V_refs = _householder_tridiag(A)
 
-    eigenvalues, Q_right = _qr_iterate(diag.clone(), subdiag.clone(), tol)
+    # The QR iteration is scalar host code: about 20 element reads/writes per
+    # Givens rotation and O(n^2) rotations per call. Run it on CPU tensors so
+    # a device-resident input does not pay one launch or sync per element
+    # (#42). CPU inputs already ran here, so their results are unchanged.
+    host = torch.device("cpu")
+    eigenvalues, Q_right = _qr_iterate(
+        diag.detach().to(host, copy=True), subdiag.detach().to(host, copy=True), tol
+    )
+    Q_right = Q_right.to(A.device)
     V = _call_apply_reflectors(V_refs, Q_right)
 
     # Subspace rotation refinement (#31): one step of Rayleigh-Ritz on the
