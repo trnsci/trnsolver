@@ -308,20 +308,28 @@ def _aten_eigh_on_device(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _call_matvec(A, v):
-    """Dispatch matvec_kernel through torch_xla or the CPU simulator."""
-    from .nki.dispatch import matvec_kernel
+    """Dispatch matvec_kernel (native op, torch_xla, or the CPU simulator).
+
+    No sync on the XLA path: the tridiagonalization driver syncs once per
+    step. The result is on A's device.
+    """
+    from .nki.dispatch import _launch, matvec_kernel
 
     if _use_simulator():
         import nki
 
         w = nki.simulate(matvec_kernel)(A.detach().cpu().numpy(), v.detach().cpu().numpy())
         return torch.from_numpy(w).to(A.device)
-    return matvec_kernel(A, v)
+    return _launch(matvec_kernel, "matvec", A, v, sync=False)
 
 
 def _call_rank2_update(A, u, v):
-    """Dispatch rank2_update_kernel through torch_xla or the CPU simulator."""
-    from .nki.dispatch import rank2_update_kernel
+    """Dispatch rank2_update_kernel (native op, torch_xla, or the CPU simulator).
+
+    No sync on the XLA path (see :func:`_call_matvec`). The result is on A's
+    device.
+    """
+    from .nki.dispatch import _launch, rank2_update_kernel
 
     if _use_simulator():
         import nki
@@ -330,7 +338,7 @@ def _call_rank2_update(A, u, v):
             A.detach().cpu().numpy(), u.detach().cpu().numpy(), v.detach().cpu().numpy()
         )
         return torch.from_numpy(out).to(A.device)
-    return rank2_update_kernel(A, u, v)
+    return _launch(rank2_update_kernel, "rank2_update", A, u, v, sync=False)
 
 
 def _call_matmul(A, V):
@@ -339,9 +347,10 @@ def _call_matmul(A, V):
     Computes C = A @ V.  A: (n, n), V: (n, k), k > 1.
 
     Simulator path routes through matmul_kernel_sim (nisa.nc_matmul is not
-    simulator-safe — nki.simulate strips the stationary operand). Hardware path
-    moves tensors to the XLA device, calls matmul_kernel, syncs to materialise
-    the result, and returns to orig_device.
+    simulator-safe — nki.simulate strips the stationary operand). The hardware
+    path goes through ``dispatch._launch``: the ``trnsolver::matmul`` custom
+    op on the native ``neuron`` device, or matmul_kernel on the XLA device
+    followed by a sync. The result returns to orig_device.
 
     To compute B.T @ C: call _call_matmul(B.T.contiguous(), C). The
     `.contiguous()` is required because load_transpose2d in the kernel expects
@@ -365,15 +374,9 @@ def _call_matmul(A, V):
         C = nki.simulate(matmul_kernel_sim)(A.detach().cpu().numpy(), V.detach().cpu().numpy())
         return torch.from_numpy(C).to(orig_device)
 
-    import torch_neuronx  # noqa: F401
-    import torch_xla
+    from .nki.dispatch import _launch, matmul_kernel
 
-    from .nki.dispatch import matmul_kernel
-
-    work_device = torch_xla.device()
-    C = matmul_kernel(A.to(work_device), V.to(work_device))
-    torch_xla.sync()
-    return C.to(orig_device)
+    return _launch(matmul_kernel, "matmul", A, V, device=orig_device)
 
 
 def _call_matmul_fp32out(A: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
@@ -409,20 +412,17 @@ def _call_matmul_fp32out(A: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
         )
         return torch.from_numpy(C).to(orig_device)
 
-    import torch_neuronx  # noqa: F401
-    import torch_xla
+    from .nki.dispatch import _launch, matmul_kernel_fp32out
 
-    from .nki.dispatch import matmul_kernel_fp32out
-
-    work_device = torch_xla.device()
     # Cast both operands to BF16: nc_matmul uses the Tensor Engine in BF16 mode
     # and accumulates to FP32 PSUM without any extra cost (Principle 1).
-    C = matmul_kernel_fp32out(
-        A.to(torch.bfloat16).to(work_device),
-        V.to(torch.bfloat16).to(work_device),
+    return _launch(
+        matmul_kernel_fp32out,
+        "matmul_fp32out",
+        A.to(torch.bfloat16),
+        V.to(torch.bfloat16),
+        device=orig_device,
     )
-    torch_xla.sync()
-    return C.to(orig_device)
 
 
 def _call_apply_reflectors(V_refs: torch.Tensor, Q: torch.Tensor) -> torch.Tensor:
@@ -460,15 +460,10 @@ def _call_apply_reflectors(V_refs: torch.Tensor, Q: torch.Tensor) -> torch.Tenso
         )
         return torch.from_numpy(Q_T_out).T.contiguous().to(orig_device)
 
-    import torch_neuronx  # noqa: F401
-    import torch_xla
+    from .nki.dispatch import _launch, apply_reflectors_kernel
 
-    from .nki.dispatch import apply_reflectors_kernel
-
-    work_device = torch_xla.device()
-    Q_T_out = apply_reflectors_kernel(V_refs.to(work_device), Q.to(work_device))
-    torch_xla.sync()
-    return Q_T_out.to(orig_device).T.contiguous()
+    Q_T_out = _launch(apply_reflectors_kernel, "apply_reflectors", V_refs, Q, device=orig_device)
+    return Q_T_out.T.contiguous()
 
 
 # ----------------------------------------------------------------------
@@ -489,7 +484,8 @@ def _householder_tridiag(
     Host drives the outer loop; kernels (matvec_kernel, rank2_update_kernel
     in trnsolver/nki/dispatch.py) handle the hot ops. Under
     TRNSOLVER_USE_SIMULATOR=1 the kernels route through nki.simulate on CPU;
-    otherwise through the XLA path on a Neuron device.
+    otherwise through ``dispatch._launch`` (native ``neuron`` custom ops or
+    the XLA device). The scalar control flow runs on host copies.
 
     Current kernels are Vector-Engine-only — the Tensor Engine lift (via
     nisa.nc_matmul + PSUM accumulation) is a pure-perf refactor tracked
@@ -505,23 +501,25 @@ def _householder_tridiag(
             f"Phase 1 Householder tridiag requires n ≤ 128 (single-tile); got n={n}."
         )
 
-    # On hardware (HAS_NKI and not _use_simulator) the NKI kernel expects
-    # tensors on the XLA (Neuron) device. The simulator path takes numpy,
-    # so CPU tensors are fine there.
+    # On hardware (HAS_NKI and not _use_simulator) the NKI kernels expect
+    # A_work on the Neuron device (native `neuron` or the XLA device). The
+    # simulator path takes numpy, so CPU tensors are fine there.
+    from .nki.dispatch import _step_sync, _work_device
+
     orig_device = A.device
-    if _use_simulator():
-        work_device = orig_device
-    else:
-        import torch_neuronx  # noqa: F401 — registers the Neuron PJRT plugin
-        import torch_xla
+    work_device = orig_device if _use_simulator() else _work_device()
 
-        work_device = torch_xla.device()
-
+    # Only A_work and the two kernels live on the device. The per-step scalar
+    # work (norms, signs, dot products, building v and u) runs on host copies:
+    # one column read and one kernel-output read per step instead of about six
+    # device-side `.item()` syncs and element writes (#40, rule 8 of the
+    # native port). The arithmetic is the same; on CPU it is bit-identical.
+    host = torch.device("cpu")
     A_work = A.clone().to(work_device)
-    V_refs = torch.zeros((n, max(n - 1, 1)), dtype=A.dtype, device=work_device)
+    V_refs = torch.zeros((n, max(n - 1, 1)), dtype=A.dtype, device=host)
 
     for k in range(n - 2):
-        x = A_work[k + 1 :, k]
+        x = A_work[k + 1 :, k].detach().to(host)
         x_norm = torch.linalg.norm(x).item()
         if x_norm < 1e-20:
             continue
@@ -529,7 +527,7 @@ def _householder_tridiag(
         sign_x0 = torch.sign(x[0]).item() if x[0].item() != 0 else 1.0
         alpha = -sign_x0 * x_norm
 
-        v = torch.zeros(n, dtype=A.dtype, device=work_device)
+        v = torch.zeros(n, dtype=A.dtype, device=host)
         v[k + 1 :] = x
         v[k + 1] -= alpha
 
@@ -540,7 +538,7 @@ def _householder_tridiag(
 
         v_col = v.unsqueeze(1)
         w_col = _call_matvec(A_work, v_col)
-        w = w_col.squeeze(1) * beta
+        w = w_col.squeeze(1).to(host) * beta
 
         gamma = beta * torch.dot(v, w).item() / 2.0
         u = w - gamma * v
@@ -548,11 +546,14 @@ def _householder_tridiag(
         u_col = u.unsqueeze(1)
         A_work = _call_rank2_update(A_work, u_col, v_col)
 
-        A_work[k + 1, k] = alpha
-        A_work[k, k + 1] = alpha
-        if k + 2 < n:
-            A_work[k + 2 :, k] = 0.0
-            A_work[k, k + 2 :] = 0.0
+        # Column k below the diagonal and row k right of it become
+        # (alpha, 0, ..., 0): two slice writes instead of four element and
+        # slice writes, same values.
+        edge = torch.zeros(n - k - 1, dtype=A.dtype, device=host)
+        edge[0] = alpha
+        edge = edge.to(A_work.device)
+        A_work[k + 1 :, k] = edge
+        A_work[k, k + 1 :] = edge
 
         v_norm_val = v.norm()
         if v_norm_val.item() > 0:
@@ -564,11 +565,10 @@ def _householder_tridiag(
         # step — causing a fresh NEFF compile on every outer-loop call.
         # torch_xla.sync() materialises A_work into a concrete HBM buffer;
         # the next _call_matvec then sees a plain leaf tensor and reuses
-        # the cached NEFF. Skipped on the simulator path (no XLA layer).
+        # the cached NEFF. Skipped on the simulator path (no XLA layer) and
+        # a no-op on the native path (eager launches).
         if not _use_simulator():
-            import torch_xla
-
-            torch_xla.sync()
+            _step_sync()
 
     diag = torch.diagonal(A_work).clone().to(orig_device)
     subdiag = torch.diagonal(A_work, offset=1).clone().to(orig_device)

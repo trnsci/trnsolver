@@ -6,18 +6,26 @@ parallel Jacobi sweep in `_jacobi_eigh_nki`. This page is the short
 trnsolver-specific version of the suite-wide guide at
 [`trnsci/docs/developing_kernels.md`](https://github.com/trnsci/trnsci/blob/main/docs/developing_kernels.md).
 
-## Three dispatch modes
+## Dispatch modes
 
 | Mode | Trigger | When to use |
 |------|---------|-------------|
 | **PyTorch fallback** | `HAS_NKI = False` (non-Neuron host), or an exception in the NKI path gets caught | Laptops, GPUs, CI's `ubuntu-latest` test matrix — the default for anyone without Neuron installed |
-| **NKI hardware** | `HAS_NKI = True`, default env. Kernel runs through `torch_xla` → NEFF compile → NeuronCore | Real perf numbers, final validation |
+| **NKI hardware, native** | `HAS_NKI = True` + TorchNeuron `torch_neuronx` (has `nki_op`) + a `neuron` device. Kernel runs as a `trnsolver::` custom op on `device="neuron"` | Trn2/Trn3 on Neuron SDK 2.33+. Set `NKI_ENABLE_TRACE_CACHE=0` with an editable install. |
+| **NKI hardware, XLA** | `HAS_NKI = True` + `torch_xla` installed (and the native path unavailable). Kernel runs through `torch_xla` → NEFF compile → NeuronCore | Trn1; real perf numbers, final validation |
 | **NKI simulator** | `TRNSOLVER_USE_SIMULATOR=1` + `HAS_NKI = True`. Kernel runs through `nki.simulate(kernel)(numpy_args)` on CPU | Fast correctness iteration during kernel design |
 
-All three modes share the same kernel source — the `@nki.jit` definition
+All modes share the same kernel source — the `@nki.jit` definition
 inside `if HAS_NKI:` in `trnsolver/nki/dispatch.py`. The host driver
 (`_jacobi_eigh_nki` in `trnsolver/eigen.py`) picks the path based on
 `_use_nki()` and `_use_simulator()`.
+
+Each host wrapper in `trnsolver/eigen.py` hands its operands to
+`_launch(kernel, op_name, *tensors)` in `dispatch.py`, which picks the
+native custom op or the torch_xla path. A new hardware kernel needs a
+matching annotated wrapper in `trnsolver/nki/_native.py` and an entry in its
+`OPS` table. On the native path, keep scalar control flow (`.item()`,
+element writes) on host copies: each one is a device round trip.
 
 ## Simulator workflow
 

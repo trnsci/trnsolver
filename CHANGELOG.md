@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Native PyTorch dispatch on TorchNeuron (#40, trnsci/trnsci#35).** On
+  TorchNeuron (Neuron SDK 2.33+, `torch-neuronx` 2.14, PyTorch 2.14,
+  Trn2/Trn3) every hardware NKI kernel is registered as a PyTorch custom op
+  with `torch_neuronx.nki_op` and launched on `device="neuron"`, with no
+  `torch_xla` import. Ops: `trnsolver::matvec`, `rank2_update`, `matmul`,
+  `matmul_fp32out`, `apply_reflectors`. Kernel bodies are unchanged.
+  - The dispatch path is detected on the first kernel launch: native when
+    `torch_neuronx` exports `nki_op` and a `neuron` device is available, XLA
+    when `torch_xla` is installed, otherwise none. The XLA path (Trn1) is
+    unchanged: kernels run on `torch_xla.device()` followed by
+    `torch_xla.sync()`, as before. The simulator path is unchanged.
+  - The custom ops are registered lazily (`trnsolver/nki/_native.py` is
+    imported only once the native path is selected), so CPU-only installs
+    and the XLA lineage see no import-time side effects.
+  - Every host wrapper (`_call_matvec`, `_call_rank2_update`, `_call_matmul`,
+    `_call_matmul_fp32out`, `_call_apply_reflectors`) goes through one
+    launch helper, `dispatch._launch`.
+  - `TRNSCI_NKI_DISPATCH=auto|native|xla|cpu` forces the dispatch path (a
+    suite-wide variable). Forcing an unavailable path raises.
+  - `TRNSCI_XLA_DEPRECATION=1` makes the XLA path emit one
+    `DeprecationWarning`. Off by default; the suite turns it on at
+    TorchNeuron GA.
+  - New `[torchneuron]` extra (`torch>=2.14`, `torch-neuronx>=2.14`,
+    `nki>=0.6`); `[neuron]` stays the PyTorch/XLA lineage.
+  - Tests: `conftest.py` sets `NKI_ENABLE_TRACE_CACHE=0` by default;
+    CPU-runnable path-selection, routing and lazy-registration tests;
+    `@pytest.mark.neuron` native-path tests (not yet run on hardware). The
+    two `test_eigh_neuron.py` tests that call kernels on `torch_xla` tensors
+    are skipped off the XLA path.
+
+### Changed
+
+- **Householder tridiagonalization keeps its scalar work on the host.**
+  `_householder_tridiag` reads column k of the working matrix once per step
+  and computes the norm, sign, `v`, `v·v`, `v·w` and `u` on CPU copies; only
+  the working matrix and the two kernels stay on the device. The fixup of
+  row and column k is two slice writes instead of four. The reflectors are
+  accumulated on the host. This replaces about six device `.item()` syncs
+  and several element writes per step. The algorithm is unchanged, and CPU
+  and simulator results are bit-identical.
+- **`gmres` keeps its Hessenberg matrix and least-squares solve on the
+  host.** Every entry was already read back as a Python float; the Krylov
+  basis stays on `b`'s device. Removes per-element device writes and a
+  device `lstsq`. CPU results are bit-identical.
+- **`schur` runs on a CPU copy of the input** and returns `Q`, `T` on the
+  input's device, like the eigh QR iteration (#42). CPU inputs are
+  unchanged.
+
 ### Fixed
 
 - **`eigh` on the native `neuron` device uses `torch.linalg.eigh` below

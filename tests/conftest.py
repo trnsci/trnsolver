@@ -1,7 +1,15 @@
 """Test configuration and fixtures."""
 
+import os
+
 import pytest
 import torch
+
+# Test runs come from source checkouts / editable installs, which the NKI trace
+# cache cannot version (it keys on wheel .dist-info). A stale hit would run an
+# old kernel, so disable it before anything imports nki. Set it explicitly to
+# override.
+os.environ.setdefault("NKI_ENABLE_TRACE_CACHE", "0")
 
 
 def pytest_configure(config):

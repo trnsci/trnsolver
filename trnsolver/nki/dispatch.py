@@ -80,7 +80,11 @@ for the architecture decision and #36 for the matmul resolution.
 
 from __future__ import annotations
 
+import importlib.util
 import os
+import warnings
+
+import torch
 
 try:
     import nki
@@ -140,6 +144,164 @@ def _use_simulator() -> bool:
     fallback if `_use_nki()` is False).
     """
     return _USE_SIMULATOR and HAS_NKI
+
+
+# ── Device dispatch path: native TorchNeuron vs XLA ──────────────────────────
+#
+# Two Neuron PyTorch lineages coexist:
+#   native  torch-neuronx 2.14+ (TorchNeuron, Trn2/Trn3): Trainium is a
+#           PyTorch `neuron` device; kernels are custom ops registered via
+#           `torch_neuronx.nki_op` (see `_native.py`).
+#   xla     torch-neuronx 2.9 lineage (PyTorch/XLA; Trn1 and Inf2 stay
+#           here): kernels run on `torch_xla.device()` and are materialised
+#           with `torch_xla.sync()`, exactly as before the native path existed.
+# Anything else is "cpu": no device path, so a kernel launch outside the
+# simulator raises from the torch_xla import, as it did before. Detection
+# runs on the first launch, not at import, and the native probe never
+# imports torch_xla.
+
+_NEURON_DEVICE = "neuron"
+_dispatch_path: str | None = None
+_native_ops: dict | None = None
+_xla_deprecation_warned = False
+
+_XLA_DEPRECATION_MESSAGE = (
+    "the PyTorch/XLA path is deprecated on Trn2/Trn3; use TorchNeuron (native). "
+    "Trn1/Inf2 remain supported in maintenance mode."
+)
+
+
+def _native_available() -> bool:
+    try:
+        import torch_neuronx
+    except Exception:
+        return False
+    # The XLA-lineage torch_neuronx has no `nki_op`.
+    if not hasattr(torch_neuronx, "nki_op"):
+        return False
+    try:
+        torch.device(_NEURON_DEVICE)  # torch_neuronx renames PrivateUse1 to "neuron"
+        return torch_neuronx.device_count() > 0
+    except Exception:
+        return False
+
+
+def _detect_dispatch_path() -> str:
+    # TRNSCI_NKI_DISPATCH=auto|native|xla|cpu is shared by every trnsci
+    # library, so one variable pins the whole suite on hosts that have both
+    # lineages.
+    forced = os.environ.get("TRNSCI_NKI_DISPATCH", "auto").strip().lower()
+    if forced == "native":
+        if not _native_available():
+            raise RuntimeError(
+                "TRNSCI_NKI_DISPATCH=native, but no TorchNeuron backend with a "
+                "'neuron' device is available"
+            )
+        return "native"
+    if forced == "xla":
+        if importlib.util.find_spec("torch_xla") is None:
+            raise RuntimeError("TRNSCI_NKI_DISPATCH=xla, but torch_xla is not installed")
+        return "xla"
+    if forced == "cpu":
+        return "cpu"
+    if forced != "auto":
+        raise ValueError(f"TRNSCI_NKI_DISPATCH must be auto, native, xla, or cpu; got {forced!r}")
+    if _native_available():
+        return "native"
+    if importlib.util.find_spec("torch_xla") is not None:
+        return "xla"
+    return "cpu"
+
+
+def _maybe_warn_xla_deprecated() -> None:
+    """Dormant hook: one DeprecationWarning on the XLA path, opt-in only.
+
+    Off unless ``TRNSCI_XLA_DEPRECATION=1``; the suite turns it on at
+    TorchNeuron GA (trnsci/trnsci#35).
+    """
+    global _xla_deprecation_warned
+    if _xla_deprecation_warned:
+        return
+    if os.environ.get("TRNSCI_XLA_DEPRECATION", "").strip() != "1":
+        return
+    _xla_deprecation_warned = True
+    warnings.warn(_XLA_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=3)
+
+
+def _get_dispatch_path() -> str:
+    """Return "native", "xla", or "cpu" (cached after the first call)."""
+    global _dispatch_path
+    if _dispatch_path is None:
+        _dispatch_path = _detect_dispatch_path()
+    if _dispatch_path == "xla":
+        _maybe_warn_xla_deprecated()
+    return _dispatch_path
+
+
+def _get_native_ops() -> dict:
+    """Import `_native` (registering the trnsolver:: custom ops) on first use."""
+    global _native_ops
+    if _native_ops is None:
+        from . import _native
+
+        _native_ops = _native.OPS
+    return _native_ops
+
+
+def _work_device() -> torch.device:
+    """Device a host driver should keep kernel operands on between launches.
+
+    ``neuron`` on the native path; ``torch_xla.device()`` otherwise (which
+    raises ImportError without torch_xla, the pre-native behaviour).
+    """
+    if _get_dispatch_path() == "native":
+        return torch.device(_NEURON_DEVICE)
+    import torch_neuronx  # noqa: F401 — registers the Neuron PJRT plugin
+    import torch_xla
+
+    return torch_xla.device()
+
+
+def _step_sync() -> None:
+    """Materialise pending device work between host-driven steps.
+
+    XLA path only: ``torch_xla.sync()`` turns a kernel output into a leaf
+    buffer so the next step reuses the cached NEFF. Native (eager) launches
+    need nothing here.
+    """
+    if _get_dispatch_path() == "native":
+        return
+    import torch_xla
+
+    torch_xla.sync()
+
+
+def _launch(
+    kernel,
+    op_name: str,
+    *tensors: torch.Tensor,
+    device: torch.device | None = None,
+    sync: bool = True,
+) -> torch.Tensor:
+    """Run one kernel launch on the Neuron device.
+
+    ``op_name`` is the ``trnsolver::<op_name>`` custom op used on the native
+    path; the XLA path calls ``kernel`` directly on torch_xla tensors and,
+    when ``sync`` is set, materialises the result with ``torch_xla.sync()``.
+    The result is returned on ``device`` (default: the first input's device).
+    """
+    out_device = tensors[0].device if device is None else device
+    if _get_dispatch_path() == "native":
+        op = _get_native_ops()[op_name]
+        return op(*(t.to(_NEURON_DEVICE) for t in tensors)).to(out_device)
+    import torch_neuronx  # noqa: F401
+    import torch_xla
+
+    work_device = torch_xla.device()
+    out = kernel(*(t.to(work_device) for t in tensors))
+    if sync:
+        torch_xla.sync()
+    return out.to(out_device)
 
 
 if HAS_NKI:

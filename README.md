@@ -29,9 +29,27 @@ trnsolver follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Act
 ```bash
 pip install trnsolver
 
-# With Neuron hardware support
-pip install trnsolver[neuron]
+# Trn2/Trn3 with TorchNeuron (native PyTorch, Neuron SDK 2.33+)
+pip install "trnsolver[torchneuron]" --extra-index-url https://pip.repos.neuron.amazonaws.com
+
+# Trn1 / PyTorch-XLA lineage
+pip install "trnsolver[neuron]" --extra-index-url https://pip.repos.neuron.amazonaws.com
 ```
+
+Kernels dispatch on whichever Neuron PyTorch lineage is installed:
+
+- **TorchNeuron (native)**: Trn2/Trn3, Neuron SDK 2.33+, Python ≥ 3.12,
+  `torch` 2.14, `torch-neuronx` 2.14.*. Each kernel is a PyTorch custom op
+  (`torch.ops.trnsolver.*`) on the `neuron` device; no `torch_xla`.
+- **PyTorch/XLA**: Trn1 (and any host on the `torch-neuronx` 2.9 lineage).
+  Kernels dispatch through `torch_xla`, unchanged.
+
+trnsolver picks the native path when the native `torch_neuronx` and a
+`neuron` device are present, and the XLA path when `torch_xla` is installed.
+Set `TRNSCI_NKI_DISPATCH=native`, `xla` or `cpu` (shared by all trnsci
+libraries) to force a path. With an editable install (`pip install -e`), set
+`NKI_ENABLE_TRACE_CACHE=0`: the NKI kernel cache only versions installed
+wheels and can serve stale kernels. See [installation](docs/installation.md).
 
 ## Quick example
 

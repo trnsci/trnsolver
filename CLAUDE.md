@@ -24,7 +24,8 @@ trnsolver/
 │   ├── iterative.py         # cg, gmres
 │   └── nki/
 │       ├── __init__.py
-│       └── dispatch.py      # auto/pytorch/nki dispatch + Jacobi rotation kernel
+│       ├── dispatch.py      # NKI kernels, launch helper, dispatch-path selection
+│       └── _native.py       # TorchNeuron custom ops (nki_op), loaded lazily
 ├── tests/
 │   ├── conftest.py          # Fixtures: symmetric, SPD, random matrices
 │   ├── test_eigen.py        # Eigenvalue tests (reconstruction, orthogonality)

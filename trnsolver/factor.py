@@ -476,7 +476,8 @@ def schur(
     on the diagonal corresponding to complex-conjugate eigenvalue pairs of
     real A. For symmetric A all blocks are 1×1 (T is diagonal = eigenvalues).
 
-    Host-only (no NKI dispatch). Uses Householder Hessenberg reduction
+    Host-only (no NKI dispatch): device inputs are copied to the CPU and the
+    factors are returned on the input's device. Uses Householder Hessenberg reduction
     followed by Francis implicit double-shift QR iteration with deflation.
     NKI acceleration of the Hessenberg stage is deferred to Phase 3.
 
@@ -491,9 +492,15 @@ def schur(
     if A.shape[0] != A.shape[1]:
         raise ValueError(f"schur: A must be square, got shape {tuple(A.shape)}")
     A, orig = _to_fp32(A)
-    H, Q = _hessenberg_reduce(A)
+    # Hessenberg reduction and the Francis iteration are scalar host code
+    # (per-element reads for deflation and shifts, small reflector updates).
+    # Run them on a CPU copy so a device-resident input does not pay a launch
+    # or sync per scalar, as the eigh QR iteration does (#42); move the result
+    # back to A's device. CPU inputs are unchanged (`.to` is a no-op).
+    device = A.device
+    H, Q = _hessenberg_reduce(A.detach().to("cpu"))
     T, Q = _schur_iterate(H, Q, tol, max_sweeps=30 * A.shape[0])
-    return _restore(Q, orig), _restore(T, orig)
+    return _restore(Q.to(device), orig), _restore(T.to(device), orig)
 
 
 def solve(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
