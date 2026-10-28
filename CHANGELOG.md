@@ -7,6 +7,290 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`eigh` on the native `neuron` device uses `torch.linalg.eigh` below
+  `TRNSOLVER_EIGH_NKI_MIN_N` (default 512).** On Trn2 the NKI path took
+  0.4 s at n=16 and 21 s at n=128, against 0.4-1.1 ms for aten on the same
+  device, and grew about 4x per doubling of n. It is launch-bound, not
+  compute-bound. Tridiagonalization makes n-2 host-driven steps, each with
+  two kernel launches, about six `.item()` reads and an XLA sync. The
+  implicit-shift QR iteration then ran element by element on the input's
+  device: O(n^2) Givens rotations, each with about 20 single-element reads,
+  writes and column updates, so at ~0.2 ms per eager launch the QR stage
+  dominated. Tensors on the `neuron` device with n below the threshold now
+  go to `torch.linalg.eigh`, and the result stays on the input's device.
+  `TRNSOLVER_EIGH_NKI_MIN_N=0` turns the cutover off, and
+  `TRNSOLVER_REQUIRE_NKI=1` bypasses it, so the hardware suite still runs the
+  kernels. Other devices, including CPU inputs with the NKI backend, are not
+  affected. The NKI path is single-tile (n <= 128), so with the default every
+  size it supports uses aten. Under `torch.compile` the cutover runs eagerly
+  behind the same single graph break as the NKI path. (#42)
+- **The NKI `eigh` path runs its QR iteration on CPU tensors.** `diag`,
+  `subdiag` and the Givens accumulator are copied to the host before
+  `_qr_iterate`, and the accumulator is moved back to the input's device
+  before `apply_reflectors_kernel`. CPU inputs already took this path, so
+  their results are unchanged. Device-resident inputs no longer pay one
+  launch or sync per scalar. (#42)
+- **`apply_reflectors_kernel` now compiles under NKI 0.7.0 / neuronx-cc 2.28
+  (Trn2).** The kernel loaded all Householder vectors as an SBUF `V^T` and
+  sliced row `V_T[k:k+1, :]` per step. That is a 1-partition access at
+  partition k, and the newer verifier only allows those to start at partition
+  0, 32, 64 or 96 (`'nisa.tensor_copy' op Expected 'src' partition start in
+  {0, 32, 64, 96}`). This failed all 19 `TestEighNKI` hardware tests. Each
+  vector is now loaded per step with `load_transpose2d(V_refs[:, k:k+1])`, so
+  it lands at partition 0, the same idiom `matmul_kernel_sim` uses. The
+  algorithm is unchanged and simulator output is bit-identical to the old
+  kernel for n ∈ {4, 8, 16, 33, 64, 128}. (#40)
+- **`benchmarks/bench_solver.py::TestEigh::test_eigh_nki` skips n > 128.**
+  The NKI eigh path is single-tile, and `_householder_tridiag` raises
+  `NotImplementedError` for n > 128, so the 256 and 512 cases failed on
+  hardware rather than measuring anything. The PyTorch and torch baselines
+  still run at every size.
+- **`cholesky`, `solve`, `solve_spd`, `inv_spd` and `eigh_generalized` use
+  only Neuron-lowerable ops under `torch.compile`.** On Trn2 there were two
+  separate failures:
+  - `torch.linalg.cholesky` and `torch.linalg.solve` decompose to a `*_ex`
+    kernel followed by `aten._linalg_check_errors(info)`. That op only
+    raises, and newer PyTorch wraps it in the `with_effects` higher-order op,
+    which TorchNeuron's FxImporter does not implement (`BackendCompilerFailed`).
+  - The Neuron backend has no lowering for `linalg_cholesky_ex` or
+    `linalg_solve_ex` themselves.
+
+  Inside a compiled region (`torch.compiler.is_compiling()`), real inputs now
+  use traceable implementations built from elementwise ops, `where`, `mm`,
+  `sqrt`, `argmax`, `gather` and `tril`/`triu`. Each is a static loop that
+  unrolls at trace time, with no `.item()`:
+  - `_cholesky_traceable`: right-looking column Cholesky that reads only the
+    lower triangle, like `potrf`.
+  - `_solve_lu_traceable`: Gaussian elimination with partial pivoting on
+    `[A | B]`. It picks the same pivot as `getrf` (`argmax |a_ik|`) and swaps
+    rows with a `gather` permutation.
+  - `_solve_triangular_traceable`: forward and back substitution, used by
+    `solve_spd` in place of `torch.linalg.solve_triangular`.
+
+  Compiled results match eager to about 1e-6 in fp32 and 1e-13 in fp64 at
+  n = 128. Under `torch.compile`, a non-SPD or singular input yields NaN or
+  inf instead of raising. Eager calls and complex inputs are unchanged. (#41)
+- **`qr` traces to StableHLO-lowerable ops under `torch.compile`.**
+  `aten.linalg_qr` has no StableHLO lowering on Neuron. When compiling, real
+  inputs now use `_householder_qr`, a reduced Householder QR made of
+  elementwise ops, `where` masks, `mm` and `triu`. It has no `.item()`, no
+  data-dependent control flow and no in-place slice assignment, and its
+  static column loop unrolls at trace time. It uses LAPACK's sign convention
+  (`R[k, k] = -sign(A[k, k]) * ||A[k:, k]||`, and the reflector is skipped
+  when the sub-column is already zero), so Q and R match `torch.linalg.qr` to
+  rounding. Supports batch dimensions. Eager calls and complex inputs still
+  use `torch.linalg.qr`. (#41)
+- **`eigh` (NKI path), `cg`, `gmres` and `gmres_ir` are documented as
+  eager-only and wrapped in `torch.compiler.disable`.** Their convergence and
+  deflation logic is data-dependent Python control flow on `.item()` scalars,
+  and they return Python numbers. Under `torch.compile` this split the graph
+  into many pieces (26 graph breaks for `eigh` at n=128, 4 for `cg`). They now
+  run eagerly behind one graph break, and `fullgraph=True` raises a clear
+  `Unsupported` error. The algorithms are unchanged. (#41)
+
+### Added
+
+- **`tests/test_compile.py`**: CPU checks with `torch.compile(backend="aot_eager",
+  fullgraph=True)`:
+  - `cholesky`, `solve` (including a case that needs pivoting and a vector
+    right-hand side), `solve_spd`, `inv_spd` and `qr` trace with zero graph
+    breaks and match eager in fp32 and fp64.
+  - The traced aten graph contains none of `_linalg_check_errors`,
+    `linalg_cholesky_ex`, `linalg_solve_ex`, `linalg_solve_triangular`,
+    `linalg_lu` or `linalg_qr`.
+  - Eager `cholesky` and `solve` still raise `LinAlgError`.
+  - The traceable kernels match LAPACK in fp64, including batches, pivoting
+    and zero columns.
+  - `cg` falls back to eager. With `fullgraph=True` it raises `Unsupported`
+    on torch 2.11 and `UserError` on 2.14.
+
+- **`tests/test_nki_compile.py`** (marker `nki_simulator`): runs the NKI
+  frontend (trace → MLIR → `verify()`) on CPU for every `@nki.jit` kernel at
+  n ∈ {8, 16, 32, 128} for both trn1 and trn2. `nki.simulate` does not run
+  the MLIR verifier, so this catches hardware-only lowering errors like #40
+  without a Neuron device. Needs `nki`, but not `neuronx-cc`.
+
+## [0.15.0] — 2026-04-22
+
+### Added
+
+- **`gmres_ir(A, b, tol=1e-10, max_outer=5, inner_tol=1e-1, inner_maxiter=50, inner_restart=20)`**
+  — GMRES with iterative refinement for general (non-symmetric) Ax = b. Implements
+  the Carson–Higham two-precision framework, extending the `solve_spd` iterative
+  refinement path (Cholesky, SPD only, one correction step) to GMRES + multiple outer
+  iterations over any invertible A.
+
+  Algorithm: compute FP32 LU(A) once; outer loop computes the FP64 residual
+  r = b − Ax, then solves the left-preconditioned correction system
+  (U⁻¹ L⁻¹ Pᵀ A) δx = U⁻¹ L⁻¹ Pᵀ r via the existing `gmres` callable interface,
+  and accumulates x += δx. When the FP32 LU is accurate, the preconditioned
+  system is near-identity and the inner GMRES converges in very few steps.
+
+  Precision tiers:
+  - **Factorization:** FP32 LU via `torch.linalg.lu` (once, reused per outer step)
+  - **Inner GMRES:** FP32 Krylov vectors and modified Gram-Schmidt
+  - **Outer residual:** FP64 — captures errors below FP32 machine epsilon
+  - **Correction solve:** FP32 triangular solves reusing stored L, U
+  - **Reliable for:** cond(A) ≲ 1/eps32 ≈ 1e7
+
+  Returns `(x, total_inner, residual)` where `total_inner` is the total GMRES
+  matvec count across all outer steps and `residual` is the final FP64 relative
+  residual. BF16/FP16 inputs upcast to FP32 via `_to_fp32`; output restored.
+
+  **Honest non-fits and deferred work:**
+  - **BF16 inner path deferred (v0.16.0).** The inner matvec A@v could use
+    `matmul_kernel_fp32out` (BF16 Tensor Engine → FP32 PSUM, Principle 1) for
+    50–100× throughput. However, Gram-Schmidt dot products need SR (Principle 3,
+    Connolly–Higham–Mary 2021) for BF16 stability at n ≥ ~300. Deferred until
+    `trnrand` SR lands.
+  - **Single-RHS only.** Block RHS (n × k) via column iteration is v0.16.0.
+  - **Callable A not supported.** LU requires a concrete matrix; raises `TypeError`
+    for callable matvec operators. Use `gmres` directly for matrix-free problems.
+
+## [0.14.0] — 2026-04-21
+
+### Added
+
+- **`matmul_kernel_fp32out(A, V)` and `matmul_kernel_fp32out_sim(A, V)`** in
+  `trnsolver.nki.dispatch`. Tensor Engine C = A @ V with FP32 output regardless
+  of input dtype. A and V are BF16; nc_matmul accumulates BF16 products to FP32
+  via PSUM at no extra cost (Principle 1: PSUM as free FP32 accumulator). The
+  result is stored as FP32 — unlike `matmul_kernel`, which downcasts the PSUM
+  result back to A.dtype and would discard the accumulated FP32 precision.
+
+  `matmul_kernel_fp32out_sim` is the simulator-safe Vector Engine variant (same
+  interface, FP32 output; receives FP32-upcast arrays since numpy has no BF16 dtype).
+
+- **`_call_matmul_fp32out(A, V)`** dispatch helper in `trnsolver.eigen`. Casts
+  A and V to BF16 for the Tensor Engine, calls `matmul_kernel_fp32out` on hardware
+  (or `matmul_kernel_fp32out_sim` on the simulator with FP32-upcast numpy), and
+  returns a FP32 result tensor on `orig_device`. Falls back to
+  `torch.matmul(A.float(), V.float())` when NKI is unavailable or n/k > 128.
+
+### Changed
+
+- **`eigh_randomized`** now uses the BF16-native sketch path when A is BF16 and
+  the NKI backend is active (`_use_nki()` returns True). Instead of upcasting A to
+  FP32, it keeps A in BF16 and routes the sketch (A @ Ω), power-iteration, and
+  projection (A @ Q) through `_call_matmul_fp32out`. All post-sketch operations
+  (QR of Y, eigh of the small ℓ×ℓ B matrix, eigenvector lift) run in FP32.
+  Output is restored to BF16 via `_restore`. On CPU/non-NKI hosts the original
+  _to_fp32 upcast path is used unchanged.
+
+  The BF16-native path delivers the 50–100× BF16 throughput on the Tensor Engine
+  while maintaining FP32-quality accumulation in the sketch — the exact scenario
+  identified in the trnsci technical brief (Principle 1). This is the correctness
+  baseline; profiling vs cuSOLVER on vintage-matched hardware is tracked separately.
+
+## [0.13.0] — 2026-04-21
+
+### Added
+
+- **`eigh_randomized(A, k, *, oversampling=10, n_iter=0, seed=None)`** — Randomized
+  symmetric eigensolver implementing the Nakatsukasa–Tropp sketch-and-Rayleigh-Ritz
+  (sRR) algorithm (SIAM SIMAX 45(2), 2024). Returns the k eigenvalues of largest
+  absolute magnitude and their corresponding eigenvectors. Complexity O(n²k) vs
+  `eigh`'s O(n³), with 50–100× speedup potential at BF16 on Trainium once the
+  native BF16 sketch path lands (v0.14.0 target).
+
+  Algorithm: sketch Ω ∈ R^{n×(k+p)} ~ N(0,1); Y = A@Ω; optional power iteration
+  (A@Q each round with re-orthogonalization); Q = orth(Y); B = Q^T A Q (small
+  (k+p)×(k+p) matrix); exact eigh(B); select k eigenvalues of largest |value|; lift
+  V_k = Q @ V_small. Output eigenvalues are Rayleigh quotients sorted ascending.
+
+  - `_call_matmul` shape guard extended to also short-circuit when `_use_nki()` is
+    False, making it safe for callers such as `eigh_randomized` that call it
+    unconditionally on arbitrary-size inputs (previously only dimension bounds were
+    checked; non-NKI hardware would attempt `import torch_neuronx`).
+  - Optional `trnrand` import for the sketch matrix Ω (NKI-accelerated Philox RNG);
+    falls back to `torch.randn` when `trnrand` is not installed.
+  - `seed` parameter enables reproducible runs; `None` = unseeded.
+
+  **Note:** Targets eigenvalues of largest magnitude, not smallest. For SCF's
+  k occupied orbitals (k smallest eigenvalues), use `eigh`. v0.14.0 will add a
+  native BF16 sketch path (BF16 A → FP32 PSUM via `nc_matmul`, Principle 1).
+
+### Changed
+
+- `_call_matmul` dispatch helper now short-circuits with `torch.matmul` when
+  `_use_nki()` is False (in addition to the existing n > 128 / k > 128 dimension
+  guards). This is a pure correctness fix for CPU-only environments; NKI-hardware
+  behavior is unchanged.
+
+## [0.12.0] — 2026-04-21
+
+### Added
+
+- **`apply_reflectors_kernel(V_refs, Q_in)`** in `trnsolver.nki.dispatch`. Fused
+  Householder reflector application: applies n-2 reflectors to Q in a single NKI
+  dispatch instead of the previous host-driven Python loop (n-2 iterations of
+  `Q ← Q − 2 v (vᵀQ)` via `torch.outer`). Eliminates n-2 iterations of O(n²)
+  PyTorch calls for the eigenvector assembly step of `eigh`, replacing them with
+  one Vector Engine kernel resident entirely in SBUF.
+
+  SBUF layout: the kernel maintains Q^T in SBUF so the critical reduction
+  `p[j] = Σᵢ vₖ[i]·Q[i,j]` becomes a free-dim sum (axis=1, supported by NKI
+  0.3.0) rather than a partition-dim sum (axis=0, unsupported). V_refs is loaded
+  transposed (V_T[k, i] = vₖ[i]) enabling static row-slice access within the
+  compile-time-unrolled `nl.affine_range` loop. The kernel returns Q^T;
+  `_call_apply_reflectors` transposes back before returning to
+  `_householder_qr_eigh`.
+
+  All ops are Vector Engine (`load_transpose2d`, `broadcast_to`, `multiply`,
+  `sum(axis=1)`) — the kernel is simulator-safe with no separate `_sim` variant;
+  `apply_reflectors_kernel_sim = apply_reflectors_kernel`.
+
+- **`_call_apply_reflectors(V_refs, Q)`** dispatch helper in `trnsolver.eigen`.
+  Routes to `apply_reflectors_kernel` (hardware) or `apply_reflectors_kernel_sim`
+  (simulator), handling the CPU→XLA→CPU round-trip and result transpose.
+
+### Changed
+
+- `_householder_qr_eigh` in `trnsolver.eigen` now routes the eigenvector assembly
+  step through `_call_apply_reflectors` (NKI) instead of the host-only
+  `_apply_reflectors` loop.
+
+## [0.11.0] — 2026-04-21
+
+### Added
+
+- **`matmul_kernel(A, V)` and `matmul_kernel_sim(A, V)`** in
+  `trnsolver.nki.dispatch`. Tensor Engine matrix-matrix product C = A @ V via
+  `nisa.nc_matmul` (hardware) and a Vector Engine per-column broadcast+sum loop
+  (simulator). The hardware kernel uses A^T as the SBUF stationary operand and V
+  as the moving operand (shape (n, k)), satisfying the NKI 0.3.0 free-dim
+  constraint (free_dim = k > 1) that blocked the earlier vector matvec attempt
+  (#36). The simulator kernel (`matmul_kernel_sim`) handles `TRNSOLVER_USE_SIMULATOR=1`
+  because `nki.simulate` strips the `nc_matmul` stationary operand and cannot
+  route the hardware kernel. Closes #36.
+
+- **`_call_matmul(A, V)`** dispatch helper in `trnsolver.eigen`. Routes to
+  `matmul_kernel` (hardware) or `matmul_kernel_sim` (simulator), handling the
+  full CPU→XLA→CPU device round-trip and `torch_xla.sync()` for NEFF cache
+  reuse.
+
+- **Rayleigh-Ritz refinement on NKI** (`trnsolver.eigen._householder_qr_eigh`).
+  The three GEMMs in the post-tridiagonalization subspace rotation step
+  (`A@V`, `V.T@AV`, `V@Q_corr`) now route through `_call_matmul` on the Tensor
+  Engine instead of PyTorch on CPU. This is the largest previously-unaccelerated
+  hot path in the NKI `eigh` call at n=128.
+
+## [0.10.0] — 2026-04-18
+
+### Added
+
+- **`schur(A, tol=1e-10)`** in `trnsolver.factor`. Schur decomposition returns
+  `(Q, T)` with `A = Q @ T @ Q.T`. T is quasi-upper triangular — upper triangular
+  with possible 2×2 blocks on the diagonal for complex-conjugate eigenvalue pairs
+  of real A; for symmetric A all diagonal blocks are 1×1 (T is the eigenvalue
+  matrix). Implemented via (1) upper Hessenberg reduction with successive Householder
+  reflectors accumulated into Q, then (2) Francis implicit double-shift QR with
+  deflation until the active window is exhausted. Host-only (no NKI dispatch);
+  BF16/FP16 inputs promoted to FP32 via the standard `_to_fp32`/`_restore` shim.
+  This closes the last item in the Factorizations "Deferred" column of the API table.
+
 ## [0.9.0] — 2026-04-17
 
 ### Added

@@ -184,3 +184,140 @@ class TestHouseholderTridiagSimulator:
             # Either unit-norm (reflector populated) or zero (step skipped
             # due to already-zero column).
             assert col_norm == pytest.approx(1.0, abs=1e-4) or col_norm < 1e-20
+
+
+class TestMatmulSimulator:
+    """matmul_kernel_sim via nki.simulate: A @ V = C.
+
+    Validates the simulator-compatible Vector Engine matmul. Also confirms
+    the end-to-end eigh Rayleigh-Ritz step routes through _call_matmul when
+    TRNSOLVER_USE_SIMULATOR=1.
+    """
+
+    @pytest.mark.parametrize("n,k", [(8, 4), (16, 16), (32, 64), (64, 64), (128, 128)])
+    def test_matmul_sim_vs_torch(self, n, k):
+        import nki
+
+        from trnsolver.nki.dispatch import matmul_kernel_sim
+
+        torch.manual_seed(42)
+        A = torch.randn(n, n)
+        V = torch.randn(n, k)
+        C_ref = (A @ V).numpy()
+        C = nki.simulate(matmul_kernel_sim)(A.numpy(), V.numpy())
+        np.testing.assert_allclose(C, C_ref, atol=1e-4)
+
+    @pytest.mark.parametrize("n", [8, 32, 64, 128])
+    def test_eigh_rayleigh_ritz_via_matmul(self, n):
+        """eigh still correct with _call_matmul wired into Rayleigh-Ritz."""
+        import trnsolver
+
+        torch.manual_seed(42)
+        A = torch.randn(n, n)
+        A = 0.5 * (A + A.T)
+        w_ref, _ = torch.linalg.eigh(A)
+        w, V = trnsolver.eigh(A)
+        np.testing.assert_allclose(w.numpy(), w_ref.numpy(), atol=1e-3, rtol=1e-3)
+
+
+class TestMatmulFp32OutSimulator:
+    """matmul_kernel_fp32out_sim via nki.simulate: A @ V → FP32.
+
+    Validates the BF16-native sketch kernel's simulator-safe variant.
+    The simulator receives FP32-upcast arrays (BF16 is not a numpy dtype),
+    so these tests verify the FP32-output contract and dispatch wiring.
+    Hardware BF16→FP32 PSUM fidelity is covered by test_eigh_neuron.py.
+    """
+
+    @pytest.mark.parametrize("n,k", [(8, 4), (16, 8), (32, 16), (64, 32), (128, 64)])
+    def test_fp32out_vs_torch(self, n, k):
+        """matmul_kernel_fp32out_sim output matches torch.matmul, dtype=float32."""
+        import nki
+
+        from trnsolver.nki.dispatch import matmul_kernel_fp32out_sim
+
+        torch.manual_seed(42)
+        A = torch.randn(n, n)
+        V = torch.randn(n, k)
+        C_ref = torch.matmul(A, V).numpy()
+        C = nki.simulate(matmul_kernel_fp32out_sim)(A.numpy(), V.numpy())
+        np.testing.assert_allclose(C, C_ref, atol=1e-4)
+        assert C.dtype == np.float32, f"Expected float32 output, got {C.dtype}"
+
+    def test_eigh_randomized_via_bf16_path(self):
+        """eigh_randomized with BF16 input exercises _call_matmul_fp32out on sim.
+
+        On the simulator, _use_nki()=True and A.dtype=BF16 → _bf16_native=True.
+        _call_matmul_fp32out routes through matmul_kernel_fp32out_sim, upcasting
+        to FP32 for numpy. The result should still match the FP32-path output.
+        """
+        import trnsolver
+
+        torch.manual_seed(42)
+        n, k = 32, 5
+        A = torch.randn(n, n)
+        A = 0.5 * (A + A.T) + n * torch.eye(n)  # SPD
+
+        w_fp32, _ = trnsolver.eigh_randomized(A, k, oversampling=15, n_iter=2, seed=0)
+        w_bf16, _ = trnsolver.eigh_randomized(
+            A.to(torch.bfloat16), k, oversampling=15, n_iter=2, seed=0
+        )
+
+        # BF16 path should produce BF16 output and be within 5% of FP32 path
+        assert w_bf16.dtype == torch.bfloat16
+        np.testing.assert_allclose(w_bf16.float().numpy(), w_fp32.numpy(), rtol=5e-2, atol=1e-1)
+
+
+class TestApplyReflectorsSimulator:
+    """apply_reflectors_kernel via nki.simulate: fused eigenvector assembly.
+
+    Validates both the raw kernel output contract (Q_T_out = (∏Hₖ @ Q)^T)
+    and the end-to-end eigh eigenvector correctness when _call_apply_reflectors
+    replaces the host-driven _apply_reflectors loop.
+    """
+
+    @pytest.mark.parametrize("n", [4, 8, 16, 32, 64, 128])
+    def test_apply_reflectors_vs_host(self, n):
+        """apply_reflectors_kernel output matches _apply_reflectors (host loop).
+
+        The kernel returns Q^T; transpose before comparing to the host result.
+        """
+        import nki
+
+        from trnsolver.eigen import _apply_reflectors, _householder_tridiag
+        from trnsolver.nki.dispatch import apply_reflectors_kernel_sim
+
+        torch.manual_seed(42)
+        A = torch.randn(n, n)
+        A = 0.5 * (A + A.T)
+
+        # Build realistic V_refs from an actual tridiagonalization
+        _, _, V_refs = _householder_tridiag(A)
+        Q = torch.eye(n)
+
+        # Host reference
+        Q_ref = _apply_reflectors(V_refs, Q.clone())
+
+        # Kernel (returns Q^T)
+        if V_refs.shape[1] == 0:
+            return  # n ≤ 2: no reflectors, skip
+        Q_T_out = nki.simulate(apply_reflectors_kernel_sim)(V_refs.numpy(), Q.numpy())
+        Q_kernel = torch.from_numpy(Q_T_out).T.contiguous()
+        np.testing.assert_allclose(Q_kernel.numpy(), Q_ref.numpy(), atol=1e-4)
+
+    @pytest.mark.parametrize("n", [8, 32, 64, 128])
+    def test_eigh_eigenvectors_via_apply_reflectors(self, n):
+        """eigh eigenvectors correct with _call_apply_reflectors wired in."""
+        import trnsolver
+
+        torch.manual_seed(42)
+        A = torch.randn(n, n)
+        A = 0.5 * (A + A.T)
+        w_ref, V_ref = torch.linalg.eigh(A)
+        w, V = trnsolver.eigh(A)
+
+        # Eigenvalues sorted ascending
+        np.testing.assert_allclose(w.numpy(), w_ref.numpy(), atol=1e-3, rtol=1e-3)
+        # Reconstruction: A ≈ V diag(w) V^T
+        A_reconstructed = V @ torch.diag(w) @ V.T
+        np.testing.assert_allclose(A_reconstructed.numpy(), A.numpy(), atol=1e-2)

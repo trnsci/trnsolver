@@ -22,10 +22,11 @@ for the Householder-QR pivot rationale.
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
-from .factor import _restore, _to_fp32
+from .factor import _cholesky_lower, _restore, _to_fp32
 from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki, _use_simulator
 
 
@@ -42,9 +43,26 @@ def eigh(
     Returns:
         eigenvalues: (n,) sorted ascending
         eigenvectors: (n, n) columns are eigenvectors
+
+    The NKI path (Householder tridiagonalization + implicit-shift QR) is
+    eager-only: deflation and shift selection are data-dependent Python
+    control flow on ``.item()`` scalars. :func:`_householder_qr_eigh` is
+    wrapped in ``torch.compiler.disable``, so under ``torch.compile`` it runs
+    eagerly behind a single graph break (an error under ``fullgraph=True``)
+    rather than splitting into dozens of subgraphs (#41). The PyTorch path
+    traces as one ``torch.linalg.eigh`` call.
+
+    On the native ``neuron`` device, inputs with n below
+    ``TRNSOLVER_EIGH_NKI_MIN_N`` (default 512) skip the NKI path and run
+    ``torch.linalg.eigh`` on the input's device (#42). The NKI path is
+    host-driven and launch-bound: on Trn2 it took 0.4 s at n=16 and 21 s at
+    n=128, against about 1 ms for aten at every measured size. Setting
+    ``TRNSOLVER_REQUIRE_NKI=1`` disables the cutover so the kernels still run.
     """
     A, orig = _to_fp32(A)
-    if _use_nki():
+    if _use_nki() and _eigh_aten_cutover(A):
+        w, V = _aten_eigh_on_device(A)
+    elif _use_nki():
         try:
             w, V = _householder_qr_eigh(A, tol)
         except Exception:
@@ -81,7 +99,7 @@ def eigh_generalized(
     except ImportError:
         _tb = None
 
-    L = torch.linalg.cholesky(B)
+    L = _cholesky_lower(B)
 
     if _tb is not None:
         # NKI path: trnblas.trsm dispatches to the blocked NKI GEMM path on
@@ -103,9 +121,185 @@ def eigh_generalized(
     return _restore(eigenvalues, orig), _restore(eigenvectors, orig)
 
 
+def eigh_randomized(
+    A: torch.Tensor,
+    k: int,
+    *,
+    oversampling: int = 10,
+    n_iter: int = 0,
+    seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Randomized symmetric eigensolver: k dominant eigenvalues/eigenvectors.
+
+    Implements the Nakatsukasa–Tropp sketch-and-Rayleigh-Ritz (sRR) algorithm
+    (SIAM SIMAX 45(2), 2024). Returns the k eigenvalues of largest absolute
+    magnitude and their corresponding eigenvectors. Complexity O(n²k) vs
+    eigh's O(n³), making it efficient when k ≪ n.
+
+    **BF16-native sketch path (v0.14.0, Principle 1):** when A is BF16 and
+    the NKI backend is active, the sketch (A @ Ω) and projection (A @ Q) route
+    through matmul_kernel_fp32out — nc_matmul (Tensor Engine) with BF16 inputs
+    accumulating to FP32 via PSUM for free. A stays in BF16 throughout; only
+    the sketch outputs (Y, Q, B) are FP32. This avoids the O(n²) upcast and
+    delivers the 50–100× BF16 throughput advantage on the Tensor Engine.
+    FP16 and FP32 inputs use the standard _to_fp32/restore path.
+
+    Args:
+        A: (n, n) symmetric matrix. BF16 uses the BF16-native sketch path on
+           NKI hardware; FP16/FP32 upcast to FP32 via _to_fp32.
+        k: Number of eigenvalues/eigenvectors to return. Must satisfy k ≥ 1
+           and k + oversampling < n.
+        oversampling: Oversampling parameter p; sketch size is ℓ = k + p.
+                      Larger values improve accuracy at O(n²p) extra cost.
+                      Default 10.
+        n_iter: Power-iteration rounds for improved accuracy when the spectral
+                gap between eigenvalues k and k+1 is small. Default 0 (pure
+                sRR). Each round adds one A@ call with re-orthogonalization.
+        seed: RNG seed for the sketch matrix Ω. None = unseeded.
+
+    Returns:
+        eigenvalues: (k,) Rayleigh quotients sorted ascending. These approximate
+                     the k eigenvalues of A with largest absolute value.
+        eigenvectors: (n, k) corresponding eigenvectors (columns), orthonormal.
+
+    Note:
+        This algorithm targets eigenvalues of **largest magnitude**, not the
+        smallest. For SCF's k occupied orbitals (k smallest eigenvalues of the
+        Fock matrix), use ``eigh`` instead. A shift strategy for smallest
+        eigenvalues is planned for a future release.
+
+    Raises:
+        ValueError: if k < 1 or k + oversampling ≥ n.
+    """
+    # BF16-native path (Principle 1): keep A in BF16 and accumulate sketch/
+    # projection matmuls to FP32 via nc_matmul PSUM. All post-sketch ops
+    # (QR, eigh(B)) run in FP32. Triggered when A is BF16 and NKI is active.
+    # Falls back to the standard FP32-upcast path otherwise.
+    _bf16_native = A.dtype == torch.bfloat16 and _use_nki()
+
+    if _bf16_native:
+        orig = torch.bfloat16  # for _restore at return
+        # A stays BF16; Omega will be BF16 for the Tensor Engine
+    else:
+        A, orig = _to_fp32(A)
+
+    n = A.shape[0]
+    ell = k + oversampling  # sketch size
+
+    if k < 1:
+        raise ValueError(f"k must be ≥ 1, got {k}")
+    if ell >= n:
+        raise ValueError(f"k + oversampling ({ell}) must be < n ({n}); reduce k or oversampling")
+
+    # Random sketch matrix Ω. BF16-native path: BF16 Omega feeds the Tensor Engine
+    # directly. Standard path: FP32 Omega matches upcast A.
+    sketch_dtype = torch.bfloat16 if _bf16_native else A.dtype
+
+    try:
+        import trnrand as _tr
+
+        _gen = _tr.Generator(seed=seed) if seed is not None else None
+        Omega = _tr.standard_normal(n, ell, dtype=sketch_dtype, device=A.device, generator=_gen)
+    except ImportError:
+        _gen = torch.Generator(device=A.device)
+        if seed is not None:
+            _gen.manual_seed(seed)
+        Omega = torch.randn(n, ell, dtype=sketch_dtype, device=A.device, generator=_gen)
+
+    if _bf16_native:
+        # BF16 A ⊗ BF16 Ω → FP32  (Tensor Engine + PSUM, Principle 1).
+        Y = _call_matmul_fp32out(A, Omega)
+        # Power iteration: Q_i is FP32 (from QR); _call_matmul_fp32out casts
+        # it to BF16 internally for nc_matmul. Acceptable: we are in the
+        # randomized sketch — approximation quality is what matters.
+        for _ in range(n_iter):
+            Q_i, _ = torch.linalg.qr(Y, mode="reduced")
+            Y = _call_matmul_fp32out(A, Q_i)
+        Q, _ = torch.linalg.qr(Y, mode="reduced")  # FP32 (n, ell)
+        AQ = _call_matmul_fp32out(A, Q)  # BF16 A @ BF16(Q) → FP32
+    else:
+        # Standard FP32 path.
+        Y = _call_matmul(A, Omega)
+        for _ in range(n_iter):
+            Q_i, _ = torch.linalg.qr(Y, mode="reduced")
+            Y = _call_matmul(A, Q_i)
+        Q, _ = torch.linalg.qr(Y, mode="reduced")
+        AQ = _call_matmul(A, Q)
+
+    # Project: B = Q^T A Q  (ℓ × ℓ, always FP32 in both paths)
+    B = Q.T @ AQ
+    B = 0.5 * (B + B.T)  # symmetrize for FP32 safety
+
+    # Small eigenproblem: exact LAPACK eigh on (ℓ × ℓ) — always FP32
+    eig_vals, V_small = torch.linalg.eigh(B)  # (ℓ,) ascending, (ℓ, ℓ)
+
+    # Select k eigenvalues of largest |value|. Sort ascending within those k.
+    idx = torch.argsort(eig_vals.abs(), descending=True)[:k]
+    idx_sorted = idx.sort().values
+    eigenvalues_k = eig_vals[idx_sorted]
+    V_k = Q @ V_small[:, idx_sorted]  # (n, k) FP32
+
+    return _restore(eigenvalues_k, orig), _restore(V_k, orig)
+
+
 def _torch_eigh(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """PyTorch backend path — delegates to torch.linalg.eigh (LAPACK)."""
     return torch.linalg.eigh(A)
+
+
+# Native-device cutover (#42). The NKI eigh path costs O(n) host-synchronised
+# steps in tridiagonalization plus O(n^2) scalar steps in the QR iteration,
+# about 0.4 s at n=16 and 21 s at n=128 on Trn2. aten eigh on the neuron
+# device takes 0.4-1.1 ms over the same range. The NKI path is single-tile
+# (n <= 128), so any threshold above 128 routes every size it supports to
+# aten; 512 leaves room for a blocked kernel to be measured against it.
+_EIGH_NKI_MIN_N_DEFAULT = 512
+_NATIVE_DEVICE_TYPE = "neuron"
+
+
+def _eigh_nki_min_n() -> int:
+    """Smallest n for which eigh on the ``neuron`` device uses the NKI path.
+
+    Read from ``TRNSOLVER_EIGH_NKI_MIN_N`` on every call (default 512).
+    ``0`` disables the cutover. Unparseable values fall back to the default.
+    """
+    raw = os.environ.get("TRNSOLVER_EIGH_NKI_MIN_N", "").strip()
+    if not raw:
+        return _EIGH_NKI_MIN_N_DEFAULT
+    try:
+        return int(raw)
+    except ValueError:
+        return _EIGH_NKI_MIN_N_DEFAULT
+
+
+def _eigh_aten_cutover(A: torch.Tensor) -> bool:
+    """True iff eigh should use aten instead of the NKI kernels for A.
+
+    Applies only to tensors on the native ``neuron`` device with
+    n < ``_eigh_nki_min_n()``. ``TRNSOLVER_REQUIRE_NKI=1`` disables it, so
+    the hardware suite keeps exercising the kernels.
+    """
+    if _REQUIRE_NKI:
+        return False
+    if A.device.type != _NATIVE_DEVICE_TYPE:
+        return False
+    return A.shape[-1] < _eigh_nki_min_n()
+
+
+@torch.compiler.disable
+def _aten_eigh_on_device(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """torch.linalg.eigh with the result on A's device.
+
+    Eager-only, like the NKI path it replaces, so the traced graph under
+    ``torch.compile`` is unchanged (one graph break). If the backend computes
+    eigh on the host, the result is moved back to A's device.
+    """
+    w, V = torch.linalg.eigh(A)
+    if w.device != A.device:
+        w = w.to(A.device)
+    if V.device != A.device:
+        V = V.to(A.device)
+    return w, V
 
 
 # ----------------------------------------------------------------------
@@ -137,6 +331,144 @@ def _call_rank2_update(A, u, v):
         )
         return torch.from_numpy(out).to(A.device)
     return rank2_update_kernel(A, u, v)
+
+
+def _call_matmul(A, V):
+    """Dispatch matmul_kernel (Tensor Engine) or matmul_kernel_sim (Vector Engine).
+
+    Computes C = A @ V.  A: (n, n), V: (n, k), k > 1.
+
+    Simulator path routes through matmul_kernel_sim (nisa.nc_matmul is not
+    simulator-safe — nki.simulate strips the stationary operand). Hardware path
+    moves tensors to the XLA device, calls matmul_kernel, syncs to materialise
+    the result, and returns to orig_device.
+
+    To compute B.T @ C: call _call_matmul(B.T.contiguous(), C). The
+    `.contiguous()` is required because load_transpose2d in the kernel expects
+    a row-major HBM tensor; a transposed view has wrong strides.
+
+    Falls back to torch.matmul when: NKI is not available (_use_nki() is False),
+    n > 128, or k > 128 (single-tile limits). This makes _call_matmul safe for
+    callers such as eigh_randomized that call it unconditionally — on non-Neuron
+    hardware the NKI guard ensures torch.matmul is used transparently.
+    """
+    if not _use_nki() or A.shape[0] > 128 or V.shape[1] > 128:
+        return torch.matmul(A, V)
+
+    orig_device = A.device
+
+    if _use_simulator():
+        import nki
+
+        from .nki.dispatch import matmul_kernel_sim
+
+        C = nki.simulate(matmul_kernel_sim)(A.detach().cpu().numpy(), V.detach().cpu().numpy())
+        return torch.from_numpy(C).to(orig_device)
+
+    import torch_neuronx  # noqa: F401
+    import torch_xla
+
+    from .nki.dispatch import matmul_kernel
+
+    work_device = torch_xla.device()
+    C = matmul_kernel(A.to(work_device), V.to(work_device))
+    torch_xla.sync()
+    return C.to(orig_device)
+
+
+def _call_matmul_fp32out(A: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+    """C = A @ V with FP32 output. Inputs may be BF16 (BF16-native sketch path).
+
+    On NKI hardware (n ≤ 128, k ≤ 128): casts A and V to BF16, then calls
+    matmul_kernel_fp32out (Tensor Engine). nc_matmul accumulates BF16 products
+    to FP32 via PSUM for free (Principle 1: PSUM as free FP32 accumulator).
+    Output is always FP32 regardless of input dtype.
+
+    On the NKI simulator: upcasts inputs to FP32 for numpy compatibility
+    (BF16 is not a numpy dtype), then calls matmul_kernel_fp32out_sim. Same
+    FP32 output contract; code path is exercised even though the accumulation
+    is exact FP32 rather than BF16→FP32 PSUM.
+
+    Falls back to torch.matmul(A.float(), V.float()) when NKI is unavailable
+    or the matrix exceeds single-tile bounds.
+    """
+    if not _use_nki() or A.shape[0] > 128 or V.shape[1] > 128:
+        return torch.matmul(A.float(), V.float())
+
+    orig_device = A.device
+
+    if _use_simulator():
+        import nki
+
+        from .nki.dispatch import matmul_kernel_fp32out_sim
+
+        # Upcast to FP32 for numpy: the simulator can't represent BF16 arrays.
+        C = nki.simulate(matmul_kernel_fp32out_sim)(
+            A.float().detach().cpu().numpy(),
+            V.float().detach().cpu().numpy(),
+        )
+        return torch.from_numpy(C).to(orig_device)
+
+    import torch_neuronx  # noqa: F401
+    import torch_xla
+
+    from .nki.dispatch import matmul_kernel_fp32out
+
+    work_device = torch_xla.device()
+    # Cast both operands to BF16: nc_matmul uses the Tensor Engine in BF16 mode
+    # and accumulates to FP32 PSUM without any extra cost (Principle 1).
+    C = matmul_kernel_fp32out(
+        A.to(torch.bfloat16).to(work_device),
+        V.to(torch.bfloat16).to(work_device),
+    )
+    torch_xla.sync()
+    return C.to(orig_device)
+
+
+def _call_apply_reflectors(V_refs: torch.Tensor, Q: torch.Tensor) -> torch.Tensor:
+    """Dispatch apply_reflectors_kernel for fused Householder eigenvector assembly.
+
+    Applies n-2 Householder reflectors (stored in V_refs) to Q in reverse order:
+
+        Q_out = H_{n-3} @ H_{n-4} @ … @ H_0 @ Q
+
+    where Hₖ = I − 2 vₖ vₖᵀ.
+
+    The kernel returns Q^T (SBUF layout trick — see dispatch.py docstring).
+    This function transposes the result back before returning.
+
+    Args:
+        V_refs : (n, n-2) unit-norm Householder vectors, one per column.
+        Q      : (n, n) matrix to left-multiply (Givens accumulation from QR).
+
+    Returns:
+        Q_out : (n, n) updated eigenvector matrix Q.
+    """
+    n_refs = V_refs.shape[1]
+    if n_refs == 0:
+        return Q  # n ≤ 2: no reflectors to apply
+
+    orig_device = Q.device
+
+    if _use_simulator():
+        import nki
+
+        from .nki.dispatch import apply_reflectors_kernel_sim
+
+        Q_T_out = nki.simulate(apply_reflectors_kernel_sim)(
+            V_refs.detach().cpu().numpy(), Q.detach().cpu().numpy()
+        )
+        return torch.from_numpy(Q_T_out).T.contiguous().to(orig_device)
+
+    import torch_neuronx  # noqa: F401
+    import torch_xla
+
+    from .nki.dispatch import apply_reflectors_kernel
+
+    work_device = torch_xla.device()
+    Q_T_out = apply_reflectors_kernel(V_refs.to(work_device), Q.to(work_device))
+    torch_xla.sync()
+    return Q_T_out.to(orig_device).T.contiguous()
 
 
 # ----------------------------------------------------------------------
@@ -409,6 +741,7 @@ def _apply_reflectors(V_refs: torch.Tensor, Q: torch.Tensor) -> torch.Tensor:
 # ----------------------------------------------------------------------
 
 
+@torch.compiler.disable
 def _householder_qr_eigh(
     A: torch.Tensor,
     tol: float = 1e-10,
@@ -432,8 +765,16 @@ def _householder_qr_eigh(
 
     diag, subdiag, V_refs = _householder_tridiag(A)
 
-    eigenvalues, Q_right = _qr_iterate(diag.clone(), subdiag.clone(), tol)
-    V = _apply_reflectors(V_refs, Q_right)
+    # The QR iteration is scalar host code: about 20 element reads/writes per
+    # Givens rotation and O(n^2) rotations per call. Run it on CPU tensors so
+    # a device-resident input does not pay one launch or sync per element
+    # (#42). CPU inputs already ran here, so their results are unchanged.
+    host = torch.device("cpu")
+    eigenvalues, Q_right = _qr_iterate(
+        diag.detach().to(host, copy=True), subdiag.detach().to(host, copy=True), tol
+    )
+    Q_right = Q_right.to(A.device)
+    V = _call_apply_reflectors(V_refs, Q_right)
 
     # Subspace rotation refinement (#31): one step of Rayleigh-Ritz on the
     # current approximate eigenbasis V. Compute the n×n projected matrix
@@ -445,10 +786,10 @@ def _householder_qr_eigh(
     # rotation and Householder-application steps, reducing
     # ||A V - V diag(w)||_F by ~1–2 orders of magnitude for n ≥ 64.
     # Cost: one extra n×n GEMM (V^T @ AV, reuses AV) + one n×n LAPACK call.
-    AV = A @ V
-    H = V.T @ AV
+    AV = _call_matmul(A, V)
+    H = _call_matmul(V.T.contiguous(), AV)
     H = 0.5 * (H + H.T)  # symmetrize for FP32 safety
     eigenvalues, Q_corr = torch.linalg.eigh(H)
-    V = V @ Q_corr
+    V = _call_matmul(V.contiguous(), Q_corr)
     # torch.linalg.eigh returns sorted ascending — no argsort needed.
     return eigenvalues, V

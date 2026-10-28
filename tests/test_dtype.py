@@ -183,3 +183,13 @@ class TestLowPrecisionDtype:
         assert Vh.dtype == dtype
         _, s_ref, _ = trnsolver.svd(A_fp32)
         assert torch.allclose(s.float(), s_ref, atol=1e-1, rtol=1e-1)
+
+    def test_schur(self, dtype):
+        torch.manual_seed(6)
+        A_fp32 = torch.randn(8, 8)
+        A = A_fp32.to(dtype)
+        Q, T = trnsolver.schur(A)
+        assert Q.dtype == dtype
+        assert T.dtype == dtype
+        recon = Q.float() @ T.float() @ Q.float().T
+        assert torch.allclose(recon, A_fp32, atol=2e-1, rtol=1e-1)

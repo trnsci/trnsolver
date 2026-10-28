@@ -1,11 +1,13 @@
 """
 Iterative linear solvers for Trainium.
 
-Conjugate Gradient (CG) for SPD systems, GMRES for general systems.
-These are relevant for large-scale SCF with linear-scaling methods
-and for CPSCF (coupled-perturbed SCF) response equations.
+Conjugate Gradient (CG) for SPD systems, GMRES for general systems,
+and GMRES-IR (GMRES with iterative refinement) for high-accuracy general solves.
 
-All inner products and matvecs map to trnblas Level 1/2 ops.
+CG/GMRES inner products map to trnblas Level 1/2 ops. GMRES-IR extends the
+Carson–Higham two-precision regime from solve_spd (Cholesky, SPD) to GMRES
+(LU, general), using FP64 outer residuals and FP32 inner factorization.
+Relevant for CPSCF (coupled-perturbed SCF) response equations.
 """
 
 from __future__ import annotations
@@ -132,6 +134,7 @@ def ssor_preconditioner(
     return apply
 
 
+@torch.compiler.disable
 def cg(
     A: torch.Tensor | Callable,
     b: torch.Tensor,
@@ -156,6 +159,12 @@ def cg(
         x: Solution vector
         iters: Number of iterations
         residual: Final relative residual norm
+
+    Eager-only: convergence is a data-dependent Python loop that reads
+    scalars with ``.item()``, and the returned iteration count and residual
+    are Python numbers. The function is wrapped in ``torch.compiler.disable``,
+    so inside a compiled region it runs eagerly behind a single graph break
+    (an error under ``fullgraph=True``) instead of fragmenting the graph (#41).
     """
     b, orig = _to_fp32(b)
     if not callable(A):
@@ -208,6 +217,7 @@ def cg(
     return _restore(x, orig), maxiter, torch.linalg.norm(r).item() / b_norm
 
 
+@torch.compiler.disable
 def gmres(
     A: torch.Tensor | Callable,
     b: torch.Tensor,
@@ -234,6 +244,8 @@ def gmres(
         x: Solution vector
         total_iters: Total matvec count
         residual: Final relative residual norm
+
+    Eager-only (``torch.compiler.disable``); see :func:`cg` (#41).
     """
     b, orig = _to_fp32(b)
     if not callable(A):
@@ -288,3 +300,124 @@ def gmres(
 
     r = b - matvec(x)
     return _restore(x, orig), total_iters, torch.linalg.norm(r).item() / b_norm
+
+
+@torch.compiler.disable
+def gmres_ir(
+    A: torch.Tensor,
+    b: torch.Tensor,
+    tol: float = 1e-10,
+    max_outer: int = 5,
+    inner_tol: float = 1e-1,
+    inner_maxiter: int = 50,
+    inner_restart: int = 20,
+) -> tuple[torch.Tensor, int, float]:
+    """GMRES with iterative refinement (GMRES-IR): general Ax = b.
+
+    Solves general (non-symmetric) linear systems via left-LU-preconditioned
+    GMRES inside an FP64 outer refinement loop. Implements the Carson–Higham
+    two-precision framework for general systems, extending the
+    ``solve_spd(iterative_refinement=True)`` path (Cholesky + one correction
+    step, SPD only) to GMRES + multiple outer iterations over any invertible A.
+
+    Precision tiers:
+
+    - **Factorization:**  FP32 LU of A via ``torch.linalg.lu`` (computed once,
+      reused for the initial guess and every outer correction step).
+    - **Inner GMRES:**    FP32 Krylov vectors and Gram-Schmidt dot products.
+      The inner problem is the left-preconditioned system
+      ``(U⁻¹ L⁻¹ Pᵀ A) δx = U⁻¹ L⁻¹ Pᵀ r``, which is near-identity when
+      LU is accurate — so the inner GMRES converges in very few steps.
+    - **Outer residual:** FP64 — captures errors below FP32 machine epsilon
+      (eps32 ≈ 1.2e-7). Reliable for cond(A) ≲ 1/eps32 ≈ 1e7.
+    - **Correction:**     FP32 triangular solves reusing L, U.
+
+    .. note::
+        **BF16 inner path deferred (v0.16.0).** The matvec A@v in the Arnoldi
+        step could use ``matmul_kernel_fp32out`` (BF16 Tensor Engine → FP32 PSUM,
+        Principle 1) for a 50–100× throughput gain. However, the Gram-Schmidt
+        dot products need SR (Principle 3, Connolly–Higham–Mary 2021) for BF16
+        stability at n ≥ ~300. SR is deferred to v0.16.0 when ``trnrand`` SR lands.
+
+    .. note::
+        **Callable A not supported.** The LU factorization requires a concrete
+        matrix. For matrix-free operators, use ``gmres`` directly.
+
+    Args:
+        A: (n, n) general square matrix. BF16/FP16 upcast to FP32 internally.
+        b: (n,) right-hand side vector. Block RHS (n, k) planned for v0.16.0.
+        tol: Relative residual tolerance for the outer FP64 loop. Default 1e-10.
+        max_outer: Maximum outer refinement iterations. Default 5.
+        inner_tol: GMRES convergence tolerance per inner solve. Default 1e-1.
+                   A coarse inner solve suffices; the outer loop corrects the error.
+        inner_maxiter: Maximum restart count for inner GMRES. Default 50.
+        inner_restart: Krylov subspace size for inner GMRES. Default 20.
+
+    Returns:
+        x:           (n,) solution in the original input dtype.
+        total_inner: Total GMRES matvec iterations summed across all outer steps.
+        residual:    Final ``‖b − Ax‖₂ / ‖b‖₂`` in FP64.
+
+    Raises:
+        TypeError: if A is callable (matrix required for LU factorization).
+        torch.linalg.LinAlgError: if A is singular or factorization fails.
+
+    Eager-only (``torch.compiler.disable``); see :func:`cg` (#41).
+    """
+    if callable(A):
+        raise TypeError(
+            "gmres_ir requires a concrete matrix for LU factorization; "
+            "use gmres() directly for callable matvec operators."
+        )
+
+    A, orig = _to_fp32(A)
+    b_fp32, _ = _to_fp32(b)
+    b_fp64 = b_fp32.to(torch.float64)
+    A_fp64 = A.to(torch.float64)
+
+    # LU factorization (FP32): torch.linalg.lu returns (P, L, U) with A = P L U.
+    # Solving (PLU) x = b: x = U⁻¹ L⁻¹ Pᵀ b
+    P, L, U = torch.linalg.lu(A)
+
+    def apply_prec(v: torch.Tensor) -> torch.Tensor:
+        """Left-preconditioner: solve PLU y = v  →  y = U⁻¹ L⁻¹ Pᵀ v."""
+        # solve_triangular requires 2D B; unsqueeze vector → column, squeeze back.
+        col = (P.T @ v).unsqueeze(1)
+        y = torch.linalg.solve_triangular(L, col, upper=False)
+        z = torch.linalg.solve_triangular(U, y, upper=True)
+        return z.squeeze(1)
+
+    def prec_matvec(v: torch.Tensor) -> torch.Tensor:
+        """Left-preconditioned matvec: (U⁻¹ L⁻¹ Pᵀ A) v ≈ v when LU is accurate."""
+        return apply_prec(A @ v)
+
+    # Initial guess: one exact LU solve (FP32)
+    x = apply_prec(b_fp32)
+    total_inner = 0
+
+    for _ in range(max_outer):
+        # FP64 residual: captures rounding errors below FP32 eps
+        r_fp64 = b_fp64 - A_fp64 @ x.to(torch.float64)
+        rel_res = (torch.linalg.norm(r_fp64) / torch.linalg.norm(b_fp64)).item()
+        if rel_res < tol:
+            break
+
+        # Preconditioned correction RHS (FP32)
+        prec_rhs = apply_prec(r_fp64.to(torch.float32))
+
+        # Inner GMRES: solve prec_matvec(δx) = prec_rhs using the callable interface
+        dx, inner_iters, _ = gmres(
+            prec_matvec,
+            prec_rhs,
+            tol=inner_tol,
+            maxiter=inner_maxiter,
+            restart=inner_restart,
+        )
+        x = x + dx
+        total_inner += inner_iters
+
+    # Final FP64 residual (captures any improvement from the last outer step)
+    r_fp64 = b_fp64 - A_fp64 @ x.to(torch.float64)
+    rel_res = (torch.linalg.norm(r_fp64) / torch.linalg.norm(b_fp64)).item()
+
+    return _restore(x, orig), total_inner, rel_res

@@ -47,10 +47,10 @@ w, V = trnsolver.eigh_generalized(F, S)
 
 # Factorizations + direct solves
 L = trnsolver.cholesky(A)
-U, s, Vh = trnsolver.svd(A)              # economy SVD: A = U @ diag(s) @ Vh
+U, s, Vh = trnsolver.svd(A)  # economy SVD: A = U @ diag(s) @ Vh
 x = trnsolver.solve_spd(A, b)
-M = trnsolver.inv_sqrt_spd(A)                            # eigendecomposition-based
-M, iters, res = trnsolver.inv_sqrt_spd_ns(A, tol=1e-8)   # Newton-Schulz, all-GEMM
+M = trnsolver.inv_sqrt_spd(A)  # eigendecomposition-based
+M, iters, res = trnsolver.inv_sqrt_spd_ns(A, tol=1e-8)  # Newton-Schulz, all-GEMM
 
 # Pseudoinverse (Moore-Penrose, truncated SVD)
 Ap = trnsolver.pinv(A)
@@ -78,6 +78,18 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 
 ## Status
 
+**v0.15.0** — `gmres_ir(A, b, ...)`. GMRES with iterative refinement: Carson–Higham two-precision framework for general (non-symmetric) Ax = b. FP32 LU(A) computed once as a left preconditioner; each outer step computes a FP64 residual and solves the preconditioned correction via inner GMRES (FP32 Krylov). Extends the `solve_spd(iterative_refinement=True)` pattern from SPD Cholesky to general LU. Reliable for cond(A) ≲ 1e7. Returns `(x, total_inner_iters, fp64_residual)`. BF16 inner matvec (50–100× via Tensor Engine + SR) deferred to v0.16.0.
+
+**v0.14.0** — BF16-native sketch path for `eigh_randomized` (Principle 1). New `matmul_kernel_fp32out` kernel: BF16 inputs → FP32 output via `nc_matmul` PSUM accumulation. When A is BF16 and NKI is active, `eigh_randomized` keeps A in BF16, routes all sketch/projection matmuls through `matmul_kernel_fp32out`, and runs QR/eigh in FP32. This delivers 50–100× BF16 throughput on the Tensor Engine while retaining FP32 accumulation quality — the PSUM upgrade is free.
+
+**v0.13.0** — `eigh_randomized(A, k, oversampling=10, n_iter=0, seed=None)`. Randomized symmetric eigensolver implementing the Nakatsukasa–Tropp sketch-and-Rayleigh-Ritz (sRR) algorithm (SIAM SIMAX 45(2), 2024). O(n²k) vs O(n³) for `eigh`. Returns k eigenvalues of largest absolute magnitude and their corresponding orthonormal eigenvectors.
+
+**v0.12.0** — `apply_reflectors_kernel`. Fused Householder reflector application: the eigenvector assembly step of `eigh` (n-2 iterations of `Q ← Q − 2 v (vᵀQ)`) is now a single NKI dispatch resident entirely in SBUF. SBUF layout trick: maintain Q^T in SBUF so the reduction `p = v^T Q` uses free-dim sum (axis=1, supported) instead of partition-dim sum (unsupported in NKI 0.3.0). All Vector Engine ops; simulator-safe.
+
+**v0.11.0** — `matmul_kernel` (Tensor Engine via `nisa.nc_matmul`) + `matmul_kernel_sim` (Vector Engine, simulator-safe). The Rayleigh-Ritz refinement step in `eigh` now routes all three GEMMs through the Tensor Engine on hardware. Resolves the NKI 0.3.0 free-dim constraint that blocked the earlier vector matvec attempt (#36): a matrix moving operand (n, k) with k > 1 satisfies the constraint. Closes #36.
+
+**v0.10.0** — `schur(A, tol=1e-10)`. Schur decomposition: returns `(Q, T)` with `A = Q @ T @ Q.T`. T is quasi-upper triangular (2×2 blocks for complex eigenvalue pairs). Implemented via Householder Hessenberg reduction + Francis implicit double-shift QR with deflation. Closes the last Factorizations "Deferred" item.
+
 **v0.9.0** — `svd(A, full_matrices=False)`. Singular Value Decomposition: returns `(U, s, Vh)`. Economy SVD by default; BF16/FP16 promoted to FP32. Closes the `svd` item in the API table.
 
 **v0.8.0** — `ssor_preconditioner(A, omega=1.0)` (#28). SSOR preconditioner for SPD systems: two triangular solves + diagonal scaling per application. Outperforms scalar Jacobi on coupled matrices (1D Laplacian, FEM stiffness). ω ∈ (0, 2); ω=1 is symmetric Gauss-Seidel.
@@ -88,12 +100,12 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 
 **API coverage:**
 
-| Category | Shipped (v0.5.0) | Deferred |
-|----------|------------------|----------|
-| Eigensolvers | `eigh`, `eigh_generalized` | — |
-| Factorizations | `cholesky`, `lu`, `qr`, `svd`, `pinv` | `schur` (implicit-shift QR, Phase 3) |
+| Category | Shipped (v0.15.0) | Deferred |
+|----------|-------------------|----------|
+| Eigensolvers | `eigh`, `eigh_generalized`, `eigh_randomized` | — |
+| Factorizations | `cholesky`, `lu`, `qr`, `svd`, `pinv`, `schur` | — |
 | Direct solvers | `solve`, `solve_spd`, `inv_spd`, `inv_sqrt_spd`, `inv_sqrt_spd_ns` | — |
-| Iterative | `cg` (w/ preconditioner), `gmres` | — |
+| Iterative | `cg` (w/ preconditioner), `gmres`, `gmres_ir` | — |
 | Preconditioners | `jacobi_preconditioner`, `block_jacobi_preconditioner`, `ssor_preconditioner` | — |
 
 **Roadmap:**
@@ -104,7 +116,14 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 - **v0.7.0** — BF16/FP16 across the full API (#19) ✓
 - **v0.8.0** — SSOR preconditioner (#28) ✓
 - **v0.9.0** — `svd` factorization ✓
-- **v1.0.0+** — `schur` (implicit-shift QR), multi-NeuronCore parallel Jacobi (#20)
+- **v0.10.0** — `schur` (implicit-shift QR via Householder + Francis double-shift) ✓
+- **v0.11.0** — Tensor Engine matmul kernel (`nisa.nc_matmul`), Rayleigh-Ritz on NKI (#36) ✓
+- **v0.12.0** — Fused Householder reflector application (`apply_reflectors_kernel`) ✓
+- **v0.13.0** — `eigh_randomized` (Nakatsukasa–Tropp sRR, O(n²k), Tensor Engine sketch) ✓
+- **v0.14.0** — `matmul_kernel_fp32out` + BF16-native sketch in `eigh_randomized` (Principle 1: BF16→FP32 PSUM, 50–100× at BF16) ✓
+- **v0.15.0** — `gmres_ir`: Carson–Higham iterative refinement for general Ax = b (FP32 LU preconditioner + FP64 outer residual) ✓
+- **v0.16.0** — BF16 inner matvec for GMRES-IR via `matmul_kernel_fp32out` + SR (Principle 3); block RHS support
+- **v0.17.0+** — NKI Hessenberg reduction kernel, multi-NeuronCore parallel Jacobi (#20)
 
 ## Operations
 
@@ -112,6 +131,7 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 |----------|-----------|-------------|
 | Eigen | `eigh` | Symmetric eigendecomposition (Jacobi / torch) |
 | Eigen | `eigh_generalized` | Generalized: `Ax = λBx` via Cholesky reduction |
+| Eigen | `eigh_randomized` | Randomized: k dominant eigenpairs, O(n²k), sRR |
 | Factor | `cholesky` | `A = LL^T` |
 | Factor | `lu` | `PA = LU` |
 | Factor | `qr` | `A = QR` |
@@ -124,6 +144,7 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 | Solve | `inv_sqrt_spd_ns` | `A^{-1/2}` via Newton-Schulz (all-GEMM) |
 | Iterative | `cg` | Conjugate Gradient (SPD systems) |
 | Iterative | `gmres` | GMRES (general systems) |
+| Iterative | `gmres_ir` | GMRES-IR: iterative refinement, FP64 outer residual |
 | Iterative | `jacobi_preconditioner` | Diagonal preconditioner for CG |
 | Iterative | `block_jacobi_preconditioner` | Block-diagonal Cholesky preconditioner for CG |
 | Iterative | `ssor_preconditioner` | SSOR / symmetric Gauss-Seidel preconditioner for CG |
@@ -142,7 +163,7 @@ All six siblings are on PyPI, along with the umbrella meta-package:
 | [trnfft](https://github.com/trnsci/trnfft) | FFT and complex-valued tensors | v0.8.0 |
 | [trnblas](https://github.com/trnsci/trnblas) | BLAS Level 1–3 | v0.4.0 |
 | [trnrand](https://github.com/trnsci/trnrand) | Philox / Sobol / Halton RNG | v0.1.0 |
-| trnsolver | Linear solvers and eigendecomposition | **v0.9.0** |
+| trnsolver | Linear solvers and eigendecomposition | **v0.15.0** |
 | [trnsparse](https://github.com/trnsci/trnsparse) | Sparse matrix operations | v0.1.1 |
 | [trntensor](https://github.com/trnsci/trntensor) | Tensor contractions (einsum, TT/Tucker) | v0.1.1 |
 

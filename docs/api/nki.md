@@ -5,9 +5,9 @@ Backend selection mirrors the sister `trnblas` and `trnfft` packages.
 ## `set_backend(backend)`
 
 ```python
-trnsolver.set_backend("auto")     # NKI if available, else PyTorch (default)
+trnsolver.set_backend("auto")  # NKI if available, else PyTorch (default)
 trnsolver.set_backend("pytorch")  # force PyTorch fallback
-trnsolver.set_backend("nki")      # require NKI; raises if unavailable
+trnsolver.set_backend("nki")  # require NKI; raises if unavailable
 ```
 
 ## `get_backend()`
@@ -23,6 +23,7 @@ Module-level boolean — `True` iff the `nki` package (NKI 0.3.0 Stable, Neuron 
 | Variable | Effect |
 |----------|--------|
 | `TRNSOLVER_REQUIRE_NKI=1` | Kernel-path failures re-raise instead of silently falling back to PyTorch. Used by the validation suite to catch silent kernel breakage. |
+| `TRNSOLVER_EIGH_NKI_MIN_N=<n>` | On the native `neuron` device, `eigh` uses `torch.linalg.eigh` for matrices with fewer than `n` rows and the NKI path otherwise. Default 512; `0` always uses NKI. Ignored when `TRNSOLVER_REQUIRE_NKI=1`. (#42) |
 | `TRNSOLVER_USE_SIMULATOR=1` | Route kernel dispatch through `nki.simulate(kernel)(numpy_args)` on CPU instead of torch_xla. No hardware needed. See [Developing kernels](../developing_kernels.md). |
 
 ## Jacobi rotation kernel

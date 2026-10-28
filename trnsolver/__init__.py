@@ -6,10 +6,10 @@ computing on Trainium. Complements trnblas (BLAS) and trnfft (FFT).
 Part of the trnsci scientific computing suite.
 """
 
-__version__ = "0.9.0"
+__version__ = "0.15.0"
 
 # Eigenvalue decomposition
-from .eigen import eigh, eigh_generalized
+from .eigen import eigh, eigh_generalized, eigh_randomized
 
 # Factorizations
 from .factor import (
@@ -20,6 +20,7 @@ from .factor import (
     lu,
     pinv,
     qr,
+    schur,
     solve,
     solve_spd,
     svd,
@@ -30,6 +31,7 @@ from .iterative import (
     block_jacobi_preconditioner,
     cg,
     gmres,
+    gmres_ir,
     jacobi_preconditioner,
     ssor_preconditioner,
 )
@@ -41,6 +43,7 @@ __all__ = [
     # Eigen
     "eigh",
     "eigh_generalized",
+    "eigh_randomized",
     # Factorization
     "cholesky",
     "lu",
@@ -51,10 +54,12 @@ __all__ = [
     "inv_sqrt_spd",
     "inv_sqrt_spd_ns",
     "pinv",
+    "schur",
     "svd",
     # Iterative
     "cg",
     "gmres",
+    "gmres_ir",
     "jacobi_preconditioner",
     "block_jacobi_preconditioner",
     "ssor_preconditioner",
