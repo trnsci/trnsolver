@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Single-launch on-device Householder tridiagonalization for `eigh`,
+  behind `TRNSOLVER_EIGH_TRIDIAG=device` (default off).**
+  `householder_tridiag_kernel` (`trnsolver/nki/tridiag.py`) reduces a
+  symmetric n <= 128 matrix to tridiagonal form in one NKI launch, with the
+  matrix resident in SBUF. Each reflector and its scalars (norm, sign, beta,
+  the v.w correction) are computed on chip: rows move across partitions
+  through exact selection matmuls on the Tensor Engine, and scalars come from
+  `nl.rsqrt` with two Newton steps on the Vector Engine. The host-driven
+  reduction needs 2(n-2) launches and about 7(n-2) host syncs per call; this
+  kernel needs one launch and one sync. The QR iteration still runs on host
+  copies of the O(n) tridiagonal. CPU simulator: eigenvalues within 1e-4 of
+  `torch.linalg.eigh` and `Q^T A Q = T` to 2e-5 for n = 8..128. The MLIR
+  verifier passes for trn1 and trn2. On-device latency has not been measured
+  yet. (#42)
+
 ### Fixed
 
 - **`eigh` on the native `neuron` device uses `torch.linalg.eigh` below
