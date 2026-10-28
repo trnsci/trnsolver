@@ -176,9 +176,14 @@ class TestSolveSPD:
         x_plain = trnsolver.solve_spd(A, b)
         x_refined = trnsolver.solve_spd(A, b, iterative_refinement=True)
 
-        res_plain = torch.linalg.norm(A @ x_plain - b).item()
-        res_refined = torch.linalg.norm(A @ x_refined - b).item()
-        assert res_refined <= res_plain
+        # Compare forward error against an FP64 reference. The FP32 residual
+        # ||A x - b|| is already at its rounding floor (~||A|| eps32 ||x||) for
+        # both solutions, so comparing residuals is a coin flip that depends
+        # on the CPU's BLAS kernels. Refinement improves x itself.
+        x_ref = torch.linalg.solve(A.double(), b.double())
+        err_plain = torch.linalg.norm(x_plain.double() - x_ref).item()
+        err_refined = torch.linalg.norm(x_refined.double() - x_ref).item()
+        assert err_refined <= 0.1 * err_plain
 
     def test_iterative_refinement_rhs_matrix(self, spd_matrix):
         # iterative_refinement=True works for B of shape (n, k)
