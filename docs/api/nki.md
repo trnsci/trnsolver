@@ -5,9 +5,9 @@ Backend selection mirrors the sister `trnblas` and `trnfft` packages.
 ## `set_backend(backend)`
 
 ```python
-trnsolver.set_backend("auto")     # NKI if available, else PyTorch (default)
+trnsolver.set_backend("auto")  # NKI if available, else PyTorch (default)
 trnsolver.set_backend("pytorch")  # force PyTorch fallback
-trnsolver.set_backend("nki")      # require NKI; raises if unavailable
+trnsolver.set_backend("nki")  # require NKI; raises if unavailable
 ```
 
 ## `get_backend()`

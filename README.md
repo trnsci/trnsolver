@@ -47,10 +47,10 @@ w, V = trnsolver.eigh_generalized(F, S)
 
 # Factorizations + direct solves
 L = trnsolver.cholesky(A)
-U, s, Vh = trnsolver.svd(A)              # economy SVD: A = U @ diag(s) @ Vh
+U, s, Vh = trnsolver.svd(A)  # economy SVD: A = U @ diag(s) @ Vh
 x = trnsolver.solve_spd(A, b)
-M = trnsolver.inv_sqrt_spd(A)                            # eigendecomposition-based
-M, iters, res = trnsolver.inv_sqrt_spd_ns(A, tol=1e-8)   # Newton-Schulz, all-GEMM
+M = trnsolver.inv_sqrt_spd(A)  # eigendecomposition-based
+M, iters, res = trnsolver.inv_sqrt_spd_ns(A, tol=1e-8)  # Newton-Schulz, all-GEMM
 
 # Pseudoinverse (Moore-Penrose, truncated SVD)
 Ap = trnsolver.pinv(A)
