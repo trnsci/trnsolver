@@ -201,7 +201,9 @@ def eigh_randomized(
         import trnrand as _tr
 
         _gen = _tr.Generator(seed=seed) if seed is not None else None
-        Omega = _tr.standard_normal(n, ell, dtype=sketch_dtype, device=A.device, generator=_gen)
+        # trnrand.standard_normal(*size, dtype, generator) has no `device`
+        # argument: draw the sketch, then move it to A's device.
+        Omega = _tr.standard_normal(n, ell, dtype=sketch_dtype, generator=_gen).to(A.device)
     except ImportError:
         _gen = torch.Generator(device=A.device)
         if seed is not None:

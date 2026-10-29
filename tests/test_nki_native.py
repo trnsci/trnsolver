@@ -79,15 +79,25 @@ OPS = sorted(_cases())
 
 class TestNativeDispatch:
     def test_native_path_never_imports_torch_xla(self):
+        # The subprocess stops after path detection and op registration and
+        # never launches a kernel: a launch would call nrt_init on a
+        # NeuronCore the parent pytest process may already hold.
         code = (
-            "import sys, torch, trnsolver; "
-            "from trnsolver.eigen import _call_matmul; "
-            "from trnsolver.nki.dispatch import _get_dispatch_path; "
-            "_call_matmul(torch.randn(16, 16), torch.randn(16, 8)); "
+            "import sys, trnsolver; "
+            "from trnsolver.nki.dispatch import _get_dispatch_path, _get_native_ops; "
             "assert _get_dispatch_path() == 'native'; "
-            "assert 'torch_xla' not in sys.modules"
+            "ops = _get_native_ops(); "
+            "import torch; assert all(hasattr(torch.ops.trnsolver, n) for n in ops); "
+            "assert 'torch_xla' not in sys.modules, 'torch_xla imported'"
         )
         subprocess.run([sys.executable, "-c", code], check=True)
+
+    def test_launch_in_process_never_imports_torch_xla(self):
+        # In-process complement: a real launch through the host wrapper.
+        from trnsolver.eigen import _call_matmul
+
+        _call_matmul(torch.randn(16, 16), torch.randn(16, 8))
+        assert "torch_xla" not in sys.modules
 
     def test_ops_registered_in_torch_ops(self):
         from trnsolver.nki.dispatch import _get_native_ops
@@ -109,7 +119,9 @@ class TestNativeDispatch:
 
         op = _get_native_ops()[name]
 
-        @torch.compile(backend="neuron", fullgraph=True)
+        # dynamic=False: NkiTensor rejects symbolic dims, and Dynamo would
+        # otherwise mark the shapes dynamic on a recompile.
+        @torch.compile(backend="neuron", fullgraph=True, dynamic=False)
         def scaled(*args):
             return op(*args) * 2.0
 
