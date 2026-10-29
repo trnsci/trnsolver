@@ -61,6 +61,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **NKI `eigh` stage 2 is one LAPACK call (#42).** The host eigensolve of the
+  tridiagonal (d, e) now uses `scipy.linalg.eigh_tridiagonal` in float64 when
+  scipy is importable, else `torch.linalg.eigh` on the dense tridiagonal
+  (scipy stays a dev-only dependency). It replaces the scalar Python
+  implicit-shift QR iteration, which took about 566 of 575 ms per warm call
+  at n = 128 on Trn2. CPU stage-2 time: n = 64 211 ms → 0.13 ms, n = 128
+  946 ms → 0.41 ms. Reflector assembly and the Rayleigh-Ritz step are
+  unchanged, so output ordering (ascending) and accuracy are preserved.
+  `TRNSOLVER_EIGH_TRIDIAG_SOLVER=qr` keeps the old iteration for one release;
+  the default is `lapack`.
+
 - **Householder tridiagonalization keeps its scalar work on the host.**
   `_householder_tridiag` reads column k of the working matrix once per step
   and computes the norm, sign, `v`, `v·v`, `v·w` and `u` on CPU copies; only
