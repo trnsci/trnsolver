@@ -28,6 +28,8 @@ import torch
 
 from .factor import _cholesky_lower, _restore, _to_fp32
 from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki, _use_simulator
+from .nki.tridiag import householder_tridiag_device as _householder_tridiag_device
+from .nki.tridiag import use_device_tridiag as _use_device_tridiag
 
 
 def eigh(
@@ -763,7 +765,13 @@ def _householder_qr_eigh(
     if n == 1:
         return A[0].clone().unsqueeze(0), torch.eye(1, dtype=A.dtype, device=A.device)
 
-    diag, subdiag, V_refs = _householder_tridiag(A)
+    # TRNSOLVER_EIGH_TRIDIAG=device: one-launch on-chip reduction (#42),
+    # no per-step host syncs. Default off; the host-driven loop stays the
+    # reference path.
+    if _use_device_tridiag(n):
+        diag, subdiag, V_refs = _householder_tridiag_device(A)
+    else:
+        diag, subdiag, V_refs = _householder_tridiag(A)
 
     # The QR iteration is scalar host code: about 20 element reads/writes per
     # Givens rotation and O(n^2) rotations per call. Run it on CPU tensors so

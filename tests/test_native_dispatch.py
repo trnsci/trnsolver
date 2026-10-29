@@ -19,11 +19,18 @@ import torch
 import trnsolver
 import trnsolver.eigen as eigen
 import trnsolver.nki
-from trnsolver.nki import dispatch
+from trnsolver.nki import dispatch, tridiag
 
 _REAL_FIND_SPEC = importlib.util.find_spec
 
-EXPECTED_OPS = {"matvec", "rank2_update", "matmul", "matmul_fp32out", "apply_reflectors"}
+EXPECTED_OPS = {
+    "matvec",
+    "rank2_update",
+    "matmul",
+    "matmul_fp32out",
+    "apply_reflectors",
+    "householder_tridiag",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -297,9 +304,72 @@ class TestLaunchRouting:
         with pytest.raises(ImportError):
             dispatch._work_device()
 
+    def test_xla_device_tridiag_calls_kernel_and_syncs_once(self, monkeypatch, sym_matrix):
+        # The XLA path keeps its pre-native behaviour: the raw kernel on
+        # torch_xla tensors, one torch_xla.sync(), no custom ops.
+        monkeypatch.setattr(dispatch, "_dispatch_path", "xla")
+        syncs = []
+        fake_xla = types.ModuleType("torch_xla")
+        fake_xla.device = lambda: torch.device("cpu")
+        fake_xla.sync = lambda: syncs.append(1)
+        monkeypatch.setitem(sys.modules, "torch_xla", fake_xla)
+        monkeypatch.setitem(sys.modules, "torch_neuronx", _fake_xla_torch_neuronx())
+
+        def no_ops():
+            raise AssertionError("native ops must not load on the XLA path")
+
+        monkeypatch.setattr(dispatch, "_get_native_ops", no_ops)
+        launches = []
+
+        def kernel(A, consts):
+            launches.append(consts.shape)
+            return _tridiag_packed_ref(A, consts)
+
+        monkeypatch.setattr(tridiag, "householder_tridiag_kernel", kernel, raising=False)
+        monkeypatch.setattr(tridiag, "HAS_NKI", True)
+        monkeypatch.setattr(tridiag, "_use_simulator", lambda: False)
+        monkeypatch.setattr(tridiag, "_CONSTS_CACHE", {})
+        n = 12
+        A = sym_matrix(n)
+        diag, subdiag, V_refs = tridiag.householder_tridiag_device(A)
+        assert launches == [(n, 2 * n)]
+        assert syncs == [1]
+        assert diag.shape == (n,) and subdiag.shape == (n - 1,)
+        assert V_refs.shape == (n, n - 1)
+        T = torch.diag(diag) + torch.diag(subdiag, 1) + torch.diag(subdiag, -1)
+        torch.testing.assert_close(
+            torch.linalg.eigvalsh(T), torch.linalg.eigvalsh(A), rtol=1e-4, atol=1e-4
+        )
+
+
+def _tridiag_packed_ref(A, consts):
+    """Torch stand-in for householder_tridiag_kernel: the packed output.
+
+    Column 0 = diag, column 1 = subdiag (last entry 0), columns 2.. = the
+    unit-norm reflectors, with the host loop's sign convention.
+    """
+    n = A.shape[0]
+    A = A.double().clone()
+    out = torch.zeros(n, tridiag.n_out_cols(n), dtype=torch.float64)
+    for k in range(n - 2):
+        x = A[k + 1 :, k]
+        nx = torch.linalg.norm(x)
+        v = torch.zeros(n, dtype=torch.float64)
+        v[k + 1 :] = x
+        v[k + 1] += nx if x[0] >= 0 else -nx
+        vn = torch.linalg.norm(v)
+        if vn > 0:
+            v = v / vn
+        H = torch.eye(n, dtype=torch.float64) - 2.0 * torch.outer(v, v)
+        A = H @ A @ H
+        out[:, 2 + k] = v
+    out[:, 0] = torch.diagonal(A)
+    out[: n - 1, 1] = torch.diagonal(A, 1)
+    return out.float()
+
 
 def _reference_ops(calls):
-    """Torch implementations of the five ops, recording each call."""
+    """Torch implementations of the six ops, recording each call."""
 
     def rec(name, fn):
         def op(*args):
@@ -321,6 +391,7 @@ def _reference_ops(calls):
         "matmul": rec("matmul", lambda A, V: A @ V),
         "matmul_fp32out": rec("matmul_fp32out", lambda A, V: A.float() @ V.float()),
         "apply_reflectors": rec("apply_reflectors", apply_reflectors),
+        "householder_tridiag": rec("householder_tridiag", _tridiag_packed_ref),
     }
 
 
@@ -347,6 +418,10 @@ class TestNativeHostDrivers:
             "apply_reflectors_kernel",
         ):
             monkeypatch.setattr(dispatch, name, object(), raising=False)
+        monkeypatch.setattr(tridiag, "householder_tridiag_kernel", object(), raising=False)
+        monkeypatch.setattr(tridiag, "HAS_NKI", True)
+        monkeypatch.setattr(tridiag, "_use_simulator", lambda: False)
+        monkeypatch.setattr(tridiag, "_CONSTS_CACHE", {})
         monkeypatch.setattr(eigen, "HAS_NKI", True)
         monkeypatch.setattr(eigen, "_use_nki", lambda: True)
         monkeypatch.setattr(eigen, "_use_simulator", lambda: False)
@@ -374,6 +449,32 @@ class TestNativeHostDrivers:
             torch.linalg.eigvalsh(T), torch.linalg.eigvalsh(A), rtol=1e-4, atol=1e-4
         )
         assert V_refs.shape == (n, n - 1)
+
+    @pytest.mark.parametrize("n", [3, 8, 17, 32])
+    def test_eigh_device_tridiag_one_launch(self, native, sym_matrix, monkeypatch, n):
+        # TRNSOLVER_EIGH_TRIDIAG=device: one trnsolver::householder_tridiag
+        # launch replaces the 2(n - 2) matvec / rank2_update launches.
+        monkeypatch.setenv("TRNSOLVER_EIGH_TRIDIAG", "device")
+        A = sym_matrix(n)
+        w, V = trnsolver.eigh(A)
+        torch.testing.assert_close(w, torch.linalg.eigh(A).eigenvalues, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(V @ torch.diag(w) @ V.T, A, rtol=1e-3, atol=1e-3)
+        assert native.count("householder_tridiag") == 1
+        assert native.count("matvec") == native.count("rank2_update") == 0
+        assert native.count("apply_reflectors") == 1
+        assert "torch_xla" not in sys.modules or sys.modules["torch_xla"] is None
+
+    def test_device_tridiag_unpacks_native_output(self, native, sym_matrix):
+        n = 16
+        A = sym_matrix(n)
+        diag, subdiag, V_refs = tridiag.householder_tridiag_device(A)
+        assert diag.shape == (n,) and subdiag.shape == (n - 1,)
+        assert V_refs.shape == (n, n - 1)
+        T = torch.diag(diag) + torch.diag(subdiag, 1) + torch.diag(subdiag, -1)
+        torch.testing.assert_close(
+            torch.linalg.eigvalsh(T), torch.linalg.eigvalsh(A), rtol=1e-4, atol=1e-4
+        )
+        assert native == ["householder_tridiag"]
 
     def test_eigh_randomized_bf16_routes_fp32out(self, native, sym_matrix):
         A = sym_matrix(64).to(torch.bfloat16)
@@ -452,3 +553,6 @@ class TestLazyRegistration:
         assert bf16.shape == (n, k) and bf16.dtype == torch.float32
         out = fake("apply_reflectors")(meta(n, n - 2), meta(n, n))
         assert out.shape == (n, n) and out.dtype == torch.float32
+        for m in (2, 3, n, 128):
+            out = fake("householder_tridiag")(meta(m, m), meta(m, 2 * m))
+            assert out.shape == (m, 2 + max(m - 1, 1)) and out.dtype == torch.float32

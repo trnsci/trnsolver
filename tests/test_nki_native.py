@@ -118,6 +118,41 @@ class TestNativeDispatch:
         torch.testing.assert_close(out, expected.float() * 2.0, rtol=tol, atol=2 * tol)
 
 
+class TestNativeDeviceTridiag:
+    """trnsolver::householder_tridiag (TRNSOLVER_EIGH_TRIDIAG=device, #42)."""
+
+    def test_op_registered(self):
+        from trnsolver.nki.dispatch import _get_native_ops
+
+        _get_native_ops()
+        assert hasattr(torch.ops.trnsolver, "householder_tridiag")
+
+    @pytest.mark.parametrize("n", [8, 64, 128])
+    def test_op_eager_tridiagonal_spectrum(self, n):
+        from trnsolver.nki.tridiag import n_out_cols, tridiag_constants
+
+        A = _sym(n)
+        out = torch.ops.trnsolver.householder_tridiag(A.to(DEV), tridiag_constants(n).to(DEV))
+        assert out.device.type == DEV and out.shape == (n, n_out_cols(n))
+        out = out.cpu()
+        d, e = out[:, 0], out[: n - 1, 1]
+        T = torch.diag(d) + torch.diag(e, 1) + torch.diag(e, -1)
+        torch.testing.assert_close(
+            torch.linalg.eigvalsh(T), torch.linalg.eigvalsh(A), rtol=1e-3, atol=1e-3
+        )
+
+    @pytest.mark.parametrize("n", [8, 32, 128])
+    def test_eigh_device_tridiag_no_torch_xla(self, n, monkeypatch):
+        monkeypatch.setenv("TRNSOLVER_EIGH_TRIDIAG", "device")
+        monkeypatch.setenv("TRNSOLVER_EIGH_NKI_MIN_N", "0")
+        A = _sym(n)
+        w, V = trnsolver.eigh(A.to(DEV))
+        w, V = w.cpu(), V.cpu()
+        torch.testing.assert_close(w, torch.linalg.eigh(A).eigenvalues, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(V @ torch.diag(w) @ V.T, A, rtol=1e-2, atol=1e-2)
+        assert "torch_xla" not in sys.modules
+
+
 class TestNativeDrivers:
     @pytest.mark.parametrize("n", [8, 32, 128])
     def test_eigh_kernel_path_device_input(self, n, monkeypatch):
