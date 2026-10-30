@@ -191,6 +191,9 @@ if HAS_NKI:
             nisa.dma_copy(dst=X[0:P, gi, 0:ne], src=Z[gi, 0:P, 0:ne])
             nisa.dma_copy(dst=X[0:P, gi, ne : 2 * ne], src=V[gi, 0:P, 0:ne])
         per_chunk = max(1, 512 // (2 * ne))
+        # Per-tile instructions pay off once a tile row is long (ne >= 64);
+        # below that the group has many tiles and batched instructions win.
+        per_tile = ne >= 64
 
         def step(g0, g1, pibd, sig):
             """One step for tiles g0..g1-1 (one dependency chain)."""
@@ -217,14 +220,42 @@ if HAS_NKI:
             mz = ps_m[0:P, 0:ng, 0:ne]
 
             # Gram entries g_pp = |z_p|^2, g_pq = z_p . z_q, g_qq = g_pp[partner].
-            pr = nl.ndarray((P, ng, ne), dtype=f32, buffer=nl.sbuf)
             gpp = col()
-            nisa.tensor_tensor(dst=pr, data1=Zc, data2=Zc, op=mul)
-            nisa.tensor_reduce(dst=gpp, op=add, data=pr, axis=2)
-            pr2 = nl.ndarray((P, ng, ne), dtype=f32, buffer=nl.sbuf)
             gpq = col()
-            nisa.tensor_tensor(dst=pr2, data1=mz, data2=Zc, op=mul)
-            nisa.tensor_reduce(dst=gpq, op=add, data=pr2, axis=2)
+            if per_tile:
+                # Large blocks: fused multiply + free-axis reduce per tile
+                # (one Vector Engine pass instead of two).
+                for j in range(ng):
+                    junk = nl.ndarray((P, ne), dtype=f32, buffer=nl.sbuf)
+                    nisa.scalar_tensor_tensor(
+                        dst=junk,
+                        data=Zc[0:P, j, 0:ne],
+                        op0=mul,
+                        operand0=1.0,
+                        op1=mul,
+                        operand1=Zc[0:P, j, 0:ne],
+                        reduce_op=add,
+                        reduce_res=gpp[0:P, j : j + 1],
+                    )
+                    junk2 = nl.ndarray((P, ne), dtype=f32, buffer=nl.sbuf)
+                    nisa.scalar_tensor_tensor(
+                        dst=junk2,
+                        data=Zc[0:P, j, 0:ne],
+                        op0=mul,
+                        operand0=1.0,
+                        op1=mul,
+                        operand1=mz[0:P, j, 0:ne],
+                        reduce_op=add,
+                        reduce_res=gpq[0:P, j : j + 1],
+                    )
+            else:
+                # Small blocks: one instruction over all tiles (many tiles).
+                pr = nl.ndarray((P, ng, ne), dtype=f32, buffer=nl.sbuf)
+                nisa.tensor_tensor(dst=pr, data1=Zc, data2=Zc, op=mul)
+                nisa.tensor_reduce(dst=gpp, op=add, data=pr, axis=2)
+                pr2 = nl.ndarray((P, ng, ne), dtype=f32, buffer=nl.sbuf)
+                nisa.tensor_tensor(dst=pr2, data1=mz, data2=Zc, op=mul)
+                nisa.tensor_reduce(dst=gpq, op=add, data=pr2, axis=2)
             ps_q = nl.ndarray((P, ng), dtype=f32, buffer=nl.psum)
             nisa.nc_matmul(dst=ps_q, stationary=pibd, moving=gpp, accumulate=False)
 
@@ -233,52 +264,60 @@ if HAS_NKI:
             nisa.tensor_tensor(dst=h, data1=ps_q, data2=gpp, op=sub)
             gs = col()
             nisa.tensor_scalar(dst=gs, data=gpq, op0=mul, operand0=2.0)
+
+            # (Placing this SBUF-only chain on the GpSimd engine failed at
+            # run time on Trn2; it stays on the engines the compiler picks.)
+            def ts(dst, data, op0, operand0, op1=None, operand1=None):
+                nisa.tensor_scalar(
+                    dst=dst, data=data, op0=op0, operand0=operand0, op1=op1, operand1=operand1
+                )
+
+            def tt(dst, a, b_, op):
+                nisa.tensor_tensor(dst=dst, data1=a, data2=b_, op=op)
+
             hs = col()
-            nisa.tensor_scalar(dst=hs, data=h, op0=mul, operand0=sig)
+            ts(hs, h, mul, sig)
             pos2 = col()
-            nisa.tensor_scalar(
-                dst=pos2, data=hs, op0=nl.greater_equal, operand0=0.0, op1=mul, operand1=2.0
-            )
+            ts(pos2, hs, nl.greater_equal, 0.0, mul, 2.0)
             sg = col()
-            nisa.tensor_scalar(dst=sg, data=pos2, op0=sub, operand0=1.0, op1=mul, operand1=sig)
+            ts(sg, pos2, sub, 1.0, mul, sig)
             hh = col()
-            nisa.tensor_tensor(dst=hh, data1=h, data2=h, op=mul)
+            tt(hh, h, h, mul)
             xx = col()
-            nisa.tensor_tensor(dst=xx, data1=gs, data2=gs, op=mul)
-            nisa.tensor_tensor(dst=xx, data1=xx, data2=hh, op=add)
-            nisa.tensor_scalar(dst=xx, data=xx, op0=nl.maximum, operand0=_TINY)
+            tt(xx, gs, gs, mul)
+            tt(xx, xx, hh, add)
+            ts(xx, xx, nl.maximum, _TINY)
             rr = col()
             # sqrt(x) as x * rsqrt(x): the Scalar Engine keeps one table loaded.
             nisa.activation(dst=rr, op=nl.rsqrt, data=xx)
-            nisa.tensor_tensor(dst=rr, data1=rr, data2=xx, op=mul)
+            tt(rr, rr, xx, mul)
             den = col()
             # |h| = max(-h, h)  (abs_max is NeuronCore-v4+ only)
-            nisa.scalar_tensor_tensor(
-                dst=den, data=h, op0=mul, operand0=-1.0, op1=nl.maximum, operand1=h
-            )
-            nisa.tensor_tensor(dst=den, data1=den, data2=rr, op=add)
-            nisa.tensor_scalar(dst=den, data=den, op0=nl.maximum, operand0=_TINY)
+            ts(den, h, mul, -1.0)
+            tt(den, den, h, nl.maximum)
+            tt(den, den, rr, add)
+            ts(den, den, nl.maximum, _TINY)
             u = col()
             # 1 / den = rsqrt(den)^2 (rsqrt is accurate; reciprocal is ~1e-3).
             nisa.activation(dst=u, op=nl.rsqrt, data=den)
             t = col()
-            nisa.tensor_tensor(dst=t, data1=gs, data2=u, op=mul)
-            nisa.tensor_tensor(dst=t, data1=t, data2=u, op=mul)
-            nisa.tensor_tensor(dst=t, data1=t, data2=sg, op=mul)
+            tt(t, gs, u, mul)
+            tt(t, t, u, mul)
+            tt(t, t, sg, mul)
             t2 = col()
-            nisa.tensor_tensor(dst=t2, data1=t, data2=t, op=mul)
+            tt(t2, t, t, mul)
             c = col()
             nisa.activation(dst=c, op=nl.rsqrt, data=t2, bias=1.0)
             negs = col()
-            nisa.scalar_tensor_tensor(dst=negs, data=t, op0=mul, operand0=-1.0, op1=mul, operand1=c)
+            ts(negs, t, mul, -1.0)
+            tt(negs, negs, c, mul)
             w_ = col()
             nisa.activation(dst=w_, op=nl.rsqrt, data=c, bias=1.0)
-            nisa.tensor_tensor(dst=w_, data1=w_, data2=w_, op=mul)
+            tt(w_, w_, w_, mul)
             km1 = col()
-            nisa.scalar_tensor_tensor(
-                dst=km1, data=negs, op0=mul, operand0=-1.0, op1=mul, operand1=negs
-            )
-            nisa.tensor_tensor(dst=km1, data1=km1, data2=w_, op=mul)
+            tt(km1, negs, negs, mul)
+            ts(km1, km1, mul, -1.0)
+            tt(km1, km1, w_, mul)
 
             # Rotation on the Vector Engine, in the X + K^T X form:
             #   (K^T X)[p, :] = (c - 1)_p X[p, :] - s_p X[partner(p), :]
@@ -286,10 +325,29 @@ if HAS_NKI:
             # (Folding both terms into PSUM with an identity matmul was
             # measured slower on Trn2: the Vector Engine work only moves.)
             t1 = nl.ndarray((P, ng, 2 * ne), dtype=f32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=t1, data1=ps_m, data2=bcast_last(negs, 2 * ne), op=mul)
-            t2x = nl.ndarray((P, ng, 2 * ne), dtype=f32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=t2x, data1=Xc, data2=bcast_last(km1, 2 * ne), op=mul)
-            nisa.tensor_tensor(dst=t1, data1=t1, data2=t2x, op=add)
+            if per_tile:
+                # -s o M on the Scalar Engine, (c - 1) o X + that on the Vector
+                # Engine, per tile (per-partition scalars, one pass each).
+                for j in range(ng):
+                    nisa.activation(
+                        dst=t1[0:P, j, 0 : 2 * ne],
+                        op=nl.copy,
+                        data=ps_m[0:P, j, 0 : 2 * ne],
+                        scale=negs[0:P, j : j + 1],
+                    )
+                    nisa.scalar_tensor_tensor(
+                        dst=t1[0:P, j, 0 : 2 * ne],
+                        data=Xc[0:P, j, 0 : 2 * ne],
+                        op0=mul,
+                        operand0=km1[0:P, j : j + 1],
+                        op1=add,
+                        operand1=t1[0:P, j, 0 : 2 * ne],
+                    )
+            else:
+                nisa.tensor_tensor(dst=t1, data1=ps_m, data2=bcast_last(negs, 2 * ne), op=mul)
+                t2x = nl.ndarray((P, ng, 2 * ne), dtype=f32, buffer=nl.sbuf)
+                nisa.tensor_tensor(dst=t2x, data1=Xc, data2=bcast_last(km1, 2 * ne), op=mul)
+                nisa.tensor_tensor(dst=t1, data1=t1, data2=t2x, op=add)
             nisa.tensor_tensor(dst=Xc, data1=Xc, data2=t1, op=add)
 
         # Independent chains over disjoint tile ranges: one chain's (P, 1)
@@ -310,14 +368,26 @@ if HAS_NKI:
         return out
 
 
+_DEVICE_CONSTS: dict = {}
+
+
+def _consts_on(n: int, chains: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """(consts, sched) for one launch, cached per device (no copy per launch)."""
+    ne = block_layout(n)[0]
+    key = (ne, chains, str(device))
+    if key not in _DEVICE_CONSTS:
+        consts = jacobi_constants(n).to(device)
+        sched = torch.zeros((1, ne, chains), dtype=torch.float32, device=device)
+        _DEVICE_CONSTS[key] = (consts, sched)
+    return _DEVICE_CONSTS[key]
+
+
 def _run_kernel(Z: torch.Tensor, V: torch.Tensor, n: int, chains: int) -> torch.Tensor:
     """One launch (one sweep) on a group: simulator or device. Z, V: (G, P, ne)."""
-    ne = block_layout(n)[0]
-    consts = jacobi_constants(n)
-    sched = torch.zeros((1, ne, chains), dtype=torch.float32)
     if _use_simulator():
         import nki as _nki
 
+        consts, sched = _consts_on(n, chains, torch.device("cpu"))
         res = _nki.simulate(jacobi_sweeps_kernel)(
             Z.detach().cpu().contiguous().numpy(),
             V.detach().cpu().contiguous().numpy(),
@@ -327,10 +397,8 @@ def _run_kernel(Z: torch.Tensor, V: torch.Tensor, n: int, chains: int) -> torch.
         return torch.from_numpy(res).to(Z.device)
     from .dispatch import _launch
 
-    dev = Z.device
-    return _launch(
-        jacobi_sweeps_kernel, "jacobi_sweeps", Z, V, consts.to(dev), sched.to(dev), device=dev
-    )
+    consts, sched = _consts_on(n, chains, Z.device)
+    return _launch(jacobi_sweeps_kernel, "jacobi_sweeps", Z, V, consts, sched, device=Z.device)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -386,11 +454,12 @@ def jacobi_eigh_device(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
     Runs ``_SWEEPS0[ne]`` sweeps (one launch per sweep and group of tiles),
     then one more sweep at a time while any matrix has a Gram off-diagonal
-    norm above 1e-6, up to 15 sweeps.
+    norm above 1e-6, up to 15 sweeps. Preparation (symmetrise, scale,
+    shift, pack) and the final Rayleigh quotients and sort run on A's
+    device, so a host input costs one copy in and one copy out.
     """
     global last_sweeps
     Bsz, n = A.shape[0], A.shape[-1]
-    out_dev = A.device
     if n == 1:
         last_sweeps = 0
         return A.reshape(Bsz, 1).clone(), torch.ones_like(A)
@@ -401,14 +470,14 @@ def jacobi_eigh_device(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         from .dispatch import _work_device
 
         work = _work_device()
-    X = A.to(work)
-    X = torch.tril(X) + torch.tril(X, -1).transpose(1, 2)
+
+    X = torch.tril(A) + torch.tril(A, -1).transpose(1, 2)
     # Exact power-of-two scaling to max |a| in (1/2, 1], then the shift.
     amax = torch.clamp(X.abs().amax(dim=(1, 2)), min=1e-30)
     scale = torch.exp2(-torch.ceil(torch.log2(amax)))
     X = X * scale[:, None, None]
     sigma = X.abs().sum(-1).amax(-1)
-    eye = torch.eye(n, dtype=X.dtype, device=work)
+    eye = torch.eye(n, dtype=X.dtype, device=X.device)
     Z = pack_compact(X + sigma[:, None, None] * eye, n)  # symmetric, so Z^T = Z
     Vt = pack_compact(eye.expand(Bsz, n, n), n)
     T = Z.shape[0]
@@ -421,31 +490,39 @@ def jacobi_eigh_device(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         fill = torch.eye(ne, dtype=t.dtype, device=t.device).repeat(padded - count, b, 1)
         return torch.cat([t, fill.reshape(padded - count, P, ne)], dim=0)
 
-    def sweep(Z, Vt):
-        zs, vs = [], []
-        for start, count, padded in plan:
-            zg = pad_tiles(Z[start : start + count], count, padded)
-            vg = pad_tiles(Vt[start : start + count], count, padded)
-            res = _run_kernel(zg, vg, n, min(chains_max, padded))
-            zs.append(res[0, :count])
-            vs.append(res[1, :count])
-        return torch.cat(zs, 0), torch.cat(vs, 0)
+    # Per group: (Z, V) on the work device, padded to the launch shape.
+    groups = [
+        (
+            pad_tiles(Z[s : s + c], c, p).to(work),
+            pad_tiles(Vt[s : s + c], c, p).to(work),
+            min(chains_max, p),
+        )
+        for s, c, p in plan
+    ]
+
+    def sweep():
+        for k, (zg, vg, ch) in enumerate(groups):
+            res = _run_kernel(zg, vg, n, ch)
+            groups[k] = (res[0], res[1], ch)
+
+    def gathered(i):
+        parts = [g[i][:c] for g, (_, c, _) in zip(groups, plan, strict=True)]
+        return parts[0] if len(parts) == 1 else torch.cat(parts, 0)
 
     done = 0
     for _ in range(_SWEEPS0[ne]):
-        Z, Vt = sweep(Z, Vt)
+        sweep()
         done += 1
     while done < _MAX_SWEEPS:
-        Zt = unpack_compact(Z, n, Bsz)
-        if float(gram_off(Zt).max()) < _TOL:
+        if float(gram_off(unpack_compact(gathered(0), n, Bsz)).max()) < _TOL:
             break
-        Z, Vt = sweep(Z, Vt)
+        sweep()
         done += 1
     last_sweeps = done
 
-    Zt = unpack_compact(Z, n, Bsz)[:, :n, :n]
-    Vt = unpack_compact(Vt, n, Bsz)[:, :n, :n]
+    Zt = unpack_compact(gathered(0).to(A.device), n, Bsz)[:, :n, :n]
+    Vt = unpack_compact(gathered(1).to(A.device), n, Bsz)[:, :n, :n]
     w = ((Zt * Vt).sum(-1) - sigma[:, None]) / scale[:, None]
     w, order = torch.sort(w, dim=-1)
     V = torch.gather(Vt.transpose(1, 2), -1, order.unsqueeze(-2).expand(Bsz, n, n))
-    return w.to(out_dev), V.contiguous().to(out_dev)
+    return w, V.contiguous()
