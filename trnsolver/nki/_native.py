@@ -74,6 +74,45 @@ def apply_reflectors(V_refs: torch.Tensor, Q_in: torch.Tensor) -> torch.Tensor:
     return _d.apply_reflectors_kernel(V_refs, Q_in)
 
 
+@nki_op(
+    "trnsolver::jacobi_sweeps",
+    mutates_args={},
+    fake_fn=lambda A, W, consts, sched: A.new_empty((2,) + tuple(A.shape)),
+)
+def jacobi_sweeps(
+    A: torch.Tensor, W: torch.Tensor, consts: torch.Tensor, sched: torch.Tensor
+) -> torch.Tensor:
+    from . import jacobi as _j
+
+    return _j.jacobi_sweeps_kernel(A, W, consts, sched)
+
+
+@nki_op(
+    "trnsolver::jacobi_compact",
+    mutates_args={},
+    fake_fn=lambda A, W, consts, sched: A.new_empty((2,) + tuple(A.shape)),
+)
+def jacobi_compact(
+    A: torch.Tensor, W: torch.Tensor, consts: torch.Tensor, sched: torch.Tensor
+) -> torch.Tensor:
+    from . import jacobi as _j
+
+    return _j.jacobi_compact_kernel(A, W, consts, sched)
+
+
+@nki_op(
+    "trnsolver::jacobi_onesided",
+    mutates_args={},
+    fake_fn=lambda Z, V, consts, sched: Z.new_empty((2,) + tuple(Z.shape)),
+)
+def jacobi_onesided(
+    Z: torch.Tensor, V: torch.Tensor, consts: torch.Tensor, sched: torch.Tensor
+) -> torch.Tensor:
+    from . import jacobi as _j
+
+    return _j.jacobi_onesided_kernel(Z, V, consts, sched)
+
+
 # Keyed by the short op name used in `dispatch._launch`.
 OPS = {
     "matvec": matvec,
@@ -81,4 +120,7 @@ OPS = {
     "matmul": matmul,
     "matmul_fp32out": matmul_fp32out,
     "apply_reflectors": apply_reflectors,
+    "jacobi_sweeps": jacobi_sweeps,
+    "jacobi_compact": jacobi_compact,
+    "jacobi_onesided": jacobi_onesided,
 }
