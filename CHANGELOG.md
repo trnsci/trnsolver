@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-10-30
+
+Native TorchNeuron dispatch (Trn2/Trn3) alongside the PyTorch/XLA path (Trn1, maintenance); validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0) — see trnsci/trnsci#35.
+
+Headline performance: batched Jacobi `eigh(A, method="jacobi")` kernel on Trn2, 40.2 ms vs 60.5 ms for CPU LAPACK at n=32, B=1024 (#50); the native `eigh` cutover to `torch.linalg.eigh` below n=512 stays the default.
+
 ### Added
 
 - **`eigh(A, method="jacobi")`: batched Jacobi eigensolver (#48).** Accepts
