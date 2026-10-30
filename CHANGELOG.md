@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`eigh(A, method="jacobi")`: batched Jacobi eigensolver (#48).** Accepts
+  `(n, n)` or `(..., n, n)`; `TRNSOLVER_EIGH_METHOD=jacobi` selects it when
+  `method` is not given. Opt-in: the default `auto` dispatch, including the
+  aten cutover for n < 512, is unchanged.
+  - On the native `neuron` device (FP32, n <= 128) it runs the one-sided
+    (Hestenes) Jacobi kernel in `trnsolver/nki/jacobi.py`: up to 128 tiles
+    of 128 / n matrices each (512 matrices at n = 32) held in SBUF for a
+    whole sweep, one launch per
+    sweep, a convergence check after the expected sweep count (6-8 for
+    random matrices), at most 15 sweeps. Native op `trnsolver::jacobi_sweeps`.
+  - Each step uses the Tensor Engine as an exact partition permutation
+    (the block-diagonal step permutation is the stationary operand, shared
+    by every tile) and applies the n/2 rotations on the Vector Engine in the
+    `X + K^T X` form, which keeps FP32 orthogonality at about 1e-6.
+  - Elsewhere (CPU, FP64, the XLA lineage, n > 128) it runs the torch
+    implementation in `trnsolver/_jacobi.py`: parallel-ordered two-sided
+    Jacobi with each step as batched matmuls.
+  - Tuning: `TRNSOLVER_JACOBI_GROUP` (tiles per launch) and
+    `TRNSOLVER_JACOBI_CHAINS` (independent dependency chains per step).
+  - Tests: `tests/test_jacobi.py` (schedules, layout, torch path and the
+    device host driver against `torch.linalg.eigh` on CPU; kernel vs a torch
+    model in the simulator; NKI 0.7 MLIR verify; `@pytest.mark.neuron`).
+  - Bench: `scripts/bench_jacobi.py` (CPU LAPACK, torch-on-device, compiled,
+    kernel).
+
 - **Native PyTorch dispatch on TorchNeuron (#40, trnsci/trnsci#35).** On
   TorchNeuron (Neuron SDK 2.33+, `torch-neuronx` 2.14, PyTorch 2.14,
   Trn2/Trn3) every hardware NKI kernel is registered as a PyTorch custom op

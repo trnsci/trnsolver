@@ -52,7 +52,7 @@ def eigh(
     ``method="jacobi"`` (#48) runs batched one-sided Jacobi. On the native
     ``neuron`` device with NKI, n <= 128, it is the SBUF-resident kernel in
     ``trnsolver/nki/jacobi.py`` (one launch per sweep per group of up to
-    512 matrices); elsewhere it is the torch implementation in
+    128 tiles of 128 / n matrices); elsewhere it is the torch implementation in
     ``trnsolver/_jacobi.py`` (batched matmuls, any device). It does not
     change the default ``auto`` dispatch below.
 
