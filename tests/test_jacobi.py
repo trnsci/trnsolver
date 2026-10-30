@@ -136,7 +136,7 @@ class TestSchedules:
     def test_group_plan(self, monkeypatch):
         monkeypatch.delenv("TRNSOLVER_JACOBI_GROUP", raising=False)
         assert JK.group_plan(3, 128) == [(0, 3, 4)]
-        assert JK.group_plan(20, 128) == [(0, 8, 8), (8, 8, 8), (16, 4, 4)]
+        assert JK.group_plan(40, 128) == [(0, 16, 16), (16, 16, 16), (32, 8, 8)]
         assert JK.group_plan(300, 32) == [(0, 128, 128), (128, 128, 128), (256, 44, 64)]
         monkeypatch.setenv("TRNSOLVER_JACOBI_GROUP", "3")  # rounded down to 2
         assert JK.group_plan(5, 32) == [(0, 2, 2), (2, 2, 2), (4, 1, 1)]

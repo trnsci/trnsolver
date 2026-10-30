@@ -67,7 +67,7 @@ _TINY = 2.0**-80
 # latency chain, so more tiles per launch amortise it until the Vector
 # Engine saturates; extra chains overlap one chain's latency with another's
 # bulk work.
-_GROUP_MAX = {2: 128, 4: 128, 8: 128, 16: 128, 32: 128, 64: 32, 128: 8}
+_GROUP_MAX = {2: 128, 4: 128, 8: 128, 16: 128, 32: 128, 64: 64, 128: 16}
 _CHAINS_MAX = {2: 8, 4: 8, 8: 8, 16: 8, 32: 8, 64: 4, 128: 2}
 # Sweeps run before the first convergence check (random symmetric matrices
 # converge to off < 1e-6 in this many; see _jacobi.py for the measurement).
@@ -178,18 +178,29 @@ if HAS_NKI:
         add = nl.add
         sub = nl.subtract
 
-        out = nl.ndarray((2, G, P, ne), dtype=Z.dtype, buffer=nl.shared_hbm)
+        out = nl.ndarray((2, Z.shape[0], P, ne), dtype=Z.dtype, buffer=nl.shared_hbm)
 
         sigt = nl.ndarray((P, m), dtype=f32, buffer=nl.sbuf)
         nisa.dma_copy(dst=sigt, src=consts[0:P, 0:m])
         qfull = nl.ndarray((P, P), dtype=f32, buffer=nl.sbuf)
         nisa.dma_copy(dst=qfull, src=consts[0:P, m : m + P])
 
+        # Split the tiles across the SPMD programs (the physical cores of a
+        # logical NeuronCore under LNC=2): program k owns tiles
+        # [k * G / nprog, (k + 1) * G / nprog). A group too small to split
+        # runs whole on every program (identical results, identical writes).
+        nprog = int(nl.num_programs(0)) if nl.program_ndim() > 0 else 1
+        if nprog > 1 and G % nprog == 0:
+            G = G // nprog
+            base = nl.program_id(0) * G
+        else:
+            base = 0
+
         # Z^T and V^T of tile g side by side: X[:, g] = [Z^T_g | V^T_g].
         X = nl.ndarray((P, G, 2 * ne), dtype=f32, buffer=nl.sbuf)
         for gi in range(G):
-            nisa.dma_copy(dst=X[0:P, gi, 0:ne], src=Z[gi, 0:P, 0:ne])
-            nisa.dma_copy(dst=X[0:P, gi, ne : 2 * ne], src=V[gi, 0:P, 0:ne])
+            nisa.dma_copy(dst=X[0:P, gi, 0:ne], src=Z[base + gi, 0:P, 0:ne])
+            nisa.dma_copy(dst=X[0:P, gi, ne : 2 * ne], src=V[base + gi, 0:P, 0:ne])
         per_chunk = max(1, 512 // (2 * ne))
         # Per-tile instructions pay off once a tile row is long (ne >= 64);
         # below that the group has many tiles and batched instructions win.
@@ -366,8 +377,8 @@ if HAS_NKI:
                         step(bounds[k], bounds[k + 1], pibd, sig)
 
         for gi in range(G):
-            nisa.dma_copy(dst=out[0, gi, 0:P, 0:ne], src=X[0:P, gi, 0:ne])
-            nisa.dma_copy(dst=out[1, gi, 0:P, 0:ne], src=X[0:P, gi, ne : 2 * ne])
+            nisa.dma_copy(dst=out[0, base + gi, 0:P, 0:ne], src=X[0:P, gi, 0:ne])
+            nisa.dma_copy(dst=out[1, base + gi, 0:P, 0:ne], src=X[0:P, gi, ne : 2 * ne])
         return out
 
 
@@ -474,16 +485,20 @@ def jacobi_eigh_device(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
         work = _work_device()
 
-    X = torch.tril(A) + torch.tril(A, -1).transpose(1, 2)
-    # Exact power-of-two scaling to max |a| in (1/2, 1], then the shift.
-    amax = torch.clamp(X.abs().amax(dim=(1, 2)), min=1e-30)
-    scale = torch.exp2(-torch.ceil(torch.log2(amax)))
+    # Symmetrise from the lower triangle (torch.linalg.eigh semantics).
+    lower = torch.ones(n, n, dtype=torch.bool, device=A.device).tril()
+    X = torch.where(lower, A, A.transpose(1, 2))
+    # Exact power-of-two scaling so the infinity norm (a Gershgorin bound on
+    # |lambda|, and >= max |a_ij|) lands in (1/2, 1]; sigma = that bound.
+    nrm = torch.clamp(torch.linalg.matrix_norm(X, ord=float("inf")), min=1e-30)
+    scale = torch.exp2(-torch.ceil(torch.log2(nrm)))
+    sigma = nrm * scale
     X = X * scale[:, None, None]
-    sigma = X.abs().sum(-1).amax(-1)
-    eye = torch.eye(n, dtype=X.dtype, device=X.device)
-    Z = pack_compact(X + sigma[:, None, None] * eye, n)  # symmetric, so Z^T = Z
-    Vt = pack_compact(eye.expand(Bsz, n, n), n)
+    X.diagonal(dim1=1, dim2=2).add_(sigma[:, None])  # Z_0 = A + sigma I (symmetric)
+    Z = pack_compact(X, n)
+    # V^T starts as identity tiles, built on the work device (no copy).
     T = Z.shape[0]
+    Vt = torch.eye(ne, dtype=X.dtype, device=work).repeat(T * b, 1, 1).reshape(T, P, ne)
     plan = group_plan(T, ne)
     chains_max = _env_int("TRNSOLVER_JACOBI_CHAINS", _CHAINS_MAX[ne])
 
@@ -494,10 +509,11 @@ def jacobi_eigh_device(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return torch.cat([t, fill.reshape(padded - count, P, ne)], dim=0)
 
     # Per group: (Z, V) on the work device, padded to the launch shape.
+    Zw = Z.to(work)
     groups = [
         (
-            pad_tiles(Z[s : s + c], c, p).to(work),
-            pad_tiles(Vt[s : s + c], c, p).to(work),
+            pad_tiles(Zw[s : s + c], c, p),
+            pad_tiles(Vt[s : s + c], c, p),
             min(chains_max, p),
         )
         for s, c, p in plan
