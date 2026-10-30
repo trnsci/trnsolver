@@ -96,6 +96,8 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 
 ## Status
 
+**v0.17.0** — Native TorchNeuron dispatch (Trn2/Trn3) alongside the PyTorch/XLA path (Trn1, maintenance); validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0; trnsci/trnsci#35). New `eigh(A, method="jacobi")`: a batched one-sided Jacobi NKI kernel for FP32 n ≤ 128 on the `neuron` device, with a batched-matmul torch path everywhere else (#50). At n=32, B=1024 it takes 40.2 ms against 60.5 ms for CPU LAPACK. The default `eigh` dispatch and its small-n cutover to `torch.linalg.eigh` are unchanged.
+
 **v0.16.0** — Trn2 validation (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron device; trnsci/trnsci#35). `eigh` on the `neuron` device uses `torch.linalg.eigh` below `TRNSOLVER_EIGH_NKI_MIN_N` (default 512), and the NKI path runs its QR iteration on host tensors (#42). `apply_reflectors_kernel` compiles under NKI 0.7.0 / neuronx-cc 2.28. `cholesky`, `solve`, `solve_spd`, `inv_spd`, `eigh_generalized` and `qr` trace to Neuron-lowerable ops under `torch.compile` (#41); `eigh` (NKI path), `cg`, `gmres` and `gmres_ir` are eager-only.
 
 **v0.15.0** — `gmres_ir(A, b, ...)`. GMRES with iterative refinement: Carson–Higham two-precision framework for general (non-symmetric) Ax = b. FP32 LU(A) computed once as a left preconditioner; each outer step computes a FP64 residual and solves the preconditioned correction via inner GMRES (FP32 Krylov). Extends the `solve_spd(iterative_refinement=True)` pattern from SPD Cholesky to general LU. Reliable for cond(A) ≲ 1e7. Returns `(x, total_inner_iters, fp64_residual)`. BF16 inner matvec (50–100× via Tensor Engine + SR) deferred to v0.16.0.
@@ -120,7 +122,7 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 
 **API coverage:**
 
-| Category | Shipped (v0.16.0) | Deferred |
+| Category | Shipped (v0.17.0) | Deferred |
 |----------|-------------------|----------|
 | Eigensolvers | `eigh`, `eigh_generalized`, `eigh_randomized` | — |
 | Factorizations | `cholesky`, `lu`, `qr`, `svd`, `pinv`, `schur` | — |
@@ -143,8 +145,9 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 - **v0.14.0** — `matmul_kernel_fp32out` + BF16-native sketch in `eigh_randomized` (Principle 1: BF16→FP32 PSUM, 50–100× at BF16) ✓
 - **v0.15.0** — `gmres_ir`: Carson–Higham iterative refinement for general Ax = b (FP32 LU preconditioner + FP64 outer residual) ✓
 - **v0.16.0** — Trn2 validation on Neuron SDK 2.33 (native TorchNeuron device): `eigh` small-n cutover, NKI 0.7.0 kernel fixes, `torch.compile`-traceable factorizations ✓
-- **v0.17.0** — BF16 inner matvec for GMRES-IR via `matmul_kernel_fp32out` + SR (Principle 3); block RHS support
-- **v0.18.0+** — NKI Hessenberg reduction kernel, multi-NeuronCore parallel Jacobi (#20)
+- **v0.17.0** — Native TorchNeuron dispatch; batched Jacobi `eigh(method="jacobi")` kernel on Trn2 ✓
+- **v0.18.0** — BF16 inner matvec for GMRES-IR via `matmul_kernel_fp32out` + SR (Principle 3); block RHS support
+- **v0.19.0+** — NKI Hessenberg reduction kernel, multi-NeuronCore parallel Jacobi (#20)
 
 ## Operations
 
@@ -184,7 +187,7 @@ All six siblings are on PyPI, along with the umbrella meta-package:
 | [trnfft](https://github.com/trnsci/trnfft) | FFT and complex-valued tensors | v0.8.0 |
 | [trnblas](https://github.com/trnsci/trnblas) | BLAS Level 1–3 | v0.4.0 |
 | [trnrand](https://github.com/trnsci/trnrand) | Philox / Sobol / Halton RNG | v0.1.0 |
-| trnsolver | Linear solvers and eigendecomposition | **v0.16.0** |
+| trnsolver | Linear solvers and eigendecomposition | **v0.17.0** |
 | [trnsparse](https://github.com/trnsci/trnsparse) | Sparse matrix operations | v0.1.1 |
 | [trntensor](https://github.com/trnsci/trntensor) | Tensor contractions (einsum, TT/Tucker) | v0.1.1 |
 
