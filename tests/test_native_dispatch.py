@@ -23,7 +23,14 @@ from trnsolver.nki import dispatch
 
 _REAL_FIND_SPEC = importlib.util.find_spec
 
-EXPECTED_OPS = {"matvec", "rank2_update", "matmul", "matmul_fp32out", "apply_reflectors"}
+EXPECTED_OPS = {
+    "matvec",
+    "rank2_update",
+    "matmul",
+    "matmul_fp32out",
+    "apply_reflectors",
+    "jacobi_sweeps",
+}
 
 
 @pytest.fixture(autouse=True)

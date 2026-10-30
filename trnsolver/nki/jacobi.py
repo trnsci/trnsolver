@@ -125,7 +125,7 @@ def jacobi_constants(n: int) -> torch.Tensor:
     sig = torch.empty((P, m))
     cols = torch.arange(P, dtype=torch.float32)
     for r, v in enumerate(step_targets(ne)):
-        partner = ((Q == v).float() * cols).sum(1)
+        partner = (torch.eq(Q, v).float() * cols).sum(1)
         sig[:, r] = torch.where(partner > cols, 1.0, -1.0)
     return torch.cat([sig, Q], dim=1).contiguous()
 
@@ -209,8 +209,10 @@ if HAS_NKI:
             for c0 in range(0, ng, per_chunk):
                 c1 = min(ng, c0 + per_chunk)
                 nisa.nc_matmul(
-                    dst=ps_m[0:P, c0:c1, 0 : 2 * ne], stationary=pibd,
-                    moving=X[0:P, g0 + c0 : g0 + c1, 0 : 2 * ne], accumulate=False,
+                    dst=ps_m[0:P, c0:c1, 0 : 2 * ne],
+                    stationary=pibd,
+                    moving=X[0:P, g0 + c0 : g0 + c1, 0 : 2 * ne],
+                    accumulate=False,
                 )
             mz = ps_m[0:P, 0:ng, 0:ne]
 

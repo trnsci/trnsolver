@@ -6,16 +6,21 @@ Prints one ``RESULT`` line per (mode, n, B):
            eig_err=<..> res=<..> orth=<..>
 
 Modes:
-    cpu        batched ``torch.linalg.eigh`` on host fp32 input (LAPACK).
-    torch      ``trnsolver._jacobi`` on the ``neuron`` device, eager aten ops
-               (``torch.bmm`` for the updates), no custom kernel.
-    compiled   the same step under ``torch.compile(backend="neuron", dynamic=False)``.
-    nki        ``trnsolver.eigh(..., method="jacobi")`` (the NKI kernel).
+    cpu        batched ``torch.linalg.eigh`` on host FP32 input (LAPACK).
+    torch      the torch Jacobi of ``trnsolver/_jacobi.py`` on the ``neuron``
+               device: eager aten ops, ``torch.bmm`` for the updates, no
+               custom kernel.
+    compiled   the same step under ``torch.compile(backend="neuron",
+               dynamic=False)``: one graph per step.
+    nki        ``trnsolver.eigh(A.to("neuron"), method="jacobi")``: the
+               SBUF-resident one-sided Jacobi kernel.
 
 Accuracy is against float64 LAPACK: ``eig_err = max|w - w64| / max|w64|``,
 ``res = max_b ||A V - V diag(w)||_F / ||A||_F``, ``orth = max|V^T V - I|``.
-Timings are warm medians including host->device input copy and
-device->host output copy, with ``torch_neuronx.synchronize()``.
+Timings are warm medians from host input to host output (copies
+included), synchronised with ``torch_neuronx.synchronize()``. The ``torch``
+and ``compiled`` modes first measure the sweeps to reach off(A) < tol and
+then time that fixed count.
 
 Pin the host threads for the CPU baseline, e.g.
     OMP_NUM_THREADS=2 taskset -c 10,11 python scripts/bench_jacobi.py --threads 2
@@ -59,9 +64,52 @@ def _time(fn, reps, sync):
     return statistics.median(ts)
 
 
+def _run_cpu(A, reps):
+    out = torch.linalg.eigh(A)
+    return out, _time(lambda: torch.linalg.eigh(A), reps, lambda: None), 0
+
+
+def _run_torch(A, step, dev, sync, reps, tol, max_sweeps, label):
+    from trnsolver import _jacobi as J
+
+    B, n = A.shape[0], A.shape[-1]
+    Ak = A.to(dev)
+    Wk = torch.eye(n, device=dev).expand(B, n, n).contiguous()
+    offs = []
+    sweeps = max_sweeps
+    for k in range(1, max_sweeps + 1):
+        Ak, Wk = J.jacobi_sweeps_torch(Ak, Wk, 1, step=step)
+        offs.append(float(J.off_norm(Ak).max()))
+        if offs[-1] < tol:
+            sweeps = k
+            break
+    print(f"SWEEPS mode={label} n={n} B={B} off=" + ",".join(f"{o:.1e}" for o in offs), flush=True)
+
+    def run():
+        Ad = A.to(dev)
+        W = torch.eye(n, device=dev).expand(B, n, n).contiguous()
+        Af, Wf = J.jacobi_sweeps_torch(Ad, W, sweeps, step=step)
+        return J.finish(Af.cpu(), Wf.cpu(), n)
+
+    out = run()
+    return out, _time(run, reps, sync), sweeps
+
+
+def _run_nki(A, dev, sync, reps):
+    import trnsolver
+    from trnsolver.nki import jacobi as JK
+
+    def run():
+        w, V = trnsolver.eigh(A.to(dev), method="jacobi")
+        return w.cpu(), V.cpu()
+
+    out = run()
+    return out, _time(run, reps, sync), JK.last_sweeps
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--modes", default="cpu,torch")
+    ap.add_argument("--modes", default="cpu,nki")
     ap.add_argument("--n", default="32,64,128")
     ap.add_argument("--B", default="16,64,256,1024")
     ap.add_argument("--threads", type=int, default=2)
@@ -89,54 +137,21 @@ def main():
             A = A64.float()
             for mode in modes:
                 if mode == "cpu":
-                    out = torch.linalg.eigh(A)
-                    t = _time(lambda: torch.linalg.eigh(A), args.reps, lambda: None)
-                    sweeps = 0
-                elif mode in ("torch", "compiled"):
-                    step = J.jacobi_step
-                    if mode == "compiled":
-                        if compiled_step is None:
-                            compiled_step = torch.compile(
-                                J.jacobi_step, backend="neuron", dynamic=False
-                            )
-                        step = compiled_step
-                    Ad = A.to(dev)
-                    W0 = torch.eye(n, device=dev).expand(B, n, n).contiguous()
-                    # Sweeps to converge: check off(A) after every sweep.
-                    Ak, Wk = Ad, W0
-                    offs = []
-                    sweeps = args.max_sweeps
-                    for k in range(1, args.max_sweeps + 1):
-                        Ak, Wk = J.jacobi_sweeps_torch(Ak, Wk, 1, step=step)
-                        offs.append(float(J.off_norm(Ak).max()))
-                        if offs[-1] < args.tol:
-                            sweeps = k
-                            break
-                    print(
-                        f"SWEEPS mode={mode} n={n} B={B} off=" + ",".join(f"{o:.1e}" for o in offs),
-                        flush=True,
+                    out, t, sweeps = _run_cpu(A, args.reps)
+                elif mode == "torch":
+                    out, t, sweeps = _run_torch(
+                        A, J.jacobi_step, dev, sync, args.reps, args.tol, args.max_sweeps, mode
                     )
-
-                    def run(sweeps=sweeps, step=step):
-                        Ad = A.to(dev)
-                        W = torch.eye(n, device=dev).expand(B, n, n).contiguous()
-                        Af, Wf = J.jacobi_sweeps_torch(Ad, W, sweeps, step=step)
-                        return J.finish(Af.cpu(), Wf.cpu(), n)
-
-                    out = run()
-                    t = _time(run, args.reps, sync)
+                elif mode == "compiled":
+                    if compiled_step is None:
+                        compiled_step = torch.compile(
+                            J.jacobi_step, backend="neuron", dynamic=False
+                        )
+                    out, t, sweeps = _run_torch(
+                        A, compiled_step, dev, sync, args.reps, args.tol, args.max_sweeps, mode
+                    )
                 elif mode == "nki":
-                    import trnsolver
-
-                    def run():
-                        return trnsolver.eigh(A.to(dev), method="jacobi")
-
-                    out = run()
-                    sync()
-                    t = _time(lambda: [x.cpu() for x in run()], args.reps, sync)
-                    from trnsolver.nki import jacobi as _jk
-
-                    sweeps = _jk.last_sweeps
+                    out, t, sweeps = _run_nki(A, dev, sync, args.reps)
                 else:
                     raise ValueError(mode)
                 eig, res, orth = _acc(A64, *out)
