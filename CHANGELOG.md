@@ -59,6 +59,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   like the other kernels, with no `torch_xla` import; the XLA path is
   unchanged. (#42)
 
+- **Batched small `eigh` on device (#48).** `trnsolver.eigh` accepts a
+  (..., n, n) batch. The dispatch policy is unchanged and applies to the
+  whole batch: on `neuron`, n < `TRNSOLVER_EIGH_NKI_MIN_N` uses aten, and a
+  batch of one matrix takes the single-matrix path as before. With
+  `TRNSOLVER_EIGH_TRIDIAG=device` and 2 <= n <= 128 the NKI path runs the
+  batch through four batched kernels (`trnsolver/nki/batched.py`):
+  Householder reduction, reflector application, Rayleigh-Ritz projection
+  H = V^T A V and rotation V Q. Each is one launch per chunk of up to
+  `TRNSOLVER_EIGH_BATCH_CHUNK` matrices (default 16, a power of two), so B
+  matrices cost 4 * ceil(B / 16) launches instead of 5 * B. Inside a chunk
+  the matrices are reduced in lockstep, one Householder step for each matrix
+  in turn, so the scheduler can overlap their dependency chains, and the step
+  masks are shared. A short tail chunk is padded with identity matrices to
+  the next power of two, so each n compiles at most five kernel shapes. The
+  host stages run once over the whole batch: a loop of
+  `scipy.linalg.eigh_tridiagonal` for the tridiagonal solves (about 2x
+  faster than one batched float64 dense `torch.linalg.eigh` at n = 64..128)
+  and one batched `torch.linalg.eigh(H)`. Without the device reduction a
+  batch loops over the single-matrix NKI path. On TorchNeuron the kernels
+  are the custom ops `trnsolver::householder_tridiag_batched`,
+  `apply_reflectors_batched`, `rr_project_batched` and `rr_rotate_batched`.
+  CPU simulator: matches `torch.linalg.eigh` for B in {1, 2, 7, 16} and
+  n in {8, 64, 128}; the MLIR verifier passes for all four kernels on trn1
+  and trn2. `scripts/bench_batched_eigh.py` compares the batched path, B
+  per-matrix calls, batched CPU `torch.linalg.eigh` and aten on `neuron`
+  for B = 1..1024 and n = 32..128. On-device timings are not in yet.
+
 ### Changed
 
 - **NKI `eigh` stage 2 is one LAPACK call (#42).** The host eigensolve of the
