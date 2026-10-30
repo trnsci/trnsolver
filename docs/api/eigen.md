@@ -7,7 +7,8 @@ Symmetric eigendecomposition `A = V Λ Vᵀ` for real symmetric `A`. Returns `(e
 `method=None` reads `TRNSOLVER_EIGH_METHOD` (default `auto`).
 
 - `auto`: on the native `neuron` device, n < `TRNSOLVER_EIGH_NKI_MIN_N` (default 512) uses `torch.linalg.eigh`; otherwise the NKI path (Householder tridiagonalization, host QR iteration). Off-device, `torch.linalg.eigh`.
-- `jacobi` (#48): batched Jacobi for `(n, n)` or `(..., n, n)` input. On the native `neuron` device (FP32, n ≤ 128) it runs the SBUF-resident one-sided Jacobi kernel: one launch per sweep, each holding up to 128 tiles of 128 / n matrices (512 at n = 32) in SBUF. Elsewhere it runs a torch implementation (two-sided Jacobi as batched matmuls). Uses the lower triangle, like `torch.linalg.eigh`.
+- `jacobi` (#48): batched Jacobi for `(n, n)` or `(..., n, n)` input. On the native `neuron` device (FP32, n ≤ 128) it runs the SBUF-resident one-sided Jacobi kernel: one launch per sweep, each holding up to 128 tiles of 128 / n matrices (512 at n = 32) in SBUF. Elsewhere it runs a torch implementation (two-sided Jacobi as batched matmuls). Uses the lower triangle, like `torch.linalg.eigh`. For 33 ≤ n ≤ 128 the kernel is block Jacobi: per step the Tensor Engine forms each matrix's Gram matrix and applies one orthogonal matmul per block pair, and the Vector Engine only rotates the 16 × 16 pair Gram blocks.
+- `auto` also runs the Jacobi kernel for FP32 batches on the native `neuron` device inside a measured region (n ≤ 32 with B ≥ 512, 33 ≤ n ≤ 64 with B ≥ 256, 65 ≤ n ≤ 128 with B ≥ 1024, plus B ≥ 256 for n ≥ 96 and B ≥ 64 at n = 128), where it beats the aten cutover. `TRNSOLVER_EIGH_JACOBI_AUTO` overrides the region.
 
 ```python
 eigenvalues, eigenvectors = trnsolver.eigh(A)

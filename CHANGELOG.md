@@ -15,9 +15,27 @@ Headline performance: batched Jacobi `eigh(A, method="jacobi")` kernel on Trn2, 
 
 ### Added
 
+- **Block Jacobi kernel for 33 <= n <= 128 (#48).** `eigh(method="jacobi")`
+  on the native `neuron` device now runs `jacobi_block_kernel` (native op
+  `trnsolver::jacobi_block`) for padded sizes 64 and 128. Columns form
+  blocks of 8; per step, per tile, the Tensor Engine transposes Z^T, forms
+  the Gram matrix, compacts each block pair's 16 x 16 Gram block, transposes
+  the accumulated rotations into the circle-method block shuffle and applies
+  them to [Z^T | V^T] as one matmul. The Vector Engine runs one-sided Jacobi
+  on the 16 x 16 Gram blocks only (full round robin on a sweep's first step,
+  the 8 cross-pair steps after that). Trn2, B = 1024, end to end: n = 64
+  194 -> 75 ms, n = 128 1350 -> 321 ms (CPU LAPACK, 2 threads: 163 / 668 ms).
+  `TRNSOLVER_JACOBI_BLOCK=0` restores the scalar kernel.
+- **`eigh(method="auto")` picks the Jacobi kernel in a measured region
+  (#48).** FP32 batches on the native `neuron` device with (n, B) in
+  `eigen._JACOBI_AUTO_REGION` (n <= 32 with B >= 512, 33 <= n <= 64 with
+  B >= 256, 65 <= n <= 128 with B >= 1024, n >= 96 with B >= 256, n = 128
+  with B >= 64), where it beats the default aten cutover. Outside it the
+  cutover is unchanged. `TRNSOLVER_EIGH_JACOBI_AUTO=off|n_min-n_max:B_min,...`
+  overrides it.
 - **`eigh(A, method="jacobi")`: batched Jacobi eigensolver (#48).** Accepts
   `(n, n)` or `(..., n, n)`; `TRNSOLVER_EIGH_METHOD=jacobi` selects it when
-  `method` is not given. Opt-in: the default `auto` dispatch, including the
+  `method` is not given. Opt-in when added: the default `auto` dispatch, including the
   aten cutover for n < 512, is unchanged.
   - On the native `neuron` device (FP32, n <= 128) it runs the one-sided
     (Hestenes) Jacobi kernel in `trnsolver/nki/jacobi.py`: up to 128 tiles
@@ -72,6 +90,11 @@ Headline performance: batched Jacobi `eigh(A, method="jacobi")` kernel on Trn2, 
 
 ### Changed
 
+- Jacobi device driver: eigenvectors are returned with unit columns and the
+  eigenvalues as Rayleigh quotients `v.z / v.v - sigma`; eigenvectors are
+  reordered with one row `index_select` instead of `torch.gather` (102 ms ->
+  2 ms on device at B = 1024, n = 128). The scalar kernel's partner
+  permutation matmuls set `is_stationary_onezero`.
 - **Householder tridiagonalization keeps its scalar work on the host.**
   `_householder_tridiag` reads column k of the working matrix once per step
   and computes the norm, sign, `v`, `v·v`, `v·w` and `u` on CPU copies; only

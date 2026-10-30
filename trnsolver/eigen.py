@@ -54,7 +54,10 @@ def eigh(
     ``trnsolver/nki/jacobi.py`` (one launch per sweep per group of up to
     128 tiles of 128 / n matrices); elsewhere it is the torch implementation in
     ``trnsolver/_jacobi.py`` (batched matmuls, any device). It does not
-    change the default ``auto`` dispatch below.
+    change the default ``auto`` dispatch below, except in the measured
+    region of ``_JACOBI_AUTO_REGION``: FP32 batches on the native ``neuron``
+    device where the Jacobi kernel beats the aten cutover (see
+    :func:`_jacobi_auto`; ``TRNSOLVER_EIGH_JACOBI_AUTO`` overrides it).
 
     The NKI path (Householder tridiagonalization + implicit-shift QR) is
     eager-only: deflation and shift selection are data-dependent Python
@@ -71,7 +74,8 @@ def eigh(
     n=128, against about 1 ms for aten at every measured size. Setting
     ``TRNSOLVER_REQUIRE_NKI=1`` disables the cutover so the kernels still run.
     """
-    if _eigh_method(method) == "jacobi":
+    resolved = _eigh_method(method)
+    if resolved == "jacobi" or (resolved == "auto" and _jacobi_auto(A)):
         return _jacobi_eigh(A)
     A, orig = _to_fp32(A)
     if _use_nki() and _eigh_aten_cutover(A):
@@ -268,6 +272,76 @@ def _eigh_method(method: str | None) -> str:
     if method not in _EIGH_METHODS:
         raise ValueError(f"eigh method must be one of {_EIGH_METHODS}; got {method!r}")
     return method
+
+
+# method="auto" -> Jacobi kernel (#48): rows (n_min, n_max, B_min) of the
+# measured region where the kernel beats the default aten cutover on the
+# native neuron device, FP32. A row matches when n_min <= n <= n_max and the
+# batch has at least B_min matrices. Measured on Trn2, one logical
+# NeuronCore, end to end from host input to host output, warm medians in ms
+# (kernel / aten cutover; full table on #48):
+#
+#   n \ B     64            256           1024
+#   32        9.3 / 4.5     12.1 / 16.0   28.3 / 78.3
+#   40        11.0 / 6.5    20.5 / 26.9   73.2 / 99.0
+#   64        11.0 / 11.7   22.1 / 47.9   75.2 / 198
+#   80        27.1 / 19.3   77.9 / 74.6   291 / 361
+#   96        28.1 / 30.3   76.8 / 94.5   301 / 442
+#   128       27.1 / 50.5   79.0 / 207    321 / 904
+#
+# The kernel's cost follows the padded size (32, 64 or 128), aten's follows
+# n, so each row starts where the kernel's padding stops costing more than
+# it saves. n <= 32 keeps the B >= 512 threshold of #50 (B = 256 wins at
+# n = 32 by 1.3x, but smaller n pad less favourably and were not measured).
+# Outside these rows the default cutover is unchanged.
+_JACOBI_AUTO_REGION: tuple[tuple[int, int, int], ...] = (
+    (1, 32, 512),
+    (33, 64, 256),
+    (65, 128, 1024),
+    (96, 128, 256),
+    (128, 128, 64),
+)
+
+
+def _jacobi_auto_region() -> tuple[tuple[int, int, int], ...]:
+    """The auto region, or ``TRNSOLVER_EIGH_JACOBI_AUTO`` if set.
+
+    The override is ``off`` (never) or comma-separated ``n_min-n_max:B_min``
+    rows, e.g. ``1-32:256,33-64:1024``. Unparseable values fall back to the
+    table.
+    """
+    raw = os.environ.get("TRNSOLVER_EIGH_JACOBI_AUTO", "").strip().lower()
+    if not raw:
+        return _JACOBI_AUTO_REGION
+    if raw in ("off", "0", "none", "false"):
+        return ()
+    rows = []
+    try:
+        for item in raw.split(","):
+            span, b_min = item.split(":")
+            n_min, n_max = span.split("-")
+            rows.append((int(n_min), int(n_max), int(b_min)))
+    except ValueError:
+        return _JACOBI_AUTO_REGION
+    return tuple(rows)
+
+
+def _jacobi_auto(A: torch.Tensor) -> bool:
+    """True iff ``method="auto"`` should run the Jacobi kernel for A.
+
+    Only FP32 batches on the native ``neuron`` device whose (n, batch) lies
+    in `_jacobi_auto_region`, and only where the kernel can run.
+    """
+    if A.device.type != _NATIVE_DEVICE_TYPE or A.dtype != torch.float32:
+        return False
+    if A.dim() < 3 or A.shape[-1] != A.shape[-2]:
+        return False
+    n = A.shape[-1]
+    batch = A.numel() // max(n * n, 1)
+    region = _jacobi_auto_region()
+    if not any(lo <= n <= hi and batch >= b_min for lo, hi, b_min in region):
+        return False
+    return _jacobi_device_ok(n, A.dtype)
 
 
 def _jacobi_device_ok(n: int, dtype: torch.dtype) -> bool:

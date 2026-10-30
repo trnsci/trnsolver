@@ -45,6 +45,21 @@ fastest of four: two-sided Jacobi with block-diagonal 128x128 tiles,
 two-sided compact with Tensor Engine quadrant tiling, one-sided with
 per-tile update matmuls, and this one (see #48 for the table).
 
+Block Jacobi (`jacobi_block_kernel`, padded n = 64 and 128). The scalar
+step above is Vector Engine bound for n >= 64 (Trn2 profile, one sweep:
+Vector Engine 90-94% active, Tensor Engine about 50%, DMA under 10%), since
+every step rotates rows of width 2 n. The block kernel splits the columns
+into blocks of 8 and pairs blocks with a circle-method block shuffle. Per
+step the Tensor Engine forms each matrix's Gram matrix Z^T Z, compacts the
+16 x 16 Gram block of every block pair, and applies the pair rotations as
+one orthogonal matmul on [Z^T | V^T]; the Vector Engine runs one-sided
+Jacobi on the 16 x 16 Gram blocks only, so its rows are 32 wide instead of
+2 n. A sweep's first step runs the full round robin inside each pair (which
+also covers the pairs within a block), later steps only the 8 cross-pair
+steps, so a sweep is n - 1 Vector Engine steps as before but on narrow rows.
+The profile becomes Vector 72-74%, Tensor 61-67%, Scalar 57-63% active, and
+a sweep costs 2.7x (n = 64) and 4.7x (n = 128) less (see #48).
+
 NKI 0.7 rules (checked by the MLIR verifier in tests/test_jacobi.py):
 every SBUF tile spans partitions 0..P-1; the (P, G) column math is
 float-only and divide-free (``rsqrt`` arguments clamped to its table range
@@ -77,6 +92,17 @@ _CHAINS_MAX = {2: 8, 4: 8, 8: 8, 16: 8, 32: 8, 64: 4, 128: 2}
 _SWEEPS0 = {2: 3, 4: 5, 8: 6, 16: 6, 32: 7, 64: 7, 128: 8}
 _TOL = 1e-6
 _MAX_SWEEPS = 15
+
+# Block Jacobi (`jacobi_block_kernel`) for these padded sizes: block size
+# (a pair spans S = 2 * block columns), tiles per launch, chains and the
+# sweeps before the first check. ``TRNSOLVER_JACOBI_BLOCK=0`` turns it off.
+_BLOCK = {64: 8, 128: 8}
+_BLOCK_GROUP_MAX = {64: 128, 128: 128}
+_BLOCK_CHAINS_MAX = {64: 2, 128: 2}
+_BLOCK_SWEEPS0 = {64: 7, 128: 8}
+_INNER_SWEEPS = 1
+# Tell the Tensor Engine the step permutation is 0/1 (half the FP32 passes).
+_ONEZERO = os.environ.get("TRNSOLVER_JACOBI_ONEZERO", "1").strip() != "0"
 
 # Sweep count of the last `jacobi_eigh_device` call (benchmarks report it).
 last_sweeps = 0
@@ -133,6 +159,68 @@ def jacobi_constants(n: int) -> torch.Tensor:
     return torch.cat([sig, Q], dim=1).contiguous()
 
 
+def circle_block_perm(nb: int) -> list[int]:
+    """Block shuffle of the block sweep: ``perm[new] = old`` position.
+
+    Positions ``(2t, 2t + 1)`` form pair t. Position 0 stays; the other
+    nb - 1 move one place round the circle-method ring (top row left to
+    right, bottom row right to left), so nb - 1 steps meet every pair of
+    blocks once and the shuffle has order nb - 1.
+    """
+    if nb < 2 or nb % 2:
+        raise ValueError(f"circle_block_perm needs an even nb >= 2, got {nb}")
+    k = nb // 2
+    ring = [2 * t for t in range(1, k)] + [2 * t + 1 for t in reversed(range(k))]
+    perm = list(range(nb))
+    for i, p in enumerate(ring):
+        perm[ring[(i + 1) % len(ring)]] = p
+    return perm
+
+
+@functools.lru_cache(maxsize=16)
+def block_constants(n: int, bs: int) -> torch.Tensor:
+    """(P, 4 P + 2 S) FP32 for `jacobi_block_kernel`, S = 2 bs.
+
+    ``[sig | Q | mask | R | Pi_blk | sig_x | Q_x]``: the inner round robin
+    of `jacobi_constants` at width S; ``mask[i, j] = 1`` when rows i and j
+    are in the same pair (superblock); ``R[i, j] = (i mod S == j)``, the
+    compact identity; ``Pi_blk[old(a), a] = 1`` the block shuffle of
+    `circle_block_perm`, per matrix; and the cross schedule, whose step r
+    (of bs) pairs local index i < bs with ``bs + (i + r) mod bs``:
+    ``Q_x[i, j] = r`` for those partners, -1 elsewhere, and ``sig_x`` +1 on
+    the first block of each pair.
+    """
+    ne, b, P = block_layout(n)
+    S = 2 * bs
+    if ne % S or ne // bs < 2:
+        raise ValueError(f"block size {bs} does not tile ne={ne}")
+    inner = jacobi_constants(S)
+    idx = torch.arange(P)
+    mask = (idx[:, None] // S == idx[None, :] // S).float()
+    R = (idx[:, None] % S == torch.arange(S)[None, :]).float()
+    perm = circle_block_perm(ne // bs)
+    pi = torch.zeros((P, P))
+    for a in range(P):
+        mat, col = divmod(a, ne)
+        old = perm[col // bs] * bs + col % bs
+        pi[mat * ne + old, a] = 1.0
+    # Cross steps: step r pairs i < bs with bs + (i + r) mod bs in each pair.
+    loc = idx % S
+    qc = torch.full((P, P), -1.0)
+    for r in range(bs):
+        p_loc = torch.where(loc < bs, bs + (loc + r) % bs, (loc - bs - r) % bs)
+        qc[idx, idx - loc + p_loc] = float(r)
+    sigc = torch.where(loc < bs, 1.0, -1.0).unsqueeze(1)
+    return torch.cat([inner, mask, R, pi, sigc, qc], dim=1).contiguous()
+
+
+def _use_block(ne: int) -> bool:
+    """True iff padded size ``ne`` runs the block kernel."""
+    if ne not in _BLOCK:
+        return False
+    return os.environ.get("TRNSOLVER_JACOBI_BLOCK", "1").strip() != "0"
+
+
 def pack_compact(X: torch.Tensor, n: int) -> torch.Tensor:
     """(B, n, n) -> (T, P, ne): zero-pad n to ne, pad B with identities."""
     ne, b, P = block_layout(n)
@@ -157,6 +245,204 @@ if HAS_NKI:
     import nki.isa as nisa
     import nki.language as nl
 
+    def _step(X, g0, g1, w, pibd, sig, per_tile, onezero, delta=True):
+        """One round-robin step on tiles g0..g1-1 of the state X (one chain).
+
+        X is (P, G, 2 w) FP32 in SBUF: per tile, ``[Y^T | U^T]`` for the
+        compact w-blocks (``Y`` the columns being orthogonalised, ``U`` the
+        accumulated rotations). ``pibd`` is the (P, P) block-diagonal step
+        permutation, ``sig`` the (P, 1) canonical orientation.
+        ``onezero`` tells the Tensor Engine that ``pibd`` is 0/1 (half the
+        passes for an FP32 stationary). ``delta=False`` applies the rotation
+        as ``c o X - s o M`` (three Vector Engine passes instead of four); a
+        rounded c only scales the pair's two rows by the same factor, so it
+        suits the block kernel, whose driver renormalises the columns.
+        """
+        P = X.shape[0]
+        f32 = nl.float32
+        mul = nl.multiply
+        add = nl.add
+        sub = nl.subtract
+        ng = g1 - g0
+        Xc = X[0:P, g0:g1, 0 : 2 * w]
+        Zc = X[0:P, g0:g1, 0:w]
+        per_chunk = max(1, 512 // (2 * w))
+
+        def col():
+            return nl.ndarray((P, ng), dtype=f32, buffer=nl.sbuf)
+
+        def bcast_last(t, size):
+            return t.expand_dim(2).broadcast(2, size)
+
+        # Partner rows: ps_m[p, g, :] = X[partner(p), g, :] (a permutation).
+        # Each matmul writes a whole 2 KiB PSUM bank (512 FP32 columns) or
+        # the bank-aligned tail, never a sub-bank column slice next to
+        # another matmul's output (the accumulate=False slice hazard).
+        ps_m = nl.ndarray((P, ng, 2 * w), dtype=f32, buffer=nl.psum)
+        for c0 in range(0, ng, per_chunk):
+            c1 = min(ng, c0 + per_chunk)
+            nisa.nc_matmul(
+                dst=ps_m[0:P, c0:c1, 0 : 2 * w],
+                stationary=pibd,
+                moving=X[0:P, g0 + c0 : g0 + c1, 0 : 2 * w],
+                is_stationary_onezero=onezero,
+                accumulate=False,
+            )
+        mz = ps_m[0:P, 0:ng, 0:w]
+
+        # Gram entries g_pp = |z_p|^2, g_pq = z_p . z_q, g_qq = g_pp[partner].
+        gpp = col()
+        gpq = col()
+        if per_tile:
+            # Large blocks: fused multiply + free-axis reduce per tile
+            # (one Vector Engine pass instead of two).
+            for j in range(ng):
+                junk = nl.ndarray((P, w), dtype=f32, buffer=nl.sbuf)
+                nisa.scalar_tensor_tensor(
+                    dst=junk,
+                    data=Zc[0:P, j, 0:w],
+                    op0=mul,
+                    operand0=1.0,
+                    op1=mul,
+                    operand1=Zc[0:P, j, 0:w],
+                    reduce_op=add,
+                    reduce_res=gpp[0:P, j : j + 1],
+                )
+                junk2 = nl.ndarray((P, w), dtype=f32, buffer=nl.sbuf)
+                nisa.scalar_tensor_tensor(
+                    dst=junk2,
+                    data=Zc[0:P, j, 0:w],
+                    op0=mul,
+                    operand0=1.0,
+                    op1=mul,
+                    operand1=mz[0:P, j, 0:w],
+                    reduce_op=add,
+                    reduce_res=gpq[0:P, j : j + 1],
+                )
+        else:
+            # Small blocks: one instruction over all tiles (many tiles).
+            pr = nl.ndarray((P, ng, w), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=pr, data1=Zc, data2=Zc, op=mul)
+            nisa.tensor_reduce(dst=gpp, op=add, data=pr, axis=2)
+            pr2 = nl.ndarray((P, ng, w), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=pr2, data1=mz, data2=Zc, op=mul)
+            nisa.tensor_reduce(dst=gpq, op=add, data=pr2, axis=2)
+        ps_q = nl.ndarray((P, ng), dtype=f32, buffer=nl.psum)
+        nisa.nc_matmul(
+            dst=ps_q, stationary=pibd, moving=gpp, is_stationary_onezero=onezero, accumulate=False
+        )
+
+        # (c, s, c - 1) per row; see trnsolver/_jacobi.rotation_csk.
+        h = col()
+        nisa.tensor_tensor(dst=h, data1=ps_q, data2=gpp, op=sub)
+        gs = col()
+        nisa.tensor_scalar(dst=gs, data=gpq, op0=mul, operand0=2.0)
+
+        # (Placing this SBUF-only chain on the GpSimd engine failed at
+        # run time on Trn2; it stays on the engines the compiler picks.)
+        def ts(dst, data, op0, operand0, op1=None, operand1=None):
+            nisa.tensor_scalar(
+                dst=dst, data=data, op0=op0, operand0=operand0, op1=op1, operand1=operand1
+            )
+
+        def tt(dst, a, b_, op):
+            nisa.tensor_tensor(dst=dst, data1=a, data2=b_, op=op)
+
+        hs = col()
+        ts(hs, h, mul, sig)
+        pos2 = col()
+        ts(pos2, hs, nl.greater_equal, 0.0, mul, 2.0)
+        sg = col()
+        ts(sg, pos2, sub, 1.0, mul, sig)
+        hh = col()
+        tt(hh, h, h, mul)
+        xx = col()
+        tt(xx, gs, gs, mul)
+        tt(xx, xx, hh, add)
+        ts(xx, xx, nl.maximum, _TINY)
+        rr = col()
+        # sqrt(x) as x * rsqrt(x): the Scalar Engine keeps one table loaded.
+        nisa.activation(dst=rr, op=nl.rsqrt, data=xx)
+        tt(rr, rr, xx, mul)
+        den = col()
+        # |h| = max(-h, h)  (abs_max is NeuronCore-v4+ only)
+        ts(den, h, mul, -1.0)
+        tt(den, den, h, nl.maximum)
+        tt(den, den, rr, add)
+        ts(den, den, nl.maximum, _TINY)
+        u = col()
+        # 1 / den = rsqrt(den)^2 (rsqrt is accurate; reciprocal is ~1e-3).
+        nisa.activation(dst=u, op=nl.rsqrt, data=den)
+        t = col()
+        tt(t, gs, u, mul)
+        tt(t, t, u, mul)
+        tt(t, t, sg, mul)
+        t2 = col()
+        tt(t2, t, t, mul)
+        c = col()
+        nisa.activation(dst=c, op=nl.rsqrt, data=t2, bias=1.0)
+        negs = col()
+        ts(negs, t, mul, -1.0)
+        tt(negs, negs, c, mul)
+        w_ = col()
+        nisa.activation(dst=w_, op=nl.rsqrt, data=c, bias=1.0)
+        tt(w_, w_, w_, mul)
+        km1 = col()
+        tt(km1, negs, negs, mul)
+        ts(km1, km1, mul, -1.0)
+        tt(km1, km1, w_, mul)
+
+        # Rotation on the Vector Engine, in the X + K^T X form:
+        #   (K^T X)[p, :] = (c - 1)_p X[p, :] - s_p X[partner(p), :]
+        # (s_partner(p) = -s_p exactly), with X[partner(p), :] = ps_m.
+        # (Folding both terms into PSUM with an identity matmul was
+        # measured slower on Trn2: the Vector Engine work only moves.)
+        t1 = nl.ndarray((P, ng, 2 * w), dtype=f32, buffer=nl.sbuf)
+        if per_tile:
+            # -s o M on the Scalar Engine, (c - 1) o X + that on the Vector
+            # Engine, per tile (per-partition scalars, one pass each).
+            for j in range(ng):
+                nisa.activation(
+                    dst=t1[0:P, j, 0 : 2 * w],
+                    op=nl.copy,
+                    data=ps_m[0:P, j, 0 : 2 * w],
+                    scale=negs[0:P, j : j + 1],
+                )
+                nisa.scalar_tensor_tensor(
+                    dst=t1[0:P, j, 0 : 2 * w],
+                    data=Xc[0:P, j, 0 : 2 * w],
+                    op0=mul,
+                    operand0=km1[0:P, j : j + 1],
+                    op1=add,
+                    operand1=t1[0:P, j, 0 : 2 * w],
+                )
+        elif not delta:
+            cc = col()
+            ts(cc, km1, add, 1.0)
+            nisa.tensor_tensor(dst=t1, data1=ps_m, data2=bcast_last(negs, 2 * w), op=mul)
+            t2x = nl.ndarray((P, ng, 2 * w), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=t2x, data1=Xc, data2=bcast_last(cc, 2 * w), op=mul)
+            nisa.tensor_tensor(dst=Xc, data1=t1, data2=t2x, op=add)
+            return
+        else:
+            nisa.tensor_tensor(dst=t1, data1=ps_m, data2=bcast_last(negs, 2 * w), op=mul)
+            t2x = nl.ndarray((P, ng, 2 * w), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=t2x, data1=Xc, data2=bcast_last(km1, 2 * w), op=mul)
+            nisa.tensor_tensor(dst=t1, data1=t1, data2=t2x, op=add)
+        nisa.tensor_tensor(dst=Xc, data1=Xc, data2=t1, op=add)
+
+    def _split_programs(G):
+        """(tiles per program, first tile) for the SPMD programs (LNC=2 cores).
+
+        Program k owns tiles [k * G / nprog, (k + 1) * G / nprog). A group too
+        small to split runs whole on every program (identical results,
+        identical writes).
+        """
+        nprog = int(nl.num_programs(0)) if nl.program_ndim() > 0 else 1
+        if nprog > 1 and G % nprog == 0:
+            return G // nprog, nl.program_id(0) * (G // nprog)
+        return G, 0
+
     @nki.jit
     def jacobi_sweeps_kernel(Z, V, consts, sched):
         """Run ``sched.shape[0]`` one-sided Jacobi sweeps on G compact tiles.
@@ -170,16 +456,12 @@ if HAS_NKI:
         Returns:
             out : (2, G, P, ne) FP32: Z^T and V^T after the sweeps.
         """
-        G = Z.shape[0]
         P = Z.shape[1]
         ne = Z.shape[2]
         sweeps = sched.shape[0]
         nchain = sched.shape[2] if len(sched.shape) > 2 else 1
         m = ne - 1
         f32 = nl.float32
-        mul = nl.multiply
-        add = nl.add
-        sub = nl.subtract
 
         out = nl.ndarray((2, Z.shape[0], P, ne), dtype=Z.dtype, buffer=nl.shared_hbm)
 
@@ -188,184 +470,16 @@ if HAS_NKI:
         qfull = nl.ndarray((P, P), dtype=f32, buffer=nl.sbuf)
         nisa.dma_copy(dst=qfull, src=consts[0:P, m : m + P])
 
-        # Split the tiles across the SPMD programs (the physical cores of a
-        # logical NeuronCore under LNC=2): program k owns tiles
-        # [k * G / nprog, (k + 1) * G / nprog). A group too small to split
-        # runs whole on every program (identical results, identical writes).
-        nprog = int(nl.num_programs(0)) if nl.program_ndim() > 0 else 1
-        if nprog > 1 and G % nprog == 0:
-            G = G // nprog
-            base = nl.program_id(0) * G
-        else:
-            base = 0
+        G, base = _split_programs(Z.shape[0])
 
         # Z^T and V^T of tile g side by side: X[:, g] = [Z^T_g | V^T_g].
         X = nl.ndarray((P, G, 2 * ne), dtype=f32, buffer=nl.sbuf)
         for gi in range(G):
             nisa.dma_copy(dst=X[0:P, gi, 0:ne], src=Z[base + gi, 0:P, 0:ne])
             nisa.dma_copy(dst=X[0:P, gi, ne : 2 * ne], src=V[base + gi, 0:P, 0:ne])
-        per_chunk = max(1, 512 // (2 * ne))
         # Per-tile instructions pay off once a tile row is long (ne >= 64);
         # below that the group has many tiles and batched instructions win.
         per_tile = ne >= 64
-
-        def step(g0, g1, pibd, sig):
-            """One step for tiles g0..g1-1 (one dependency chain)."""
-            ng = g1 - g0
-            Xc = X[0:P, g0:g1, 0 : 2 * ne]
-            Zc = X[0:P, g0:g1, 0:ne]
-
-            def col():
-                return nl.ndarray((P, ng), dtype=f32, buffer=nl.sbuf)
-
-            def bcast_last(t, size):
-                return t.expand_dim(2).broadcast(2, size)
-
-            # Partner rows: ps_m[p, g, :] = X[partner(p), g, :] (a permutation).
-            # Each matmul writes a whole 2 KiB PSUM bank (512 FP32 columns) or
-            # the bank-aligned tail, never a sub-bank column slice next to
-            # another matmul's output (the accumulate=False slice hazard).
-            ps_m = nl.ndarray((P, ng, 2 * ne), dtype=f32, buffer=nl.psum)
-            for c0 in range(0, ng, per_chunk):
-                c1 = min(ng, c0 + per_chunk)
-                nisa.nc_matmul(
-                    dst=ps_m[0:P, c0:c1, 0 : 2 * ne],
-                    stationary=pibd,
-                    moving=X[0:P, g0 + c0 : g0 + c1, 0 : 2 * ne],
-                    accumulate=False,
-                )
-            mz = ps_m[0:P, 0:ng, 0:ne]
-
-            # Gram entries g_pp = |z_p|^2, g_pq = z_p . z_q, g_qq = g_pp[partner].
-            gpp = col()
-            gpq = col()
-            if per_tile:
-                # Large blocks: fused multiply + free-axis reduce per tile
-                # (one Vector Engine pass instead of two).
-                for j in range(ng):
-                    junk = nl.ndarray((P, ne), dtype=f32, buffer=nl.sbuf)
-                    nisa.scalar_tensor_tensor(
-                        dst=junk,
-                        data=Zc[0:P, j, 0:ne],
-                        op0=mul,
-                        operand0=1.0,
-                        op1=mul,
-                        operand1=Zc[0:P, j, 0:ne],
-                        reduce_op=add,
-                        reduce_res=gpp[0:P, j : j + 1],
-                    )
-                    junk2 = nl.ndarray((P, ne), dtype=f32, buffer=nl.sbuf)
-                    nisa.scalar_tensor_tensor(
-                        dst=junk2,
-                        data=Zc[0:P, j, 0:ne],
-                        op0=mul,
-                        operand0=1.0,
-                        op1=mul,
-                        operand1=mz[0:P, j, 0:ne],
-                        reduce_op=add,
-                        reduce_res=gpq[0:P, j : j + 1],
-                    )
-            else:
-                # Small blocks: one instruction over all tiles (many tiles).
-                pr = nl.ndarray((P, ng, ne), dtype=f32, buffer=nl.sbuf)
-                nisa.tensor_tensor(dst=pr, data1=Zc, data2=Zc, op=mul)
-                nisa.tensor_reduce(dst=gpp, op=add, data=pr, axis=2)
-                pr2 = nl.ndarray((P, ng, ne), dtype=f32, buffer=nl.sbuf)
-                nisa.tensor_tensor(dst=pr2, data1=mz, data2=Zc, op=mul)
-                nisa.tensor_reduce(dst=gpq, op=add, data=pr2, axis=2)
-            ps_q = nl.ndarray((P, ng), dtype=f32, buffer=nl.psum)
-            nisa.nc_matmul(dst=ps_q, stationary=pibd, moving=gpp, accumulate=False)
-
-            # (c, s, c - 1) per row; see trnsolver/_jacobi.rotation_csk.
-            h = col()
-            nisa.tensor_tensor(dst=h, data1=ps_q, data2=gpp, op=sub)
-            gs = col()
-            nisa.tensor_scalar(dst=gs, data=gpq, op0=mul, operand0=2.0)
-
-            # (Placing this SBUF-only chain on the GpSimd engine failed at
-            # run time on Trn2; it stays on the engines the compiler picks.)
-            def ts(dst, data, op0, operand0, op1=None, operand1=None):
-                nisa.tensor_scalar(
-                    dst=dst, data=data, op0=op0, operand0=operand0, op1=op1, operand1=operand1
-                )
-
-            def tt(dst, a, b_, op):
-                nisa.tensor_tensor(dst=dst, data1=a, data2=b_, op=op)
-
-            hs = col()
-            ts(hs, h, mul, sig)
-            pos2 = col()
-            ts(pos2, hs, nl.greater_equal, 0.0, mul, 2.0)
-            sg = col()
-            ts(sg, pos2, sub, 1.0, mul, sig)
-            hh = col()
-            tt(hh, h, h, mul)
-            xx = col()
-            tt(xx, gs, gs, mul)
-            tt(xx, xx, hh, add)
-            ts(xx, xx, nl.maximum, _TINY)
-            rr = col()
-            # sqrt(x) as x * rsqrt(x): the Scalar Engine keeps one table loaded.
-            nisa.activation(dst=rr, op=nl.rsqrt, data=xx)
-            tt(rr, rr, xx, mul)
-            den = col()
-            # |h| = max(-h, h)  (abs_max is NeuronCore-v4+ only)
-            ts(den, h, mul, -1.0)
-            tt(den, den, h, nl.maximum)
-            tt(den, den, rr, add)
-            ts(den, den, nl.maximum, _TINY)
-            u = col()
-            # 1 / den = rsqrt(den)^2 (rsqrt is accurate; reciprocal is ~1e-3).
-            nisa.activation(dst=u, op=nl.rsqrt, data=den)
-            t = col()
-            tt(t, gs, u, mul)
-            tt(t, t, u, mul)
-            tt(t, t, sg, mul)
-            t2 = col()
-            tt(t2, t, t, mul)
-            c = col()
-            nisa.activation(dst=c, op=nl.rsqrt, data=t2, bias=1.0)
-            negs = col()
-            ts(negs, t, mul, -1.0)
-            tt(negs, negs, c, mul)
-            w_ = col()
-            nisa.activation(dst=w_, op=nl.rsqrt, data=c, bias=1.0)
-            tt(w_, w_, w_, mul)
-            km1 = col()
-            tt(km1, negs, negs, mul)
-            ts(km1, km1, mul, -1.0)
-            tt(km1, km1, w_, mul)
-
-            # Rotation on the Vector Engine, in the X + K^T X form:
-            #   (K^T X)[p, :] = (c - 1)_p X[p, :] - s_p X[partner(p), :]
-            # (s_partner(p) = -s_p exactly), with X[partner(p), :] = ps_m.
-            # (Folding both terms into PSUM with an identity matmul was
-            # measured slower on Trn2: the Vector Engine work only moves.)
-            t1 = nl.ndarray((P, ng, 2 * ne), dtype=f32, buffer=nl.sbuf)
-            if per_tile:
-                # -s o M on the Scalar Engine, (c - 1) o X + that on the Vector
-                # Engine, per tile (per-partition scalars, one pass each).
-                for j in range(ng):
-                    nisa.activation(
-                        dst=t1[0:P, j, 0 : 2 * ne],
-                        op=nl.copy,
-                        data=ps_m[0:P, j, 0 : 2 * ne],
-                        scale=negs[0:P, j : j + 1],
-                    )
-                    nisa.scalar_tensor_tensor(
-                        dst=t1[0:P, j, 0 : 2 * ne],
-                        data=Xc[0:P, j, 0 : 2 * ne],
-                        op0=mul,
-                        operand0=km1[0:P, j : j + 1],
-                        op1=add,
-                        operand1=t1[0:P, j, 0 : 2 * ne],
-                    )
-            else:
-                nisa.tensor_tensor(dst=t1, data1=ps_m, data2=bcast_last(negs, 2 * ne), op=mul)
-                t2x = nl.ndarray((P, ng, 2 * ne), dtype=f32, buffer=nl.sbuf)
-                nisa.tensor_tensor(dst=t2x, data1=Xc, data2=bcast_last(km1, 2 * ne), op=mul)
-                nisa.tensor_tensor(dst=t1, data1=t1, data2=t2x, op=add)
-            nisa.tensor_tensor(dst=Xc, data1=Xc, data2=t1, op=add)
 
         # Independent chains over disjoint tile ranges: one chain's (P, 1)
         # math overlaps the other's big Vector Engine and matmul work.
@@ -377,7 +491,164 @@ if HAS_NKI:
                 sig = sigt[0:P, r : r + 1]
                 for k in range(nchain):
                     if bounds[k + 1] > bounds[k]:
-                        step(bounds[k], bounds[k + 1], pibd, sig)
+                        _step(X, bounds[k], bounds[k + 1], ne, pibd, sig, per_tile, _ONEZERO)
+
+        for gi in range(G):
+            nisa.dma_copy(dst=out[0, base + gi, 0:P, 0:ne], src=X[0:P, gi, 0:ne])
+            nisa.dma_copy(dst=out[1, base + gi, 0:P, 0:ne], src=X[0:P, gi, ne : 2 * ne])
+        return out
+
+    @nki.jit
+    def jacobi_block_kernel(Z, V, consts, sched):
+        """One block one-sided Jacobi sweep on G compact tiles (n >= 64).
+
+        Args:
+            Z, V   : (G, P, ne) FP32 compact tiles of Z^T and V^T.
+            consts : from `block_constants`.
+            sched  : (inner_sweeps, S, chains) FP32, shape only: inner sweeps
+                     per block pair, pair width S = 2 * block size, chains.
+
+        Returns:
+            out : (2, G, P, ne) FP32: Z^T and V^T after the sweep.
+
+        The ne columns of each matrix form ne / (S / 2) blocks, and superblock
+        t (columns [t S, (t + 1) S)) pairs blocks 2t and 2t + 1. An outer
+        step, per tile:
+
+            Z      = (Z^T)^T                       [Tensor Engine transpose]
+            G      = Z^T Z,  masked to the S x S   [Tensor Engine]
+                     superblock diagonal
+            Gc     = G_masked R                    [Tensor Engine] compact
+                     (R stacks identities), so Gc holds each pair's S x S Gram
+            U      = one-sided Jacobi on Gc        [Vector Engine, `_step` at
+                     (inner_sweeps sweeps; the      width S on all tiles]
+                     sweep's first step runs the
+                     full round robin, the others
+                     only the cross pairs)
+            W      = U_blockdiag Pi_blk            [Tensor Engine transpose
+                                                    into the block shuffle]
+            X      = W^T X                         [Tensor Engine]
+
+        ``Pi_blk`` is the circle-method block shuffle: it moves the blocks so
+        that the next step pairs new partners, and it has order
+        ne / (S / 2) - 1, so after the sweep's last step every column is
+        back in place. The Vector Engine works on rows of width 2 S instead
+        of 2 ne, and the Tensor Engine carries the O(ne^2) update.
+        """
+        P = Z.shape[1]
+        ne = Z.shape[2]
+        s_in = sched.shape[0]
+        S = sched.shape[1]
+        nchain = sched.shape[2]
+        m = S - 1
+        nsteps = ne // (S // 2) - 1
+        if len(sched.shape) > 3:  # tests: a partial sweep
+            nsteps = sched.shape[3]
+        f32 = nl.float32
+        mul = nl.multiply
+
+        out = nl.ndarray((2, Z.shape[0], P, ne), dtype=Z.dtype, buffer=nl.shared_hbm)
+
+        # consts = [sig (m) | Q (P) | mask (P) | R (S) | Pi_blk (P) | sig_x (1) | Q_x (P)]
+        sigt = nl.ndarray((P, m), dtype=f32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=sigt, src=consts[0:P, 0:m])
+        qfull = nl.ndarray((P, P), dtype=f32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=qfull, src=consts[0:P, m : m + P])
+        mask = nl.ndarray((P, P), dtype=f32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=mask, src=consts[0:P, m + P : m + 2 * P])
+        rid = nl.ndarray((P, S), dtype=f32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=rid, src=consts[0:P, m + 2 * P : m + 2 * P + S])
+        pblk = nl.ndarray((P, P), dtype=f32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=pblk, src=consts[0:P, m + 2 * P + S : m + 3 * P + S])
+        c0 = m + 3 * P + S
+        sigx = nl.ndarray((P, 1), dtype=f32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=sigx, src=consts[0:P, c0 : c0 + 1])
+        qx = nl.ndarray((P, P), dtype=f32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=qx, src=consts[0:P, c0 + 1 : c0 + 1 + P])
+        # The inner step permutations, built once per launch: the m steps of
+        # the full round robin, then the bs cross steps.
+        bsz = S // 2
+        pib = nl.ndarray((P, m + bsz, P), dtype=f32, buffer=nl.sbuf)
+        for r in range(m):
+            nisa.tensor_scalar(
+                dst=pib[0:P, r, 0:P], data=qfull, op0=nl.equal, operand0=float((2 * r) % m)
+            )
+        for r in range(bsz):
+            nisa.tensor_scalar(dst=pib[0:P, m + r, 0:P], data=qx, op0=nl.equal, operand0=float(r))
+
+        G, base = _split_programs(Z.shape[0])
+
+        X = nl.ndarray((P, G, 2 * ne), dtype=f32, buffer=nl.sbuf)
+        for gi in range(G):
+            nisa.dma_copy(dst=X[0:P, gi, 0:ne], src=Z[base + gi, 0:P, 0:ne])
+            nisa.dma_copy(dst=X[0:P, gi, ne : 2 * ne], src=V[base + gi, 0:P, 0:ne])
+        # Inner state per tile: [Gc | U^T] for the P / S compact pairs.
+        Y = nl.ndarray((P, G, 2 * S), dtype=f32, buffer=nl.sbuf)
+        # Block-diagonal U^T per tile, the stationary of the W transpose.
+        E = nl.ndarray((P, G, P), dtype=f32, buffer=nl.sbuf)
+
+        def gram(g):
+            """Y[:, g] = [Gc | I]: the pairs' Gram blocks, rotations reset."""
+            ps_t = nl.ndarray((ne, P), dtype=f32, buffer=nl.psum)
+            nisa.nc_transpose(dst=ps_t, data=X[0:P, g, 0:ne], engine=nisa.engine.tensor)
+            zm = nl.ndarray((ne, P), dtype=f32, buffer=nl.sbuf)
+            nisa.activation(dst=zm, op=nl.copy, data=ps_t)
+            ps_g = nl.ndarray((P, P), dtype=f32, buffer=nl.psum)
+            nisa.nc_matmul(dst=ps_g, stationary=zm, moving=zm, accumulate=False)
+            gm = nl.ndarray((P, P), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=gm, data1=ps_g, data2=mask, op=mul)
+            ps_c = nl.ndarray((P, S), dtype=f32, buffer=nl.psum)
+            nisa.nc_matmul(
+                dst=ps_c, stationary=gm, moving=rid, is_moving_onezero=True, accumulate=False
+            )
+            nisa.activation(dst=Y[0:P, g, 0:S], op=nl.copy, data=ps_c)
+            nisa.activation(dst=Y[0:P, g, S : 2 * S], op=nl.copy, data=rid)
+
+        def update(g0, g1):
+            """X <- W^T X for tiles g0..g1-1, W = U_blockdiag Pi_blk."""
+            ng = g1 - g0
+            nisa.tensor_tensor(
+                dst=E[0:P, g0:g1, 0:P].reshape_dim(2, (P // S, S)),
+                data1=Y[0:P, g0:g1, S : 2 * S].expand_dim(2).broadcast(2, P // S),
+                data2=mask.reshape_dim(1, (P // S, S)).expand_dim(1).broadcast(1, ng),
+                op=mul,
+            )
+            for g in range(g0, g1):
+                ps_w = nl.ndarray((P, P), dtype=f32, buffer=nl.psum)
+                nisa.nc_matmul(
+                    dst=ps_w,
+                    stationary=E[0:P, g, 0:P],
+                    moving=pblk,
+                    is_moving_onezero=True,
+                    accumulate=False,
+                )
+                wsb = nl.ndarray((P, P), dtype=f32, buffer=nl.sbuf)
+                nisa.activation(dst=wsb, op=nl.copy, data=ps_w)
+                ps_x = nl.ndarray((P, 2 * ne), dtype=f32, buffer=nl.psum)
+                nisa.nc_matmul(
+                    dst=ps_x, stationary=wsb, moving=X[0:P, g, 0 : 2 * ne], accumulate=False
+                )
+                nisa.activation(dst=X[0:P, g, 0 : 2 * ne], op=nl.copy, data=ps_x)
+
+        bounds = [(G * k) // nchain for k in range(nchain + 1)]
+        chains = [(bounds[k], bounds[k + 1]) for k in range(nchain) if bounds[k + 1] > bounds[k]]
+        for st in range(nsteps):
+            for g0, g1 in chains:
+                for g in range(g0, g1):
+                    gram(g)
+            # The first step's pairs run the full round robin (it also covers
+            # the pairs inside each block); later steps only rotate the
+            # bs x bs cross pairs, so a sweep rotates each pair once.
+            if st == 0:
+                plan = [(r, sigt[0:P, r : r + 1]) for r in range(m)]
+            else:
+                plan = [(m + r, sigx) for r in range(bsz)]
+            for _sw in range(s_in):
+                for r, sig in plan:
+                    for g0, g1 in chains:
+                        _step(Y, g0, g1, S, pib[0:P, r, 0:P], sig, False, _ONEZERO, False)
+            for g0, g1 in chains:
+                update(g0, g1)
 
         for gi in range(G):
             nisa.dma_copy(dst=out[0, base + gi, 0:P, 0:ne], src=X[0:P, gi, 0:ne])
@@ -418,6 +689,36 @@ def _run_kernel(Z: torch.Tensor, V: torch.Tensor, n: int, chains: int) -> torch.
     return _launch(jacobi_sweeps_kernel, "jacobi_sweeps", Z, V, consts, sched, device=Z.device)
 
 
+def _block_consts_on(n: int, chains: int, device: torch.device):
+    ne = block_layout(n)[0]
+    bs = _BLOCK[ne]
+    key = ("block", ne, bs, chains, str(device))
+    if key not in _DEVICE_CONSTS:
+        consts = block_constants(n, bs).to(device)
+        sched = torch.zeros((_INNER_SWEEPS, 2 * bs, chains), dtype=torch.float32, device=device)
+        _DEVICE_CONSTS[key] = (consts, sched)
+    return _DEVICE_CONSTS[key]
+
+
+def _run_block_kernel(Z: torch.Tensor, V: torch.Tensor, n: int, chains: int) -> torch.Tensor:
+    """One block-sweep launch on a group: simulator or device. Z, V: (G, P, ne)."""
+    if _use_simulator():
+        import nki as _nki
+
+        consts, sched = _block_consts_on(n, chains, torch.device("cpu"))
+        res = _nki.simulate(jacobi_block_kernel)(
+            Z.detach().cpu().contiguous().numpy(),
+            V.detach().cpu().contiguous().numpy(),
+            consts.numpy(),
+            sched.numpy(),
+        )
+        return torch.from_numpy(res).to(Z.device)
+    from .dispatch import _launch
+
+    consts, sched = _block_consts_on(n, chains, Z.device)
+    return _launch(jacobi_block_kernel, "jacobi_block", Z, V, consts, sched, device=Z.device)
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, "").strip()
     try:
@@ -429,11 +730,13 @@ def _env_int(name: str, default: int) -> int:
 def group_plan(tiles: int, ne: int) -> list[tuple[int, int, int]]:
     """Split ``tiles`` into launches: ``[(start, count, padded), ...]``.
 
-    Full groups of ``_GROUP_MAX[ne]`` (``TRNSOLVER_JACOBI_GROUP`` overrides),
-    then one tail rounded up to a power of two, so each ne compiles at most
-    log2(group) + 1 shapes whatever the batch size.
+    Full groups of ``_GROUP_MAX[ne]`` (``_BLOCK_GROUP_MAX`` for the block
+    kernel; ``TRNSOLVER_JACOBI_GROUP`` overrides), then one tail rounded up
+    to a power of two, so each ne compiles at most log2(group) + 1 shapes
+    whatever the batch size.
     """
-    gmax = _env_int("TRNSOLVER_JACOBI_GROUP", _GROUP_MAX[ne])
+    table = _BLOCK_GROUP_MAX if _use_block(ne) else _GROUP_MAX
+    gmax = _env_int("TRNSOLVER_JACOBI_GROUP", table[ne])
     gmax = max(1, 1 << (max(gmax, 1).bit_length() - 1))
     out = []
     start = 0
@@ -471,9 +774,16 @@ def jacobi_eigh_device(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
     Runs ``_SWEEPS0[ne]`` sweeps (one launch per sweep and group of tiles),
     then one more sweep at a time while any matrix has a Gram off-diagonal
-    norm above 1e-6, up to 15 sweeps. Preparation (symmetrise, scale,
-    shift, pack) and the final Rayleigh quotients and sort run on A's
-    device, so a host input costs one copy in and one copy out.
+    norm above 1e-6, up to 15 sweeps. Padded sizes in ``_BLOCK`` (ne = 64,
+    128) run `jacobi_block_kernel` instead, with ``_BLOCK_SWEEPS0[ne]``
+    sweeps first. Preparation (symmetrise, scale, shift, pack) and the final
+    Rayleigh quotients and sort run on A's device, so a host input costs
+    one copy in and one copy out.
+
+    The eigenvectors are returned with unit columns and the eigenvalues as
+    the Rayleigh quotients ``v . z / v . v - sigma``: rounding in the
+    accumulated rotations (the block kernel's FP32 products of rotations
+    especially) shows up mostly as column-norm drift, which this removes.
     """
     global last_sweeps
     Bsz, n = A.shape[0], A.shape[-1]
@@ -503,7 +813,12 @@ def jacobi_eigh_device(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     T = Z.shape[0]
     Vt = torch.eye(ne, dtype=X.dtype, device=work).repeat(T * b, 1, 1).reshape(T, P, ne)
     plan = group_plan(T, ne)
-    chains_max = _env_int("TRNSOLVER_JACOBI_CHAINS", _CHAINS_MAX[ne])
+    block = _use_block(ne)
+    run_kernel = _run_block_kernel if block else _run_kernel
+    chains_max = _env_int(
+        "TRNSOLVER_JACOBI_CHAINS", (_BLOCK_CHAINS_MAX if block else _CHAINS_MAX)[ne]
+    )
+    sweeps0 = (_BLOCK_SWEEPS0 if block else _SWEEPS0)[ne]
 
     def pad_tiles(t, count, padded):
         if padded == count:
@@ -524,7 +839,7 @@ def jacobi_eigh_device(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
     def sweep():
         for k, (zg, vg, ch) in enumerate(groups):
-            res = _run_kernel(zg, vg, n, ch)
+            res = run_kernel(zg, vg, n, ch)
             groups[k] = (res[0], res[1], ch)
 
     def gathered(i):
@@ -532,7 +847,7 @@ def jacobi_eigh_device(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return parts[0] if len(parts) == 1 else torch.cat(parts, 0)
 
     done = 0
-    for _ in range(_SWEEPS0[ne]):
+    for _ in range(sweeps0):
         sweep()
         done += 1
     while done < _MAX_SWEEPS:
@@ -544,7 +859,13 @@ def jacobi_eigh_device(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
     Zt = unpack_compact(gathered(0).to(A.device), n, Bsz)[:, :n, :n]
     Vt = unpack_compact(gathered(1).to(A.device), n, Bsz)[:, :n, :n]
-    w = ((Zt * Vt).sum(-1) - sigma[:, None]) / scale[:, None]
+    vv = (Vt * Vt).sum(-1)
+    w = ((Zt * Vt).sum(-1) / vv - sigma[:, None]) / scale[:, None]
+    Vt = Vt * torch.rsqrt(vv).unsqueeze(-1)
     w, order = torch.sort(w, dim=-1)
-    V = torch.gather(Vt.transpose(1, 2), -1, order.unsqueeze(-2).expand(Bsz, n, n))
-    return w, V.contiguous()
+    # Reorder whole rows of V^T (one row gather) rather than an elementwise
+    # torch.gather on V: on the neuron device that is ~2 ms instead of
+    # ~100 ms at B = 1024, n = 128.
+    rows = (order + torch.arange(Bsz, device=order.device).unsqueeze(1) * n).reshape(-1)
+    Vt = Vt.reshape(Bsz * n, n).index_select(0, rows).reshape(Bsz, n, n)
+    return w, Vt.transpose(1, 2).contiguous()

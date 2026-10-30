@@ -135,11 +135,118 @@ class TestSchedules:
 
     def test_group_plan(self, monkeypatch):
         monkeypatch.delenv("TRNSOLVER_JACOBI_GROUP", raising=False)
+        monkeypatch.setenv("TRNSOLVER_JACOBI_BLOCK", "0")
         assert JK.group_plan(3, 128) == [(0, 3, 4)]
         assert JK.group_plan(40, 128) == [(0, 16, 16), (16, 16, 16), (32, 8, 8)]
+        monkeypatch.delenv("TRNSOLVER_JACOBI_BLOCK")
+        assert JK.group_plan(200, 128) == [(0, 128, 128), (128, 72, 128)]
         assert JK.group_plan(300, 32) == [(0, 128, 128), (128, 128, 128), (256, 44, 64)]
         monkeypatch.setenv("TRNSOLVER_JACOBI_GROUP", "3")  # rounded down to 2
         assert JK.group_plan(5, 32) == [(0, 2, 2), (2, 2, 2), (4, 1, 1)]
+
+
+class TestBlockConstants:
+    @pytest.mark.parametrize("nb", [2, 4, 8, 16])
+    def test_circle_perm_meets_every_block_pair(self, nb):
+        pos = list(range(nb))  # pos[p] = block at position p
+        met = set()
+        for _ in range(nb - 1):
+            for t in range(nb // 2):
+                met.add(frozenset((pos[2 * t], pos[2 * t + 1])))
+            perm = JK.circle_block_perm(nb)
+            pos = [pos[perm[p]] for p in range(nb)]
+        assert len(met) == nb * (nb - 1) // 2
+        assert pos == list(range(nb))  # order nb - 1: back in place
+
+    @pytest.mark.parametrize("n", [33, 64, 128])
+    def test_layout(self, n):
+        ne, b, P = JK.block_layout(n)
+        bs = JK._BLOCK[ne]
+        S = 2 * bs
+        c = JK.block_constants(n, bs)
+        assert c.shape == (P, 4 * P + 2 * S)
+        m = S - 1
+        mask = c[:, m + P : m + 2 * P]
+        pi = c[:, m + 2 * P + S : m + 3 * P + S]
+        # Cross steps: every pair (i in the first block, j in the second) once.
+        qx = c[:, m + 3 * P + S + 1 :]
+        assert torch.equal(qx, qx.T)
+        assert torch.equal(
+            (qx >= 0).float(),
+            mask
+            * (1 - torch.eye(P))
+            * ((torch.arange(P) % S < bs)[:, None] != (torch.arange(P) % S < bs)[None, :]).float(),
+        )
+        for r in range(bs):
+            assert torch.equal((qx == r).float().sum(1), torch.ones(P))
+        assert torch.equal(mask, mask.T) and float(mask.sum()) == P * S
+        assert torch.equal(pi.sum(0), torch.ones(P)) and torch.equal(pi.sum(1), torch.ones(P))
+        # The shuffle stays within each matrix, and has order nb - 1.
+        blockdiag = torch.block_diag(*[torch.ones(ne, ne)] * b)
+        assert float((pi * (1 - blockdiag)).abs().sum()) == 0
+        assert torch.equal(torch.linalg.matrix_power(pi, ne // bs - 1), torch.eye(P))
+
+    def test_bad_block_size(self):
+        with pytest.raises(ValueError):
+            JK.block_constants(64, 64)
+
+
+class TestAutoRegion:
+    def test_region_env(self, no_env, monkeypatch):
+        assert eigen._jacobi_auto_region() == eigen._JACOBI_AUTO_REGION
+        monkeypatch.setenv("TRNSOLVER_EIGH_JACOBI_AUTO", "off")
+        assert eigen._jacobi_auto_region() == ()
+        monkeypatch.setenv("TRNSOLVER_EIGH_JACOBI_AUTO", "1-32:256, 33-64:1024")
+        assert eigen._jacobi_auto_region() == ((1, 32, 256), (33, 64, 1024))
+        monkeypatch.setenv("TRNSOLVER_EIGH_JACOBI_AUTO", "junk")
+        assert eigen._jacobi_auto_region() == eigen._JACOBI_AUTO_REGION
+
+    def test_default_table(self, no_env, monkeypatch):
+        monkeypatch.setattr(eigen, "_NATIVE_DEVICE_TYPE", "cpu")
+        monkeypatch.setattr(eigen, "_jacobi_device_ok", lambda n, dtype: True)
+        for (n, b), want in {
+            (32, 512): True,
+            (32, 256): False,
+            (40, 256): True,
+            (40, 64): False,
+            (80, 256): False,
+            (80, 1024): True,
+            (96, 256): True,
+            (128, 64): True,
+            (127, 64): False,
+        }.items():
+            assert eigen._jacobi_auto(torch.zeros(b, n, n)) is want, (n, b)
+
+    def test_cpu_input_never_auto(self, no_env):
+        assert not eigen._jacobi_auto(torch.zeros(1024, 16, 16))
+
+    def test_decision(self, no_env, monkeypatch):
+        # Pretend CPU is the native device so the region logic is exercised.
+        monkeypatch.setattr(eigen, "_NATIVE_DEVICE_TYPE", "cpu")
+        monkeypatch.setattr(eigen, "_jacobi_device_ok", lambda n, dtype: True)
+        monkeypatch.setenv("TRNSOLVER_EIGH_JACOBI_AUTO", "1-32:512,65-128:1024")
+        assert eigen._jacobi_auto(torch.zeros(512, 32, 32))
+        assert eigen._jacobi_auto(torch.zeros(2, 256, 8, 8))  # batch dims multiply
+        assert not eigen._jacobi_auto(torch.zeros(511, 32, 32))
+        assert not eigen._jacobi_auto(torch.zeros(1024, 33, 33))
+        assert eigen._jacobi_auto(torch.zeros(1024, 65, 65))
+        assert not eigen._jacobi_auto(torch.zeros(512, 128, 128))
+        assert not eigen._jacobi_auto(torch.zeros(32, 32))  # unbatched
+        assert not eigen._jacobi_auto(torch.zeros(1024, 32, 32, dtype=torch.float64))
+        monkeypatch.setenv("TRNSOLVER_EIGH_JACOBI_AUTO", "off")
+        assert not eigen._jacobi_auto(torch.zeros(1024, 32, 32))
+
+    def test_auto_routes_to_jacobi(self, no_env, monkeypatch):
+        monkeypatch.setattr(eigen, "_NATIVE_DEVICE_TYPE", "cpu")
+        monkeypatch.setattr(eigen, "_jacobi_device_ok", lambda n, dtype: False)
+        monkeypatch.setattr(eigen, "_jacobi_auto", lambda A: True)
+        calls = []
+        real = eigen._jacobi_eigh
+        monkeypatch.setattr(eigen, "_jacobi_eigh", lambda A: calls.append(1) or real(A))
+        A = _separated(4, 8)
+        w, V = trnsolver.eigh(A)
+        assert calls == [1]
+        _check(A, w, V)
 
 
 # ----------------------------------------------------------------------
@@ -152,6 +259,8 @@ def no_env(monkeypatch):
     monkeypatch.delenv("TRNSOLVER_EIGH_METHOD", raising=False)
     monkeypatch.delenv("TRNSOLVER_JACOBI_GROUP", raising=False)
     monkeypatch.delenv("TRNSOLVER_JACOBI_CHAINS", raising=False)
+    monkeypatch.delenv("TRNSOLVER_JACOBI_BLOCK", raising=False)
+    monkeypatch.delenv("TRNSOLVER_EIGH_JACOBI_AUTO", raising=False)
 
 
 class TestTorchJacobi:
@@ -277,6 +386,40 @@ def _emulate_launch(Z, V, n, chains):
     return torch.stack([X[..., :ne], X[..., ne:]])
 
 
+def _emulate_block_launch(Z, V, n, chains, nsteps=None):
+    """Torch model of one `jacobi_block_kernel` launch (one block sweep)."""
+    ne, b, P = JK.block_layout(n)
+    bs = JK._BLOCK[ne]
+    S = 2 * bs
+    m = S - 1
+    c = JK.block_constants(n, bs)
+    sig, Q = c[:, :m], c[:, m : m + P]
+    mask = c[:, m + P : m + 2 * P]
+    R = c[:, m + 2 * P : m + 2 * P + S]
+    c0 = m + 2 * P + S
+    pblk = c[:, c0 : c0 + P]
+    sigx, Qx = c[:, c0 + P], c[:, c0 + P + 1 :]
+    full = [(torch.eq(Q, v), sig[:, r]) for r, v in enumerate(JK.step_targets(S))]
+    cross = [(torch.eq(Qx, float(r)), sigx) for r in range(bs)]
+    X = torch.cat([Z, V], dim=-1)  # (G, P, 2 ne)
+    for st in range(ne // bs - 1 if nsteps is None else nsteps):
+        zm = X[..., :ne].transpose(1, 2)
+        Gc = ((zm.transpose(1, 2) @ zm) * mask).transpose(1, 2) @ R  # (G, P, S)
+        Y = torch.cat([Gc, R.expand_as(Gc)], -1)
+        for _ in range(JK._INNER_SWEEPS):
+            for Pi, sg in full if st == 0 else cross:
+                Pi = Pi.to(X.dtype)
+                M = torch.einsum("kp,gkc->gpc", Pi, Y)
+                Yc = Y[..., :S]
+                gpp = (Yc * Yc).sum(-1)
+                gpq = (M[..., :S] * Yc).sum(-1)
+                c_, s, _ = J.rotation_csk(gpp, gpp @ Pi, gpq, sg)
+                Y = c_.unsqueeze(-1) * Y - s.unsqueeze(-1) * M
+        E = Y[..., S:].unsqueeze(2).expand(-1, P, P // S, S).reshape(-1, P, P) * mask
+        X = (E.transpose(1, 2) @ pblk).transpose(1, 2) @ X
+    return torch.stack([X[..., :ne], X[..., ne:]])
+
+
 @pytest.fixture
 def emulated_kernel(monkeypatch, no_env):
     launches = []
@@ -285,7 +428,12 @@ def emulated_kernel(monkeypatch, no_env):
         launches.append((tuple(Z.shape), chains))
         return _emulate_launch(Z, V, n, chains)
 
+    def run_block(Z, V, n, chains):
+        launches.append((tuple(Z.shape), chains))
+        return _emulate_block_launch(Z, V, n, chains)
+
     monkeypatch.setattr(JK, "_run_kernel", run)
+    monkeypatch.setattr(JK, "_run_block_kernel", run_block)
     monkeypatch.setattr(JK, "_use_simulator", lambda: True)
     monkeypatch.setattr(eigen, "_jacobi_device_ok", lambda n, dtype: dtype == torch.float32)
     return launches
@@ -297,9 +445,12 @@ class TestDeviceDriverEmulated:
         A = _separated(nb, n, seed=n + nb)
         w, V = trnsolver.eigh(A, method="jacobi")
         _check(A, w, V)
-        assert JK._SWEEPS0[JK.block_layout(n)[0]] <= JK.last_sweeps <= JK._MAX_SWEEPS
+        ne = JK.block_layout(n)[0]
+        sweeps0 = (JK._BLOCK_SWEEPS0 if JK._use_block(ne) else JK._SWEEPS0)[ne]
+        assert sweeps0 <= JK.last_sweeps <= JK._MAX_SWEEPS
 
-    def test_random_n128(self, emulated_kernel):
+    def test_random_n128(self, emulated_kernel, monkeypatch):
+        monkeypatch.setenv("TRNSOLVER_JACOBI_BLOCK", "0")
         A = _sym_batch(2, 128)
         w, V = trnsolver.eigh(A, method="jacobi")
         _check(A, w, V, vecs=False)
@@ -328,6 +479,22 @@ class TestDeviceDriverEmulated:
         A = (Q @ torch.diag(w0) @ Q.T).float().unsqueeze(0)
         w, V = trnsolver.eigh(A, method="jacobi")
         _check(A, w, V)
+
+    @pytest.mark.parametrize("n", [33, 64, 100, 128])
+    def test_block_and_scalar_agree(self, emulated_kernel, monkeypatch, n):
+        A = _separated(3, n, seed=n)
+        w_b, V_b = trnsolver.eigh(A, method="jacobi")
+        _check(A, w_b, V_b)
+        monkeypatch.setenv("TRNSOLVER_JACOBI_BLOCK", "0")
+        w_s, V_s = trnsolver.eigh(A, method="jacobi")
+        _check(A, w_s, V_s)
+        torch.testing.assert_close(w_b, w_s, rtol=0, atol=1e-4 * float(w_s.abs().max()))
+
+    def test_block_random_n128_sweeps(self, emulated_kernel):
+        A = _sym_batch(2, 128, seed=5)
+        w, V = trnsolver.eigh(A, method="jacobi")
+        _check(A, w, V, vecs=False)
+        assert JK._BLOCK_SWEEPS0[128] <= JK.last_sweeps <= 9
 
     def test_kernel_failure_falls_back(self, emulated_kernel, monkeypatch):
         def boom(*a):
@@ -374,6 +541,36 @@ class TestSimulator:
         ref = _emulate_launch(Z, V, n, chains)
         torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)
 
+    @pytest.mark.parametrize("n,G,chains", [(64, 1, 1), (40, 2, 2), (128, 1, 1)])
+    def test_block_kernel_one_step(self, n, G, chains):
+        # One outer step (a full sweep amplifies rounding differences in
+        # near-degenerate inner angles; the end-to-end test covers it).
+        ne, b, P = JK.block_layout(n)
+        bs = JK._BLOCK[ne]
+        A = _sym_batch(G * b, n)
+        sigma = A.abs().sum(-1).amax(-1)
+        Z = JK.pack_compact(A + sigma[:, None, None] * torch.eye(n), n)
+        V = JK.pack_compact(torch.eye(n).expand(G * b, n, n), n)
+        import nki
+
+        got = torch.from_numpy(
+            nki.simulate(JK.jacobi_block_kernel)(
+                Z.numpy(),
+                V.numpy(),
+                JK.block_constants(n, bs).numpy(),
+                np.zeros((JK._INNER_SWEEPS, 2 * bs, chains, 1), dtype=np.float32),
+            )
+        )
+        ref = _emulate_block_launch(Z, V, n, chains, nsteps=1)
+        scale = float(ref.abs().max())
+        torch.testing.assert_close(got, ref, rtol=0, atol=1e-4 * scale)
+
+    @pytest.mark.parametrize("n,nb", [(40, 3), (64, 4), (128, 1)])
+    def test_block_eigh_end_to_end(self, n, nb):
+        A = _sym_batch(nb, n, seed=n)
+        w, V = trnsolver.eigh(A, method="jacobi")
+        _check(A, w, V, vecs=False)
+
     @pytest.mark.parametrize("n,nb", [(3, 2), (8, 20)])
     def test_eigh_end_to_end(self, n, nb):
         A = _separated(nb, n, seed=nb)
@@ -386,7 +583,8 @@ class TestSimulator:
     "n,G,chains",
     [(2, 1, 1), (8, 2, 2), (32, 4, 2), (33, 2, 1), (64, 2, 2), (128, 1, 1), (128, 8, 2)],
 )
-def test_mlir_verifies(n, G, chains):
+@pytest.mark.parametrize("lnc", [1, 2])
+def test_mlir_verifies(n, G, chains, lnc):
     if not HAS_NKI:
         pytest.skip("nki not importable on this host")
     try:
@@ -402,6 +600,34 @@ def test_mlir_verifies(n, G, chains):
         JK.jacobi_constants(n).numpy(),
         np.zeros((1, ne, chains), dtype=np.float32),
         target="trn2",
+        lnc=lnc,
+        frontend=FrontendKind.TRACER,
+    ).verify()
+
+
+@pytest.mark.nki_simulator
+@pytest.mark.parametrize(
+    "n,G,chains", [(33, 1, 1), (64, 2, 2), (64, 128, 2), (128, 4, 2), (128, 128, 2)]
+)
+@pytest.mark.parametrize("lnc", [1, 2])
+def test_block_mlir_verifies(n, G, chains, lnc):
+    if not HAS_NKI:
+        pytest.skip("nki not importable on this host")
+    try:
+        from nki.compiler.frontend import FrontendKind, source_to_mlir
+    except ImportError:
+        pytest.skip("nki.compiler.frontend.source_to_mlir not available in this nki")
+    ne, b, P = JK.block_layout(n)
+    bs = JK._BLOCK[ne]
+    Z = np.zeros((G, P, ne), dtype=np.float32)
+    source_to_mlir(
+        JK.jacobi_block_kernel,
+        Z,
+        Z,
+        JK.block_constants(n, bs).numpy(),
+        np.zeros((JK._INNER_SWEEPS, 2 * bs, chains), dtype=np.float32),
+        target="trn2",
+        lnc=lnc,
         frontend=FrontendKind.TRACER,
     ).verify()
 
@@ -445,6 +671,15 @@ class TestJacobiNeuron:
         w, V = trnsolver.eigh(A.to("neuron"), method="jacobi")
         assert w.device.type == "neuron" and V.device.type == "neuron"
         _check(A, w.cpu(), V.cpu(), tol=5e-5)
+
+    @pytest.mark.parametrize("n", [64, 128])
+    def test_block_matches_scalar_kernel(self, monkeypatch, n):
+        A = _separated(4, n, seed=3)
+        w_b, V_b = trnsolver.eigh(A, method="jacobi")
+        _check(A, w_b, V_b, tol=5e-5)
+        monkeypatch.setenv("TRNSOLVER_JACOBI_BLOCK", "0")
+        w_s, V_s = trnsolver.eigh(A, method="jacobi")
+        _check(A, w_s, V_s, tol=5e-5)
 
     def test_multi_group(self, monkeypatch):
         monkeypatch.setenv("TRNSOLVER_JACOBI_GROUP", "2")
