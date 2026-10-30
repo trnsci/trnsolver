@@ -29,6 +29,7 @@ import torch
 
 from .factor import _cholesky_lower, _restore, _to_fp32
 from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki, _use_simulator
+from .nki import batched as _batched
 from .nki.tridiag import householder_tridiag_device as _householder_tridiag_device
 from .nki.tridiag import use_device_tridiag as _use_device_tridiag
 
@@ -40,12 +41,12 @@ def eigh(
     """Symmetric eigenvalue decomposition: A = V @ diag(w) @ V^T
 
     Args:
-        A: Symmetric matrix (n, n)
+        A: Symmetric matrix (n, n), or a batch (..., n, n)
         tol: Convergence tolerance for QR iteration (NKI path only)
 
     Returns:
-        eigenvalues: (n,) sorted ascending
-        eigenvectors: (n, n) columns are eigenvectors
+        eigenvalues: (n,) sorted ascending, or (..., n) for a batch
+        eigenvectors: (n, n) columns are eigenvectors, or (..., n, n)
 
     The NKI path (Householder tridiagonalization + implicit-shift QR) is
     eager-only: deflation and shift selection are data-dependent Python
@@ -61,20 +62,68 @@ def eigh(
     host-driven and launch-bound: on Trn2 it took 0.4 s at n=16 and 21 s at
     n=128, against about 1 ms for aten at every measured size. Setting
     ``TRNSOLVER_REQUIRE_NKI=1`` disables the cutover so the kernels still run.
+
+    Batched input (#48): a (..., n, n) stack follows the same policy (aten
+    cutover on ``neuron`` for small n, otherwise the NKI path). With
+    ``TRNSOLVER_EIGH_TRIDIAG=device`` and 2 <= n <= 128 the whole batch runs
+    through batched kernels, 4 launches per chunk of up to
+    ``TRNSOLVER_EIGH_BATCH_CHUNK`` (default 16) matrices, with one host pass
+    for the tridiagonal solves and one batched ``torch.linalg.eigh`` for the
+    Rayleigh-Ritz step; see ``trnsolver/nki/batched.py``. A batch of one
+    matrix takes the single-matrix path unchanged.
     """
     A, orig = _to_fp32(A)
+    if A.dim() > 2:
+        w, V = _eigh_batched(A, tol)
+    else:
+        w, V = _eigh_single(A, tol)
+    return _restore(w, orig), _restore(V, orig)
+
+
+def _eigh_single(A: torch.Tensor, tol: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """eigh dispatch for one FP32 (n, n) matrix (the pre-#48 behaviour)."""
     if _use_nki() and _eigh_aten_cutover(A):
-        w, V = _aten_eigh_on_device(A)
-    elif _use_nki():
+        return _aten_eigh_on_device(A)
+    if _use_nki():
         try:
-            w, V = _householder_qr_eigh(A, tol)
+            return _householder_qr_eigh(A, tol)
         except Exception:
             if _REQUIRE_NKI:
                 raise
-            w, V = _torch_eigh(A)
+            return _torch_eigh(A)
+    return _torch_eigh(A)
+
+
+def _eigh_batched(A: torch.Tensor, tol: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """eigh dispatch for an FP32 (..., n, n) batch (#48).
+
+    Same policy as `_eigh_single`, applied to the whole batch: the aten
+    cutover on ``neuron`` for n < ``TRNSOLVER_EIGH_NKI_MIN_N``, then the NKI
+    path with a torch fallback unless ``TRNSOLVER_REQUIRE_NKI=1``. A batch of
+    one matrix goes through `_eigh_single`.
+    """
+    n = A.shape[-1]
+    if A.shape[-2] != n:
+        return _torch_eigh(A)  # let aten raise its usual shape error
+    batch_shape = A.shape[:-2]
+    Ab = A.reshape(-1, n, n)
+    nb = Ab.shape[0]
+    if nb == 0:
+        return _torch_eigh(A)
+    if nb == 1:
+        w, V = _eigh_single(Ab[0], tol)
+    elif _use_nki() and _eigh_aten_cutover(Ab):
+        w, V = _aten_eigh_on_device(Ab)
+    elif _use_nki():
+        try:
+            w, V = _householder_qr_eigh_batched(Ab, tol)
+        except Exception:
+            if _REQUIRE_NKI:
+                raise
+            w, V = _torch_eigh(Ab)
     else:
-        w, V = _torch_eigh(A)
-    return _restore(w, orig), _restore(V, orig)
+        w, V = _torch_eigh(Ab)
+    return w.reshape(*batch_shape, n), V.reshape(*batch_shape, n, n)
 
 
 def eigh_generalized(
@@ -771,6 +820,54 @@ def _lapack_tridiag_eigh(
     return w.to(dtype), Q.to(dtype)
 
 
+def _lapack_tridiag_eigh_batched(
+    diag: torch.Tensor, subdiag: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batched `_lapack_tridiag_eigh`: diag (B, n), subdiag (B, n - 1) on host.
+
+    One pass over the batch with ``scipy.linalg.eigh_tridiagonal`` per
+    matrix. Measured against one batched dense float64 ``torch.linalg.eigh``
+    of the tridiagonals (#48), the scipy loop is as fast at n = 32 and about
+    2x faster at n = 64..128 for B = 16..1024 (0.26 vs 0.55 ms per matrix at
+    n = 128), so the dense batched solve is only the fallback: for the whole
+    batch when scipy is missing, and per matrix when ``stemr`` fails.
+    """
+    dtype = diag.dtype
+    d = diag.detach().to("cpu", torch.float64)
+    e = subdiag.detach().to("cpu", torch.float64)
+    nb, n = d.shape
+    try:
+        import scipy.linalg
+    except ImportError:
+        scipy = None
+    if scipy is None:
+        T = torch.diag_embed(d) + torch.diag_embed(e, 1) + torch.diag_embed(e, -1)
+        w, Q = torch.linalg.eigh(T)
+        return w.to(dtype), Q.to(dtype)
+    w = torch.empty((nb, n), dtype=torch.float64)
+    Q = torch.empty((nb, n, n), dtype=torch.float64)
+    dn, en = d.numpy(), e.numpy()
+    for b in range(nb):
+        try:
+            wb, Qb = scipy.linalg.eigh_tridiagonal(dn[b], en[b])
+            w[b] = torch.from_numpy(wb)
+            Q[b] = torch.from_numpy(Qb)
+        except (scipy.linalg.LinAlgError, ValueError):
+            T = torch.diag(d[b]) + torch.diag(e[b], 1) + torch.diag(e[b], -1)
+            w[b], Q[b] = torch.linalg.eigh(T)
+    return w.to(dtype), Q.to(dtype)
+
+
+def _tridiag_eigh_host_batched(
+    diag: torch.Tensor, subdiag: torch.Tensor, tol: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batched `_tridiag_eigh_host`: (eigenvalues (B, n), Q_right (B, n, n)) on CPU."""
+    if _tridiag_solver() == "qr":
+        pairs = [_tridiag_eigh_host(diag[b], subdiag[b], tol) for b in range(diag.shape[0])]
+        return torch.stack([p[0] for p in pairs]), torch.stack([p[1] for p in pairs])
+    return _lapack_tridiag_eigh_batched(diag, subdiag)
+
+
 def _tridiag_eigh_host(
     diag: torch.Tensor, subdiag: torch.Tensor, tol: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -875,4 +972,54 @@ def _householder_qr_eigh(
     eigenvalues, Q_corr = torch.linalg.eigh(H)
     V = _call_matmul(V.contiguous(), Q_corr)
     # torch.linalg.eigh returns sorted ascending — no argsort needed.
+    return eigenvalues, V
+
+
+@torch.compiler.disable
+def _householder_qr_eigh_batched(
+    A: torch.Tensor,
+    tol: float = 1e-10,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """NKI eigh of a (B, n, n) batch, B >= 2 (#48).
+
+    With ``TRNSOLVER_EIGH_TRIDIAG=device`` and 2 <= n <= 128, the batch runs
+    through `_householder_qr_eigh_batched_device`. Otherwise (host-driven
+    reduction, or n > 128) each matrix goes through `_householder_qr_eigh`
+    in turn: the host-driven reduction is per-matrix by construction.
+    """
+    n = A.shape[-1]
+    if n == 1:
+        w = A[:, 0, :].clone()
+        return w, torch.ones_like(A)
+    if _use_device_tridiag(n):
+        return _householder_qr_eigh_batched_device(A, tol)
+    pairs = [_householder_qr_eigh(A[b], tol) for b in range(A.shape[0])]
+    return torch.stack([p[0] for p in pairs]), torch.stack([p[1] for p in pairs])
+
+
+def _householder_qr_eigh_batched_device(
+    A: torch.Tensor,
+    tol: float = 1e-10,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`_householder_qr_eigh` for a batch, on the batched kernels.
+
+    Same three stages and the same Rayleigh-Ritz refinement as the
+    single-matrix path, each stage over the whole batch at once:
+
+    1. one batched Householder reduction (``householder_tridiag_batched``);
+    2. one host pass of tridiagonal solves (`_tridiag_eigh_host_batched`);
+    3. the reflectors applied to the tridiagonal eigenvectors
+       (``apply_reflectors_batched``, which returns V^T), then
+       H = V^T A V (``rr_project_batched``), one batched
+       ``torch.linalg.eigh(H)``, and V <- V Q_corr (``rr_rotate_batched``).
+
+    Each device stage is one launch per chunk; see `nki.batched`.
+    """
+    diag, subdiag, V_refs = _batched.householder_tridiag_batched_device(A)
+    _, Q_right = _tridiag_eigh_host_batched(diag, subdiag, tol)
+    V_T = _batched.apply_reflectors_batched(V_refs, Q_right.to(A.device))
+    H = _batched.rr_project_batched(A, V_T)
+    H = 0.5 * (H + H.transpose(1, 2))
+    eigenvalues, Q_corr = torch.linalg.eigh(H)
+    V = _batched.rr_rotate_batched(V_T, Q_corr.contiguous())
     return eigenvalues, V

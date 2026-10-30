@@ -30,6 +30,10 @@ EXPECTED_OPS = {
     "matmul_fp32out",
     "apply_reflectors",
     "householder_tridiag",
+    "householder_tridiag_batched",
+    "apply_reflectors_batched",
+    "rr_project_batched",
+    "rr_rotate_batched",
 }
 
 
@@ -556,3 +560,10 @@ class TestLazyRegistration:
         for m in (2, 3, n, 128):
             out = fake("householder_tridiag")(meta(m, m), meta(m, 2 * m))
             assert out.shape == (m, 2 + max(m - 1, 1)) and out.dtype == torch.float32
+        for c, m in ((1, 2), (4, n), (16, 128)):
+            out = fake("householder_tridiag_batched")(meta(c, m, m), meta(m, 2 * m))
+            assert out.shape == (c, m, 2 + max(m - 1, 1)) and out.dtype == torch.float32
+            out = fake("apply_reflectors_batched")(meta(c, m, max(m - 2, 1)), meta(c, m, m))
+            assert out.shape == (c, m, m)
+            for name in ("rr_project_batched", "rr_rotate_batched"):
+                assert fake(name)(meta(c, m, m), meta(c, m, m)).shape == (c, m, m)
