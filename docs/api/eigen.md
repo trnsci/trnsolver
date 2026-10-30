@@ -1,13 +1,17 @@
 # Eigensolvers
 
-## `eigh(A, *, max_sweeps=50, tol=1e-10)`
+## `eigh(A, tol=1e-10, *, method=None)`
 
 Symmetric eigendecomposition `A = V Λ Vᵀ` for real symmetric `A`. Returns `(eigenvalues, eigenvectors)` with eigenvalues in ascending order.
 
-When the NKI backend is active, dispatches to the Jacobi rotation kernel (currently scaffolded — falls back to `torch.linalg.eigh` until on-hardware validation lands). Pure-PyTorch path uses `torch.linalg.eigh`.
+`method=None` reads `TRNSOLVER_EIGH_METHOD` (default `auto`).
+
+- `auto`: on the native `neuron` device, n < `TRNSOLVER_EIGH_NKI_MIN_N` (default 512) uses `torch.linalg.eigh`; otherwise the NKI path (Householder tridiagonalization, host QR iteration). Off-device, `torch.linalg.eigh`.
+- `jacobi` (#48): batched Jacobi for `(n, n)` or `(..., n, n)` input. On the native `neuron` device (FP32, n ≤ 128) it runs the SBUF-resident one-sided Jacobi kernel: one launch per sweep, each holding up to 128 tiles of 128 / n matrices (512 at n = 32) in SBUF. Elsewhere it runs a torch implementation (two-sided Jacobi as batched matmuls). Uses the lower triangle, like `torch.linalg.eigh`.
 
 ```python
 eigenvalues, eigenvectors = trnsolver.eigh(A)
+w, V = trnsolver.eigh(A_batch.to("neuron"), method="jacobi")  # (B, n), (B, n, n)
 ```
 
 ## `eigh_generalized(A, B)`
@@ -27,4 +31,4 @@ eigenvalues, eigenvectors = trnsolver.eigh_generalized(F, S)
 
 ## Backend notes
 
-The Jacobi method is preferred over Householder tridiagonalization on Trainium because each Givens rotation maps cleanly to a 128×128 Tensor Engine tile. For details see the [architecture notes](../architecture.md).
+Householder tridiagonalization is n − 2 dependent BLAS-2 steps and leaves the Tensor Engine idle (#48). A parallel-ordered Jacobi step rotates n/2 disjoint pairs at once, so a batch of matrices advances in lockstep with no long dependency chain. In the kernel the Tensor Engine applies the step's partner permutation (an exact matmul shared by every tile) and the Vector Engine applies the rotations. For measurements against batched CPU LAPACK see #48.

@@ -74,6 +74,21 @@ def apply_reflectors(V_refs: torch.Tensor, Q_in: torch.Tensor) -> torch.Tensor:
     return _d.apply_reflectors_kernel(V_refs, Q_in)
 
 
+@nki_op(
+    "trnsolver::jacobi_sweeps",
+    mutates_args={},
+    fake_fn=lambda Z, V, consts, sched: Z.new_empty((2,) + tuple(Z.shape)),
+)
+def jacobi_sweeps(
+    Z: torch.Tensor, V: torch.Tensor, consts: torch.Tensor, sched: torch.Tensor
+) -> torch.Tensor:
+    # The Jacobi kernel lives in its own module (nki/jacobi.py), imported
+    # here at call time like the dispatch kernels above.
+    from . import jacobi as _j
+
+    return _j.jacobi_sweeps_kernel(Z, V, consts, sched)
+
+
 # Keyed by the short op name used in `dispatch._launch`.
 OPS = {
     "matvec": matvec,
@@ -81,4 +96,5 @@ OPS = {
     "matmul": matmul,
     "matmul_fp32out": matmul_fp32out,
     "apply_reflectors": apply_reflectors,
+    "jacobi_sweeps": jacobi_sweeps,
 }

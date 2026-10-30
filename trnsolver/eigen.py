@@ -33,16 +33,28 @@ from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki, _use_simulator
 def eigh(
     A: torch.Tensor,
     tol: float = 1e-10,
+    *,
+    method: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Symmetric eigenvalue decomposition: A = V @ diag(w) @ V^T
 
     Args:
-        A: Symmetric matrix (n, n)
+        A: Symmetric matrix (n, n). With ``method="jacobi"``, also a batch
+           (..., n, n).
         tol: Convergence tolerance for QR iteration (NKI path only)
+        method: ``"auto"`` (default) or ``"jacobi"``. ``None`` reads
+           ``TRNSOLVER_EIGH_METHOD`` (default ``auto``).
 
     Returns:
-        eigenvalues: (n,) sorted ascending
-        eigenvectors: (n, n) columns are eigenvectors
+        eigenvalues: (n,) sorted ascending ((..., n) for a batch)
+        eigenvectors: (n, n) columns are eigenvectors ((..., n, n))
+
+    ``method="jacobi"`` (#48) runs batched one-sided Jacobi. On the native
+    ``neuron`` device with NKI, n <= 128, it is the SBUF-resident kernel in
+    ``trnsolver/nki/jacobi.py`` (one launch per sweep per group of up to
+    128 tiles of 128 / n matrices); elsewhere it is the torch implementation in
+    ``trnsolver/_jacobi.py`` (batched matmuls, any device). It does not
+    change the default ``auto`` dispatch below.
 
     The NKI path (Householder tridiagonalization + implicit-shift QR) is
     eager-only: deflation and shift selection are data-dependent Python
@@ -59,6 +71,8 @@ def eigh(
     n=128, against about 1 ms for aten at every measured size. Setting
     ``TRNSOLVER_REQUIRE_NKI=1`` disables the cutover so the kernels still run.
     """
+    if _eigh_method(method) == "jacobi":
+        return _jacobi_eigh(A)
     A, orig = _to_fp32(A)
     if _use_nki() and _eigh_aten_cutover(A):
         w, V = _aten_eigh_on_device(A)
@@ -242,6 +256,61 @@ def eigh_randomized(
     V_k = Q @ V_small[:, idx_sorted]  # (n, k) FP32
 
     return _restore(eigenvalues_k, orig), _restore(V_k, orig)
+
+
+_EIGH_METHODS = ("auto", "jacobi")
+
+
+def _eigh_method(method: str | None) -> str:
+    """Resolve ``eigh(method=...)``; ``None`` reads ``TRNSOLVER_EIGH_METHOD``."""
+    if method is None:
+        method = os.environ.get("TRNSOLVER_EIGH_METHOD", "").strip().lower() or "auto"
+    if method not in _EIGH_METHODS:
+        raise ValueError(f"eigh method must be one of {_EIGH_METHODS}; got {method!r}")
+    return method
+
+
+def _jacobi_device_ok(n: int, dtype: torch.dtype) -> bool:
+    """True iff the FP32 Jacobi NKI kernel can run: simulator, or the native path."""
+    if not (_use_nki() and HAS_NKI and 1 <= n <= 128 and dtype == torch.float32):
+        return False
+    if _use_simulator():
+        return True
+    from .nki.dispatch import _get_dispatch_path
+
+    # The kernel uses the NKI 0.7 ISA (TorchNeuron lineage); the XLA lineage
+    # (Trn1, NKI 0.3) takes the torch implementation.
+    return _get_dispatch_path() == "native"
+
+
+@torch.compiler.disable
+def _jacobi_eigh(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``eigh(method="jacobi")`` for (n, n) or (..., n, n) input (#48)."""
+    from . import _jacobi
+
+    A, orig = _to_fp32(A)
+    if A.dim() < 2 or A.shape[-1] != A.shape[-2]:
+        raise ValueError(f"eigh expects (..., n, n); got {tuple(A.shape)}")
+    batch_shape = A.shape[:-2]
+    n = A.shape[-1]
+    X = A.reshape(-1, n, n)
+    if X.shape[0] == 0:
+        w = X.new_empty((0, n))
+        V = X.new_empty((0, n, n))
+    elif _jacobi_device_ok(n, X.dtype):
+        try:
+            from .nki.jacobi import jacobi_eigh_device
+
+            w, V = jacobi_eigh_device(X)
+        except Exception:
+            if _REQUIRE_NKI:
+                raise
+            w, V, _ = _jacobi.jacobi_eigh_torch(X)
+    else:
+        w, V, _ = _jacobi.jacobi_eigh_torch(X)
+    w = w.reshape(*batch_shape, n)
+    V = V.reshape(*batch_shape, n, n)
+    return _restore(w, orig), _restore(V, orig)
 
 
 def _torch_eigh(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
