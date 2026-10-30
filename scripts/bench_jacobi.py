@@ -134,7 +134,9 @@ def main():
                     out = run()
                     sync()
                     t = _time(lambda: [x.cpu() for x in run()], args.reps, sync)
-                    sweeps = getattr(trnsolver.eigen, "_LAST_JACOBI_SWEEPS", -1)
+                    from trnsolver.nki import jacobi as _jk
+
+                    sweeps = _jk.last_sweeps
                 else:
                     raise ValueError(mode)
                 eig, res, orth = _acc(A64, *out)

@@ -192,18 +192,29 @@ def finish(A: torch.Tensor, W: torch.Tensor, n: int) -> tuple[torch.Tensor, torc
 def jacobi_eigh_torch(
     A: torch.Tensor,
     *,
-    tol: float = 1e-6,
-    max_sweeps: int = 15,
+    tol: float | None = None,
+    max_sweeps: int | None = None,
     check_every: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Batched Jacobi eigh in torch: returns (w, V, sweeps_run).
 
-    Converged when every matrix has ``off(A) / ||A||_F < tol``, checked every
-    ``check_every`` sweeps (each check is one host sync).
+    A is (n, n) or (B, n, n); only its lower triangle is used, as in
+    ``torch.linalg.eigh``. Converged when every matrix has
+    ``off(A) / ||A||_F < tol`` (default 1e-6 in FP32, 1e-13 in FP64),
+    checked every ``check_every`` sweeps (each check is one host sync).
     """
     squeeze = A.dim() == 2
     if squeeze:
         A = A.unsqueeze(0)
+    if tol is None:
+        tol = 1e-13 if A.dtype == torch.float64 else 1e-6
+    if max_sweeps is None:
+        max_sweeps = 20 if A.dtype == torch.float64 else 15
+    A = torch.tril(A) + torch.tril(A, -1).transpose(-2, -1)
+    n0 = A.shape[-1]
+    if n0 == 1:
+        w, V = A.reshape(A.shape[0], 1), torch.ones_like(A)
+        return (w[0], V[0], 0) if squeeze else (w, V, 0)
     Ap, n = _pad_even(A)
     np_ = Ap.shape[-1]
     W = torch.eye(np_, dtype=Ap.dtype, device=Ap.device).expand_as(Ap).contiguous()
