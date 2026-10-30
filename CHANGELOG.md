@@ -57,6 +57,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   input's device, like the eigh QR iteration (#42). CPU inputs are
   unchanged.
 
+## [0.16.0] — 2026-10-28
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron device) — see trnsci/trnsci#35.
+
 ### Fixed
 
 - **`eigh` on the native `neuron` device uses `torch.linalg.eigh` below
