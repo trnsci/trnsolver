@@ -208,6 +208,9 @@ if HAS_NKI:
                 return t.expand_dim(2).broadcast(2, size)
 
             # Partner rows: ps_m[p, g, :] = X[partner(p), g, :] (a permutation).
+            # Each matmul writes a whole 2 KiB PSUM bank (512 FP32 columns) or
+            # the bank-aligned tail, never a sub-bank column slice next to
+            # another matmul's output (the accumulate=False slice hazard).
             ps_m = nl.ndarray((P, ng, 2 * ne), dtype=f32, buffer=nl.psum)
             for c0 in range(0, ng, per_chunk):
                 c1 = min(ng, c0 + per_chunk)
