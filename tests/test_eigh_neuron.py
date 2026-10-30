@@ -18,6 +18,20 @@ import trnsolver
 pytestmark = pytest.mark.neuron
 
 
+def _xla_path() -> bool:
+    from trnsolver.nki.dispatch import HAS_NKI, _get_dispatch_path
+
+    return HAS_NKI and _get_dispatch_path() == "xla"
+
+
+# The two direct-kernel tests below call the raw kernels on torch_xla
+# tensors. tests/test_nki_native.py covers the same kernels as
+# trnsolver:: custom ops on the native path.
+xla_only = pytest.mark.skipif(
+    "not _xla_path()", reason="calls kernels on torch_xla tensors (XLA lineage only)"
+)
+
+
 class TestEighNKI:
     def test_identity(self):
         A = torch.eye(4)
@@ -77,6 +91,7 @@ class TestEighNKI:
         rhs = B @ V @ torch.diag(w)
         np.testing.assert_allclose(lhs.numpy(), rhs.numpy(), atol=1e-2)
 
+    @xla_only
     def test_matmul_tensor_engine(self):
         """matmul_kernel (nisa.nc_matmul) on XLA device matches torch.matmul.
 
@@ -100,6 +115,7 @@ class TestEighNKI:
         torch_xla.sync()
         np.testing.assert_allclose(C.cpu().numpy(), C_ref, atol=1e-3)
 
+    @xla_only
     def test_apply_reflectors_kernel(self):
         """apply_reflectors_kernel on XLA device: Q_T_out^T matches host _apply_reflectors.
 

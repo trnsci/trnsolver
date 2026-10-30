@@ -268,12 +268,17 @@ def gmres(
         if r_norm / b_norm < tol:
             return _restore(x, orig), total_iters, r_norm / b_norm
 
-        # Arnoldi process
+        # Arnoldi process. The Krylov basis V lives on b's device; the small
+        # Hessenberg matrix H and the RHS g live on the host. Every entry of
+        # H is already read back as a Python float, so keeping H on the host
+        # removes the per-element device writes and the device lstsq without
+        # adding syncs (rule 8 of the native port; CPU results unchanged).
+        host = torch.device("cpu")
         m = min(restart, n)
         V = torch.zeros(n, m + 1, dtype=b.dtype, device=b.device)
-        H = torch.zeros(m + 1, m, dtype=b.dtype, device=b.device)
+        H = torch.zeros(m + 1, m, dtype=b.dtype, device=host)
         V[:, 0] = r / r_norm
-        g = torch.zeros(m + 1, dtype=b.dtype, device=b.device)
+        g = torch.zeros(m + 1, dtype=b.dtype, device=host)
         g[0] = r_norm
 
         for j in range(m):
@@ -283,20 +288,21 @@ def gmres(
             # Modified Gram-Schmidt — FP64 inner products for numerical stability
             for i in range(j + 1):
                 H[i, j] = float(w.to(torch.float64).dot(V[:, i].to(torch.float64)))
-                w = w - H[i, j] * V[:, i]
+                w = w - H[i, j].item() * V[:, i]
 
-            H[j + 1, j] = torch.linalg.norm(w)
-            if H[j + 1, j].item() < 1e-14:
+            H[j + 1, j] = torch.linalg.norm(w).item()
+            h_next = H[j + 1, j].item()
+            if h_next < 1e-14:
                 m = j + 1
                 break
-            V[:, j + 1] = w / H[j + 1, j]
+            V[:, j + 1] = w / h_next
 
             # Check convergence via Givens rotations on g
             # (simplified: just check residual norm)
 
-        # Solve least-squares: min ||H @ y - g||
+        # Solve least-squares: min ||H @ y - g|| (host, (m+1) x m)
         y, _ = torch.linalg.lstsq(H[: m + 1, :m], g[: m + 1])[:2]
-        x = x + V[:, :m] @ y[:m]
+        x = x + V[:, :m] @ y[:m].to(V.device)
 
     r = b - matvec(x)
     return _restore(x, orig), total_iters, torch.linalg.norm(r).item() / b_norm

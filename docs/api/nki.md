@@ -24,7 +24,25 @@ Module-level boolean — `True` iff the `nki` package (NKI 0.3.0 Stable, Neuron 
 |----------|--------|
 | `TRNSOLVER_REQUIRE_NKI=1` | Kernel-path failures re-raise instead of silently falling back to PyTorch. Used by the validation suite to catch silent kernel breakage. |
 | `TRNSOLVER_EIGH_NKI_MIN_N=<n>` | On the native `neuron` device, `eigh` uses `torch.linalg.eigh` for matrices with fewer than `n` rows and the NKI path otherwise. Default 512; `0` always uses NKI. Ignored when `TRNSOLVER_REQUIRE_NKI=1`. (#42) |
+| `TRNSCI_NKI_DISPATCH=auto\|native\|xla\|cpu` | Suite-wide. Forces the native or XLA dispatch path; `auto` (default) detects. Forcing an unavailable path raises. |
+| `TRNSCI_XLA_DEPRECATION=1` | The XLA path emits one `DeprecationWarning`. Off by default. |
+| `NKI_ENABLE_TRACE_CACHE=0` | TorchNeuron (not trnsolver) setting. Turns off the cross-process NKI kernel cache, which cannot version editable installs. |
 | `TRNSOLVER_USE_SIMULATOR=1` | Route kernel dispatch through `nki.simulate(kernel)(numpy_args)` on CPU instead of torch_xla. No hardware needed. See [Developing kernels](../developing_kernels.md). |
+
+## Dispatch path
+
+On Neuron hardware, kernels run on one of two `torch-neuronx` lineages,
+detected on the first kernel launch:
+
+- **Native (TorchNeuron, Trn2/Trn3)**: each kernel is a PyTorch custom op
+  on `device="neuron"`, also callable directly and inside
+  `torch.compile(backend="neuron")`: `torch.ops.trnsolver.matvec`,
+  `rank2_update`, `matmul`, `matmul_fp32out`, `apply_reflectors`. The ops
+  are registered only once this path is selected.
+- **XLA (Trn1)**: kernels run on the `torch_xla` device, as before.
+
+`set_backend` is unaffected: it still chooses NKI vs PyTorch. See
+[Installation](../installation.md#two-neuron-pytorch-lineages).
 
 ## Jacobi rotation kernel
 
