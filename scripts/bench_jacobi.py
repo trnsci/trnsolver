@@ -13,7 +13,12 @@ Modes:
     compiled   the same step under ``torch.compile(backend="neuron",
                dynamic=False)``: one graph per step.
     nki        ``trnsolver.eigh(A.to("neuron"), method="jacobi")``: the
-               SBUF-resident one-sided Jacobi kernel.
+               SBUF-resident one-sided Jacobi kernel (the block kernel for
+               33 <= n <= 128; ``TRNSOLVER_JACOBI_BLOCK=0`` for the scalar one).
+    aten       ``trnsolver.eigh(A.to("neuron"))`` with the Jacobi auto region
+               off (``TRNSOLVER_EIGH_JACOBI_AUTO=off``): the default aten
+               cutover, host LAPACK plus copies.
+    auto       ``trnsolver.eigh(A.to("neuron"))``: the default dispatch.
 
 Accuracy is against float64 LAPACK: ``eig_err = max|w - w64| / max|w64|``,
 ``res = max_b ||A V - V diag(w)||_F / ||A||_F``, ``orth = max|V^T V - I|``.
@@ -107,6 +112,24 @@ def _run_nki(A, dev, sync, reps):
     return out, _time(run, reps, sync), JK.last_sweeps
 
 
+def _run_eigh_default(A, dev, sync, reps, region):
+    import os
+
+    import trnsolver
+
+    os.environ["TRNSOLVER_EIGH_JACOBI_AUTO"] = region
+
+    def run():
+        w, V = trnsolver.eigh(A.to(dev))
+        return w.cpu(), V.cpu()
+
+    try:
+        out = run()
+        return out, _time(run, reps, sync), 0
+    finally:
+        os.environ.pop("TRNSOLVER_EIGH_JACOBI_AUTO", None)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--modes", default="cpu,nki")
@@ -152,6 +175,10 @@ def main():
                     )
                 elif mode == "nki":
                     out, t, sweeps = _run_nki(A, dev, sync, args.reps)
+                elif mode == "aten":
+                    out, t, sweeps = _run_eigh_default(A, dev, sync, args.reps, "off")
+                elif mode == "auto":
+                    out, t, sweeps = _run_eigh_default(A, dev, sync, args.reps, "")
                 else:
                     raise ValueError(mode)
                 eig, res, orth = _acc(A64, *out)

@@ -25,8 +25,10 @@ Module-level boolean — `True` iff the `nki` package (NKI 0.3.0 Stable, Neuron 
 | `TRNSOLVER_REQUIRE_NKI=1` | Kernel-path failures re-raise instead of silently falling back to PyTorch. Used by the validation suite to catch silent kernel breakage. |
 | `TRNSOLVER_EIGH_NKI_MIN_N=<n>` | On the native `neuron` device, `eigh` uses `torch.linalg.eigh` for matrices with fewer than `n` rows and the NKI path otherwise. Default 512; `0` always uses NKI. Ignored when `TRNSOLVER_REQUIRE_NKI=1`. (#42) |
 | `TRNSOLVER_EIGH_METHOD=auto\|jacobi` | `eigh` method when `method=` is not passed. `jacobi` selects the batched Jacobi solver (#48). Default `auto`. |
-| `TRNSOLVER_JACOBI_GROUP=<g>` | Jacobi kernel: tiles per launch (rounded down to a power of two). Default 128 for n ≤ 32, 64 for n ≤ 64, 16 for n ≤ 128 (split across the two physical cores of a logical NeuronCore). |
-| `TRNSOLVER_JACOBI_CHAINS=<c>` | Jacobi kernel: independent dependency chains per step. Default 8 / 4 / 2 by the same size classes. |
+| `TRNSOLVER_JACOBI_GROUP=<g>` | Jacobi kernel: tiles per launch (rounded down to a power of two). Default 128 (n ≤ 32: scalar kernel; 33 ≤ n ≤ 128: block kernel), split across the two physical cores of a logical NeuronCore. |
+| `TRNSOLVER_JACOBI_CHAINS=<c>` | Jacobi kernel: independent dependency chains per step. Default 8 for n ≤ 32, 2 for the block kernel. |
+| `TRNSOLVER_JACOBI_BLOCK=0` | Run the scalar Jacobi kernel for 33 ≤ n ≤ 128 instead of the block kernel (#48). |
+| `TRNSOLVER_EIGH_JACOBI_AUTO=off\|<rows>` | Region where `method="auto"` runs the Jacobi kernel (FP32 batches on `neuron`). `off`, or rows `n_min-n_max:B_min`, e.g. `1-32:512,33-64:256`. Default: the measured table in `eigen._JACOBI_AUTO_REGION`. |
 | `TRNSCI_NKI_DISPATCH=auto\|native\|xla\|cpu` | Suite-wide. Forces the native or XLA dispatch path; `auto` (default) detects. Forcing an unavailable path raises. |
 | `TRNSCI_XLA_DEPRECATION=1` | The XLA path emits one `DeprecationWarning`. Off by default. |
 | `NKI_ENABLE_TRACE_CACHE=0` | TorchNeuron (not trnsolver) setting. Turns off the cross-process NKI kernel cache, which cannot version editable installs. |
@@ -41,7 +43,7 @@ detected on the first kernel launch:
   on `device="neuron"`, also callable directly and inside
   `torch.compile(backend="neuron")`: `torch.ops.trnsolver.matvec`,
   `rank2_update`, `matmul`, `matmul_fp32out`, `apply_reflectors`,
-  `jacobi_sweeps`. The ops
+  `jacobi_sweeps`, `jacobi_block`. The ops
   are registered only once this path is selected.
 - **XLA (Trn1)**: kernels run on the `torch_xla` device, as before.
 

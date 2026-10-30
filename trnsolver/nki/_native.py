@@ -89,6 +89,19 @@ def jacobi_sweeps(
     return _j.jacobi_sweeps_kernel(Z, V, consts, sched)
 
 
+@nki_op(
+    "trnsolver::jacobi_block",
+    mutates_args={},
+    fake_fn=lambda Z, V, consts, sched: Z.new_empty((2,) + tuple(Z.shape)),
+)
+def jacobi_block(
+    Z: torch.Tensor, V: torch.Tensor, consts: torch.Tensor, sched: torch.Tensor
+) -> torch.Tensor:
+    from . import jacobi as _j
+
+    return _j.jacobi_block_kernel(Z, V, consts, sched)
+
+
 # Keyed by the short op name used in `dispatch._launch`.
 OPS = {
     "matvec": matvec,
@@ -97,4 +110,5 @@ OPS = {
     "matmul_fp32out": matmul_fp32out,
     "apply_reflectors": apply_reflectors,
     "jacobi_sweeps": jacobi_sweeps,
+    "jacobi_block": jacobi_block,
 }

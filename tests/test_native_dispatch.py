@@ -30,6 +30,7 @@ EXPECTED_OPS = {
     "matmul_fp32out",
     "apply_reflectors",
     "jacobi_sweeps",
+    "jacobi_block",
 }
 
 
