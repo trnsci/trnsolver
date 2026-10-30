@@ -37,10 +37,13 @@ partition shuffle (an exact permutation matmul); the rotation itself is
 elementwise. ``X + K^T X`` keeps a small rotation's O(s^2) diagonal
 shrinkage (``c - 1 = -s^2 / (1 + c)``) instead of rounding c to 1.
 
-Measured on Trn2 (one NeuronCore, FP32), this formulation was the fastest of
-four: two-sided Jacobi with block-diagonal 128x128 tiles, two-sided compact
-with Tensor Engine quadrant tiling, one-sided with per-tile update matmuls,
-and this one (see #48 for the table).
+Under LNC=2 the kernel is traced once per physical core (``program_id``
+0 and 1) and each core takes half of the group's tiles.
+
+Measured on Trn2 (one logical NeuronCore, FP32), this formulation was the
+fastest of four: two-sided Jacobi with block-diagonal 128x128 tiles,
+two-sided compact with Tensor Engine quadrant tiling, one-sided with
+per-tile update matmuls, and this one (see #48 for the table).
 
 NKI 0.7 rules (checked by the MLIR verifier in tests/test_jacobi.py):
 every SBUF tile spans partitions 0..P-1; the (P, G) column math is

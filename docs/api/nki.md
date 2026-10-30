@@ -25,7 +25,7 @@ Module-level boolean — `True` iff the `nki` package (NKI 0.3.0 Stable, Neuron 
 | `TRNSOLVER_REQUIRE_NKI=1` | Kernel-path failures re-raise instead of silently falling back to PyTorch. Used by the validation suite to catch silent kernel breakage. |
 | `TRNSOLVER_EIGH_NKI_MIN_N=<n>` | On the native `neuron` device, `eigh` uses `torch.linalg.eigh` for matrices with fewer than `n` rows and the NKI path otherwise. Default 512; `0` always uses NKI. Ignored when `TRNSOLVER_REQUIRE_NKI=1`. (#42) |
 | `TRNSOLVER_EIGH_METHOD=auto\|jacobi` | `eigh` method when `method=` is not passed. `jacobi` selects the batched Jacobi solver (#48). Default `auto`. |
-| `TRNSOLVER_JACOBI_GROUP=<g>` | Jacobi kernel: tiles per launch (rounded down to a power of two). Default 128 for n ≤ 32, 32 for n ≤ 64, 8 for n ≤ 128. |
+| `TRNSOLVER_JACOBI_GROUP=<g>` | Jacobi kernel: tiles per launch (rounded down to a power of two). Default 128 for n ≤ 32, 64 for n ≤ 64, 16 for n ≤ 128 (split across the two physical cores of a logical NeuronCore). |
 | `TRNSOLVER_JACOBI_CHAINS=<c>` | Jacobi kernel: independent dependency chains per step. Default 8 / 4 / 2 by the same size classes. |
 | `TRNSCI_NKI_DISPATCH=auto\|native\|xla\|cpu` | Suite-wide. Forces the native or XLA dispatch path; `auto` (default) detects. Forcing an unavailable path raises. |
 | `TRNSCI_XLA_DEPRECATION=1` | The XLA path emits one `DeprecationWarning`. Off by default. |
