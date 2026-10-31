@@ -261,6 +261,7 @@ def no_env(monkeypatch):
     monkeypatch.delenv("TRNSOLVER_JACOBI_CHAINS", raising=False)
     monkeypatch.delenv("TRNSOLVER_JACOBI_BLOCK", raising=False)
     monkeypatch.delenv("TRNSOLVER_EIGH_JACOBI_AUTO", raising=False)
+    monkeypatch.delenv("TRNSOLVER_EIGH_CORES", raising=False)
 
 
 class TestTorchJacobi:
@@ -514,6 +515,100 @@ class TestDeviceDriverEmulated:
         assert emulated_kernel == []
 
 
+class TestMulticore:
+    @pytest.mark.parametrize(
+        "B,n,parts,expected",
+        [
+            (1024, 128, 4, [(0, 256), (256, 512), (512, 768), (768, 1024)]),
+            (10, 128, 4, [(0, 3), (3, 6), (6, 9), (9, 10)]),
+            (3, 128, 4, [(0, 1), (1, 2), (2, 3)]),
+            (9, 32, 2, [(0, 8), (8, 9)]),  # whole tiles of 4 matrices
+            (3, 32, 4, [(0, 3)]),  # one tile: no split
+            (100, 64, 1, [(0, 100)]),
+        ],
+    )
+    def test_split_batch(self, B, n, parts, expected):
+        assert JK.split_batch(B, n, parts) == expected
+
+    def test_matches_single_core(self, emulated_kernel):
+        A = _separated(13, 32, seed=11)
+        w1, V1 = JK.jacobi_eigh_device(A)
+        cpu = torch.device("cpu")
+        w, V = JK.jacobi_eigh_multicore(A, [cpu, cpu, cpu])
+        _check(A, w, V)
+        torch.testing.assert_close(w, w1)
+        assert JK.last_sweeps >= JK._SWEEPS0[32]
+
+    def test_cores_env(self, no_env, monkeypatch):
+        assert eigen._eigh_cores() == 1
+        for raw, want in [("4", 4), ("auto", "auto"), (" AUTO ", "auto"), ("0", 1), ("x", 1)]:
+            monkeypatch.setenv("TRNSOLVER_EIGH_CORES", raw)
+            assert eigen._eigh_cores() == want
+
+    def test_default_is_one_core(self, no_env):
+        X = _sym_batch(4096, 128)
+        assert eigen._jacobi_devices(X) == [X.device]
+
+    def test_device_choice(self, no_env, monkeypatch):
+        import sys
+        import types
+
+        monkeypatch.setattr(eigen, "_NATIVE_DEVICE_TYPE", "meta")
+        monkeypatch.setattr(eigen, "_use_simulator", lambda: False)
+        monkeypatch.setitem(
+            sys.modules, "torch_neuronx", types.SimpleNamespace(device_count=lambda: 4)
+        )
+        X = torch.empty(1024, 128, 128, device="meta")
+        monkeypatch.setenv("TRNSOLVER_EIGH_CORES", "2")
+        assert [d.index for d in eigen._jacobi_devices(X)] == [0, 1]
+        monkeypatch.setenv("TRNSOLVER_EIGH_CORES", "8")
+        assert len(eigen._jacobi_devices(X)) == 4
+        monkeypatch.setenv("TRNSOLVER_EIGH_CORES", "auto")
+        per = eigen._MULTICORE_MIN_PER_CORE[128]
+        assert len(eigen._jacobi_devices(X[: 4 * per])) == 4
+        assert len(eigen._jacobi_devices(X[: 2 * per])) == 2
+        assert len(eigen._jacobi_devices(X[: per - 1])) == 1
+        monkeypatch.setenv("TRNSOLVER_EIGH_CORES", "2")
+        assert eigen._jacobi_devices(torch.empty(8, 32, 32)) == [
+            torch.device("meta", 0),
+            torch.device("meta", 1),
+        ]
+        X2 = types.SimpleNamespace(device=torch.device("meta", 2), shape=(64, 32, 32))
+        monkeypatch.setenv("TRNSOLVER_EIGH_CORES", "4")
+        assert [d.index for d in eigen._jacobi_devices(X2)] == [2, 3, 0, 1]
+
+    def test_multicore_failure_falls_back_to_one_core(self, emulated_kernel, monkeypatch):
+        cpu = torch.device("cpu")
+        monkeypatch.setattr(eigen, "_jacobi_devices", lambda X: [cpu, cpu])
+
+        def boom(X, d):
+            raise RuntimeError("core busy")
+
+        monkeypatch.setattr(JK, "jacobi_eigh_multicore", boom)
+        monkeypatch.setattr(eigen, "_REQUIRE_NKI", False)
+        A = _separated(9, 32, seed=4)
+        w, V = trnsolver.eigh(A, method="jacobi")
+        _check(A, w, V)
+        assert emulated_kernel  # the single-core kernel ran, not the torch path
+        monkeypatch.setattr(eigen, "_REQUIRE_NKI", True)
+        with pytest.raises(RuntimeError, match="core busy"):
+            trnsolver.eigh(A, method="jacobi")
+
+    def test_eigh_routes_to_multicore(self, emulated_kernel, monkeypatch):
+        monkeypatch.setenv("TRNSOLVER_EIGH_CORES", "3")
+        calls = []
+        cpu = torch.device("cpu")
+        monkeypatch.setattr(eigen, "_jacobi_devices", lambda X: [cpu, cpu, cpu])
+        real = JK.jacobi_eigh_multicore
+        monkeypatch.setattr(
+            JK, "jacobi_eigh_multicore", lambda X, d: calls.append(len(d)) or real(X, d)
+        )
+        A = _separated(9, 32, seed=2)
+        w, V = trnsolver.eigh(A, method="jacobi")
+        _check(A, w, V)
+        assert calls == [3]
+
+
 # ----------------------------------------------------------------------
 # NKI simulator and MLIR verifier
 # ----------------------------------------------------------------------
@@ -686,3 +781,20 @@ class TestJacobiNeuron:
         A = _separated(5 * 4 + 1, 32, seed=7)  # 6 tiles -> 3 launches per sweep
         w, V = trnsolver.eigh(A, method="jacobi")
         _check(A, w, V, tol=5e-5)
+
+    @pytest.mark.parametrize("on_device", [False, True])
+    def test_multicore_split(self, monkeypatch, on_device):
+        import torch_neuronx
+
+        if torch_neuronx.device_count() < 2:
+            pytest.skip("needs >= 2 visible NeuronCores (NEURON_RT_VISIBLE_CORES)")
+        monkeypatch.setenv("TRNSOLVER_EIGH_CORES", "auto")
+        A = _separated(300, 128, seed=9)  # 300 // 128 -> 2 cores
+        X = A.to("neuron") if on_device else A
+        assert len(eigen._jacobi_devices(X)) == 2
+        for _ in range(2):  # first call runs the chunks in turn, then concurrently
+            w, V = trnsolver.eigh(X, method="jacobi")
+            assert w.device == X.device and V.device == X.device
+            # 300 x 128 columns: the sign normalisation in _check is ambiguous
+            # for a few, so check residual and orthogonality, not V itself.
+            _check(A, w.cpu(), V.cpu(), tol=5e-5, vecs=False)

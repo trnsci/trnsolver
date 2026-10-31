@@ -371,7 +371,9 @@ if HAS_NKI:
         tt(den, den, rr, add)
         ts(den, den, nl.maximum, _TINY)
         u = col()
-        # 1 / den = rsqrt(den)^2 (rsqrt is accurate; reciprocal is ~1e-3).
+        # 1 / den = rsqrt(den)^2 (den is clamped into the rsqrt table range;
+        # ScalarE reciprocal is ~1.5e-6 relative in range but silently
+        # returns 1e7 or 0 outside about |x| in [2^-42, 2^41]).
         nisa.activation(dst=u, op=nl.rsqrt, data=den)
         t = col()
         tt(t, gs, u, mul)
@@ -763,6 +765,13 @@ def gram_off(Zt: torch.Tensor) -> torch.Tensor:
 
 
 def jacobi_eigh_device(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batched symmetric eigh by the one-sided Jacobi kernel; see `_solve`."""
+    global last_sweeps
+    w, V, last_sweeps = _solve(A)
+    return w, V
+
+
+def _solve(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Batched symmetric eigh by the one-sided Jacobi kernel.
 
     Args:
@@ -770,7 +779,8 @@ def jacobi_eigh_device(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             used, as in ``torch.linalg.eigh``).
 
     Returns:
-        (w (B, n) ascending, V (B, n, n)) on A's device.
+        (w (B, n) ascending, V (B, n, n)) on A's device, and the sweep
+        count. The work stays on A's NeuronCore when A is on one.
 
     Runs ``_SWEEPS0[ne]`` sweeps (one launch per sweep and group of tiles),
     then one more sweep at a time while any matrix has a Gram off-diagonal
@@ -785,14 +795,16 @@ def jacobi_eigh_device(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     accumulated rotations (the block kernel's FP32 products of rotations
     especially) shows up mostly as column-norm drift, which this removes.
     """
-    global last_sweeps
     Bsz, n = A.shape[0], A.shape[-1]
     if n == 1:
-        last_sweeps = 0
-        return A.reshape(Bsz, 1).clone(), torch.ones_like(A)
+        return A.reshape(Bsz, 1).clone(), torch.ones_like(A), 0
     ne, b, P = block_layout(n)
     if _use_simulator():
         work = torch.device("cpu")
+    elif A.device.type == "neuron":
+        # Stay on A's NeuronCore (``neuron:k``): the multi-core split in
+        # `jacobi_eigh_multicore` hands each core its own chunk.
+        work = A.device
     else:
         from .dispatch import _work_device
 
@@ -855,7 +867,6 @@ def jacobi_eigh_device(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             break
         sweep()
         done += 1
-    last_sweeps = done
 
     Zt = unpack_compact(gathered(0).to(A.device), n, Bsz)[:, :n, :n]
     Vt = unpack_compact(gathered(1).to(A.device), n, Bsz)[:, :n, :n]
@@ -868,4 +879,85 @@ def jacobi_eigh_device(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     # ~100 ms at B = 1024, n = 128.
     rows = (order + torch.arange(Bsz, device=order.device).unsqueeze(1) * n).reshape(-1)
     Vt = Vt.reshape(Bsz * n, n).index_select(0, rows).reshape(Bsz, n, n)
-    return w, Vt.transpose(1, 2).contiguous()
+    return w, Vt.transpose(1, 2).contiguous(), done
+
+
+_POOL = None
+# (n, chunk sizes, cores) of the multi-core splits that have run once.
+_WARM: set = set()
+
+
+def _pool(workers: int):
+    global _POOL
+    if _POOL is None or _POOL._max_workers < workers:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _POOL = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="trnsolver-eigh")
+    return _POOL
+
+
+def split_batch(Bsz: int, n: int, parts: int) -> list[tuple[int, int]]:
+    """Split ``Bsz`` matrices into at most ``parts`` chunks ``[(start, stop)]``.
+
+    Chunks are whole tiles (``128 / ne`` matrices) and as even as possible,
+    so every core runs the same launch shapes.
+    """
+    b = block_layout(n)[1]
+    tiles = -(-Bsz // b)
+    parts = max(1, min(parts, tiles))
+    per = -(-tiles // parts)
+    out = []
+    start = 0
+    while start < Bsz:
+        stop = min(Bsz, start + per * b)
+        out.append((start, stop))
+        start = stop
+    return out
+
+
+def jacobi_eigh_multicore(
+    A: torch.Tensor, devices: list[torch.device]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`jacobi_eigh_device` with the batch split across NeuronCores.
+
+    Chunk ``i`` is solved on ``devices[i]`` by its own host thread
+    (launches, convergence checks and the final sort run per core). A chunk
+    whose core is A's own stays where it is; the others go through the
+    host, copied out of A's device before any kernel is queued there, and
+    their results come back through the host. The matrices are
+    independent, so the result equals the single-core one up to each chunk
+    converging on its own sweep count.
+
+    Measured on Trn2 (#48), the host staging is needed: with direct
+    ``neuron:0 -> neuron:k`` copies the split ran no faster than one core
+    (B = 1024, n = 128: 284, 290 and 302 ms on 1, 2 and 4 cores), and a
+    copy out of a busy core waits behind its queued kernels.
+    """
+    global last_sweeps
+    chunks = split_batch(A.shape[0], A.shape[-1], len(devices))
+    local = [devices[i] == A.device for i in range(len(chunks))]
+    staged = [None if local[i] else A[s:e].cpu() for i, (s, e) in enumerate(chunks)]
+
+    def solve(i):
+        s, e = chunks[i]
+        x = A[s:e] if local[i] else staged[i].to(devices[i])
+        w, V, sweeps = _solve(x)
+        if not local[i]:
+            w, V = w.cpu().to(A.device), V.cpu().to(A.device)
+        return w, V, sweeps
+
+    # NKI tracing is not thread-safe, and it runs on every dispatch-cache
+    # miss, including for kernels behind some aten ops (Trn2: concurrent
+    # first calls failed inside the tracer, or crashed). So the first call
+    # for a set of chunk shapes and cores runs the chunks one after another,
+    # and later calls run them concurrently.
+    key = (A.shape[-1], tuple(e - s for s, e in chunks), tuple(str(d) for d in devices))
+    if len(chunks) == 1 or key not in _WARM:
+        results = [solve(i) for i in range(len(chunks))]
+        _WARM.add(key)
+    else:
+        results = list(_pool(len(chunks)).map(solve, range(len(chunks))))
+    last_sweeps = max(r[2] for r in results)
+    if len(results) == 1:
+        return results[0][0], results[0][1]
+    return torch.cat([r[0] for r in results]), torch.cat([r[1] for r in results])

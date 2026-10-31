@@ -58,6 +58,8 @@ def eigh(
     region of ``_JACOBI_AUTO_REGION``: FP32 batches on the native ``neuron``
     device where the Jacobi kernel beats the aten cutover (see
     :func:`_jacobi_auto`; ``TRNSOLVER_EIGH_JACOBI_AUTO`` overrides it).
+    ``TRNSOLVER_EIGH_CORES=<k>|auto`` splits the kernel's batch across
+    logical NeuronCores (:func:`_jacobi_devices`); unset, it uses one.
 
     The NKI path (Householder tridiagonalization + implicit-shift QR) is
     eager-only: deflation and shift selection are data-dependent Python
@@ -357,6 +359,60 @@ def _jacobi_device_ok(n: int, dtype: torch.dtype) -> bool:
     return _get_dispatch_path() == "native"
 
 
+def _eigh_cores() -> int | str:
+    """``TRNSOLVER_EIGH_CORES``: a core count, ``"auto"``, or 1 (the default).
+
+    Unparseable or non-positive values mean 1.
+    """
+    raw = os.environ.get("TRNSOLVER_EIGH_CORES", "").strip().lower()
+    if raw == "auto":
+        return "auto"
+    try:
+        return max(1, int(raw)) if raw else 1
+    except ValueError:
+        return 1
+
+
+# TRNSOLVER_EIGH_CORES=auto: use as many cores as keep at least this many
+# matrices each, by padded size. Measured on Trn2 (#48), device input, host
+# output, 8 host CPUs, warm medians in ms on 1 / 2 / 4 logical cores:
+#
+#   n \ B   64               256              1024             4096
+#   32      9.3 / 9.6 / 16   11 / 14 / 20     27 / 22 / 23     113 / 60 / 42
+#   64      11 / 12 / 18     22 / 21 / 22     72 / 46 / 33     276 / 183 / 122
+#   128     27 / 23 / 26     79 / 48 / 41     309 / 202 / 127  1219 / 769 / 533
+#
+# A split costs a few ms of thread and host-staging overhead per core, so
+# it pays once each core has a few hundred small (or ~100 n = 128) matrices.
+_MULTICORE_MIN_PER_CORE = {32: 512, 64: 256, 128: 128}
+
+
+def _jacobi_devices(X: torch.Tensor) -> list[torch.device]:
+    """NeuronCores for the Jacobi kernel on X: X's own first, then the others.
+
+    One core (X's, or the default one for a host X) unless
+    ``TRNSOLVER_EIGH_CORES`` asks for more. ``auto`` uses every visible core
+    while each keeps at least ``_MULTICORE_MIN_PER_CORE`` matrices.
+    """
+    want = _eigh_cores()
+    if want == 1 or X.device.type not in (_NATIVE_DEVICE_TYPE, "cpu") or _use_simulator():
+        return [X.device]
+    import torch_neuronx
+
+    from .nki.jacobi import block_layout
+
+    count = torch_neuronx.device_count()
+    if want == "auto":
+        ne = block_layout(X.shape[-1])[0]
+        per = _MULTICORE_MIN_PER_CORE.get(ne, _MULTICORE_MIN_PER_CORE[32])
+        want = max(1, min(count, X.shape[0] // per))
+    want = min(want, count)
+    if want == 1:
+        return [X.device]
+    first = X.device.index or 0
+    return [torch.device(_NATIVE_DEVICE_TYPE, (first + i) % count) for i in range(want)]
+
+
 @torch.compiler.disable
 def _jacobi_eigh(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """``eigh(method="jacobi")`` for (n, n) or (..., n, n) input (#48)."""
@@ -373,9 +429,18 @@ def _jacobi_eigh(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         V = X.new_empty((0, n, n))
     elif _jacobi_device_ok(n, X.dtype):
         try:
-            from .nki.jacobi import jacobi_eigh_device
+            from .nki.jacobi import jacobi_eigh_device, jacobi_eigh_multicore
 
-            w, V = jacobi_eigh_device(X)
+            devices = _jacobi_devices(X)
+            if len(devices) > 1:
+                try:
+                    w, V = jacobi_eigh_multicore(X, devices)
+                except Exception:
+                    if _REQUIRE_NKI:
+                        raise
+                    w, V = jacobi_eigh_device(X)
+            else:
+                w, V = jacobi_eigh_device(X)
         except Exception:
             if _REQUIRE_NKI:
                 raise

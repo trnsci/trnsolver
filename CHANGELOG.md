@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Batched Jacobi `eigh` across NeuronCores, opt-in (#48).**
+  `TRNSOLVER_EIGH_CORES=<k>|auto` splits a `method="jacobi"` batch (and the
+  `method="auto"` Jacobi region) into whole-tile chunks, one per logical
+  NeuronCore, each solved by its own host thread. `auto` uses every visible
+  core while each keeps at least 512 / 256 / 128 matrices (padded n = 32 /
+  64 / 128). The default (unset or 1) is the single-core path, unchanged.
+  Chunks for other cores go through the host: direct core-to-core copies
+  gave no speed-up. The first call for a split shape runs the chunks in
+  turn, because NKI tracing (also inside aten ops) is not thread-safe; if
+  the split fails, `eigh` falls back to one core. Trn2, n = 128, B = 1024,
+  device input: 1 / 2 / 4 cores 309 / 202 / 127 ms (8 host CPUs);
+  batch-parallel CPU LAPACK on 8 threads 159 ms.
+- `scripts/bench_jacobi_multicore.py`: the 1 / 2 / 4-core, process-per-core
+  and CPU (batched, and batch-parallel threads) measurements.
+
+### Fixed
+
+- Native launches run on the input's NeuronCore (`neuron:k`) instead of
+  always on the current device, and the Jacobi driver keeps its work on a
+  NeuronCore-resident input's core.
+
 ## [0.18.0] — 2026-10-30
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron; LNC=1 and LNC=2) — see trnsci/trnsci#35.
