@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-10-31
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: opt-in batched Jacobi `eigh` across logical NeuronCores (`TRNSOLVER_EIGH_CORES`): n=128, B=1024 drops from 310 to 152 ms on four cores (#54); corrects the v0.18.0 CPU-baseline headline.
+
 ### Added
 
 - **Batched Jacobi `eigh` across NeuronCores, opt-in (#48).**
