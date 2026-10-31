@@ -661,23 +661,27 @@ if HAS_NKI:
 _DEVICE_CONSTS: dict = {}
 
 
-def _consts_on(n: int, chains: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+def _consts_on(
+    n: int, chains: int, device: torch.device, sweeps: int = 1
+) -> tuple[torch.Tensor, torch.Tensor]:
     """(consts, sched) for one launch, cached per device (no copy per launch)."""
     ne = block_layout(n)[0]
-    key = (ne, chains, str(device))
+    key = (ne, chains, str(device), sweeps)
     if key not in _DEVICE_CONSTS:
         consts = jacobi_constants(n).to(device)
-        sched = torch.zeros((1, ne, chains), dtype=torch.float32, device=device)
+        sched = torch.zeros((sweeps, ne, chains), dtype=torch.float32, device=device)
         _DEVICE_CONSTS[key] = (consts, sched)
     return _DEVICE_CONSTS[key]
 
 
-def _run_kernel(Z: torch.Tensor, V: torch.Tensor, n: int, chains: int) -> torch.Tensor:
-    """One launch (one sweep) on a group: simulator or device. Z, V: (G, P, ne)."""
+def _run_kernel(
+    Z: torch.Tensor, V: torch.Tensor, n: int, chains: int, sweeps: int = 1
+) -> torch.Tensor:
+    """One launch (``sweeps`` sweeps) on a group: simulator or device. Z, V: (G, P, ne)."""
     if _use_simulator():
         import nki as _nki
 
-        consts, sched = _consts_on(n, chains, torch.device("cpu"))
+        consts, sched = _consts_on(n, chains, torch.device("cpu"), sweeps)
         res = _nki.simulate(jacobi_sweeps_kernel)(
             Z.detach().cpu().contiguous().numpy(),
             V.detach().cpu().contiguous().numpy(),
@@ -687,7 +691,7 @@ def _run_kernel(Z: torch.Tensor, V: torch.Tensor, n: int, chains: int) -> torch.
         return torch.from_numpy(res).to(Z.device)
     from .dispatch import _launch
 
-    consts, sched = _consts_on(n, chains, Z.device)
+    consts, sched = _consts_on(n, chains, Z.device, sweeps)
     return _launch(jacobi_sweeps_kernel, "jacobi_sweeps", Z, V, consts, sched, device=Z.device)
 
 
@@ -849,19 +853,24 @@ def _solve(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
         for s, c, p in plan
     ]
 
-    def sweep():
+    def sweep(count=1):
         for k, (zg, vg, ch) in enumerate(groups):
-            res = run_kernel(zg, vg, n, ch)
+            res = run_kernel(zg, vg, n, ch) if count == 1 else run_kernel(zg, vg, n, ch, count)
             groups[k] = (res[0], res[1], ch)
 
     def gathered(i):
         parts = [g[i][:c] for g, (_, c, _) in zip(groups, plan, strict=True)]
         return parts[0] if len(parts) == 1 else torch.cat(parts, 0)
 
+    # TRNSOLVER_JACOBI_SWEEPS_PER_LAUNCH=k (scalar kernel only) runs the
+    # first sweeps k per launch: fewer launches and HBM round trips of the
+    # state, more kernel shapes to compile.
+    per_launch = 1 if block else max(1, _env_int("TRNSOLVER_JACOBI_SWEEPS_PER_LAUNCH", 1))
     done = 0
-    for _ in range(sweeps0):
-        sweep()
-        done += 1
+    while done < sweeps0:
+        k = min(per_launch, sweeps0 - done)
+        sweep(k)
+        done += k
     while done < _MAX_SWEEPS:
         if float(gram_off(unpack_compact(gathered(0), n, Bsz)).max()) < _TOL:
             break

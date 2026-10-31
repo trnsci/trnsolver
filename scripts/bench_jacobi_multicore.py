@@ -17,6 +17,14 @@ Modes:
              ``TRNSOLVER_EIGH_CORES=k``: device input, staged through the
              host to the other cores and back; timed from host input to
              host output like ``scripts/bench_jacobi.py``.
+    pool     ``trnsolver.eigh(A_host, method="jacobi")`` with
+             ``TRNSOLVER_EIGH_POOL=proc`` and ``TRNSOLVER_EIGH_CORES=k``:
+             the persistent worker-process pool of
+             ``trnsolver/nki/eigh_pool.py``, host input and output. Run it
+             in its own invocation: the pool's workers need cores this
+             process has not opened (no ``host``/``eigh`` modes alongside).
+             ``first_ms`` is the first call of each case (pool start and
+             kernel compile on the first case, compile only afterwards).
     proc     one process per core (``NEURON_RT_VISIBLE_CORES=i``), each
              solving its chunk from host input; the wall time of a rep is
              the slowest process. A reference for the threaded modes.
@@ -165,6 +173,8 @@ def main():
                 for k in ks:
                     sweeps = 0
                     err = float("nan")
+                    first = float("nan")
+                    extra = ""
                     if mode == "cpu":
                         out, t = _time(lambda A=A: torch.linalg.eigh(A), args.reps, sync)
                         err = _eig_err(A64, out[0])
@@ -190,13 +200,30 @@ def main():
                         os.environ.pop("TRNSOLVER_EIGH_CORES", None)
                         sweeps = JK.last_sweeps
                         err = _eig_err(A64, out[0])
+                    elif mode == "pool":
+                        os.environ["TRNSOLVER_EIGH_POOL"] = "proc"
+                        os.environ["TRNSOLVER_EIGH_CORES"] = str(k)
+                        t0 = time.perf_counter()
+                        trnsolver.eigh(A, method="jacobi")
+                        first = time.perf_counter() - t0
+                        out, t = _time(
+                            lambda A=A: trnsolver.eigh(A, method="jacobi"), args.reps, sync
+                        )
+                        os.environ.pop("TRNSOLVER_EIGH_CORES", None)
+                        sweeps = JK.last_sweeps
+                        err = _eig_err(A64, out[0])
+                        from trnsolver.nki import eigh_pool
+
+                        wk = eigh_pool._POOL.last_times if eigh_pool._POOL else []
+                        extra = " worker_ms=" + "/".join(f"{x * 1e3:.0f}" for x in wk)
                     elif mode == "proc":
                         t = _run_proc(n, B, k, args.reps, list(range(k)))
                     else:
                         raise ValueError(mode)
                     print(
                         f"RESULT mode={mode} cores={k} threads={args.threads} n={n} B={B} "
-                        f"ms={t * 1e3:.2f} sweeps={sweeps} eig_err={err:.1e}",
+                        f"ms={t * 1e3:.2f} sweeps={sweeps} eig_err={err:.1e} "
+                        f"first_ms={first * 1e3:.0f}{extra}",
                         flush=True,
                     )
 
