@@ -102,9 +102,11 @@ them only without the packed copy (`--jk-square`).
 
 Energy against the float64 reference: the fp32 total energy is off by
 8e-6 to 6e-4 Eh on the device and up to 2e-2 Eh on the CPU (fp32
-accumulation in the host BLAS J and K; at C10H22, 1.6e-3 Eh from J and
-7e-4 from K), but re-evaluating it in float64 at the fp32 orbitals
-(`E(C)`) gives 2e-10 to 5e-7 Eh up to n_ao = 490 and 5e-8 to 1e-7 Eh at 970.
+accumulation in the host BLAS J and K; at C10H22 with a laptop BLAS,
+1.6e-3 Eh from J and 7e-4 Eh from K). Re-evaluating it in float64 at the
+fp32 orbitals (`E(C)`) gives 2e-10 to 5e-7 Eh up to n_ao = 490 and 5e-8
+to 1e-7 Eh at 970, so the fp32 loops converge to the right orbitals; a
+final float64 energy evaluation recovers the energy.
 
 Median per-iteration stage times on the device (ms):
 
