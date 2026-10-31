@@ -52,7 +52,7 @@ Headline performance: batched Jacobi `eigh(A, method="jacobi")` kernel on Trn2, 
 
 - **`eigh(A, method="jacobi")`: batched Jacobi eigensolver (#48).** Accepts
   `(n, n)` or `(..., n, n)`; `TRNSOLVER_EIGH_METHOD=jacobi` selects it when
-  `method` is not given. Opt-in when added: the default `auto` dispatch, including the
+  `method` is not given. Opt-in: the default `auto` dispatch, including the
   aten cutover for n < 512, is unchanged.
   - On the native `neuron` device (FP32, n <= 128) it runs the one-sided
     (Hestenes) Jacobi kernel in `trnsolver/nki/jacobi.py`: up to 128 tiles
