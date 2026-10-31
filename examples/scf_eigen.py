@@ -8,8 +8,9 @@ Demonstrates the self-consistent field iteration for quantum chemistry:
     4. Check convergence (energy change, density change)
 
 This is the inner loop that runs before DF-MP2 (trnblas).
-The eigenvalue solve is the bottleneck for small-to-medium molecules;
-for large molecules the Fock build (GEMM-dominated, trnblas) dominates.
+For the density-fitted version built from trnblas / trntensor / trnsolver,
+with stage timings and an fp64 comparison, see examples/scf_df_rhf.py and
+scripts/bench_scf.py.
 
 Usage:
     python examples/scf_eigen.py --demo
@@ -30,20 +31,19 @@ def scf_iteration(
     eri: torch.Tensor,  # (n, n, n, n) — two-electron integrals (simplified)
     nocc: int,  # Number of occupied orbitals
     max_iter: int = 50,
-    tol: float = 1e-8,
+    tol: float = 1e-5,  # fp32 cannot resolve dP or dE much below 1e-6
 ) -> dict:
     """Run SCF iteration.
 
     Returns dict with energy, MO coefficients, orbital energies.
     """
-    H_core.shape[0]
-
     # Initial guess: diagonalize H_core
     eps, C = trnsolver.eigh_generalized(H_core, S)
     C_occ = C[:, :nocc]
 
-    # Density matrix
-    P = C_occ @ C_occ.T
+    # Closed-shell density matrix: two electrons per occupied orbital, so
+    # F = H + J - K/2 and E = tr P (H + F) / 2 below are consistent.
+    P = 2.0 * C_occ @ C_occ.T
 
     energies = []
 
@@ -55,16 +55,16 @@ def scf_iteration(
         K = torch.einsum("ls,mlns->mn", P, eri)
         F = H_core + J - 0.5 * K
 
+        # Energy of the density F was built from: E = Σ_μν P_μν (H_core + F)_μν / 2.
+        energy = 0.5 * torch.sum(P * (H_core + F)).item()
+        energies.append(energy)
+
         # Solve FC = SCε
         eps, C = trnsolver.eigh_generalized(F, S)
 
         # New density from occupied orbitals
         C_occ = C[:, :nocc]
-        P_new = C_occ @ C_occ.T
-
-        # Energy: E = Σ_μν P_μν (H_core_μν + F_μν)
-        energy = 0.5 * torch.sum(P_new * (H_core + F)).item()
-        energies.append(energy)
+        P_new = 2.0 * C_occ @ C_occ.T
 
         # Check convergence
         dP = torch.linalg.norm(P_new - P).item()

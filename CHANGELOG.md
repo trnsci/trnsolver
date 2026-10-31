@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DF-RHF SCF end to end on the trnsci libraries (#15).**
+  `examples/scf_df_rhf.py` runs closed-shell density-fitted Hartree-Fock with
+  the J/K build on packed three-centre integrals (`trnblas.gemv`/`syrk`,
+  `trntensor.einsum`/`unpack_tril`), DIIS, and `trnsolver.eigh` (or
+  `eigh_generalized`) per iteration, on the host or a NeuronCore. Systems: a
+  synthetic s-Gaussian H2 lattice with closed-form integrals (no
+  dependencies), or PySCF integrals for real molecules (water, benzene,
+  C_kH_2k+2). `scripts/bench_scf.py` times each stage per iteration, CPU
+  against device against float64, and one `eigh` at SCF sizes
+  (`--eigh-only`). The float64 loop matches PySCF's DF-RHF energy to
+  1e-11 Eh. On Trn2 (one logical core, host pinned to 2 CPUs), time to
+  convergence is 11x (n_ao = 250), 38x (490) and 97x (970, unpacked
+  integrals resident) faster than the same loop on those 2 CPUs; below
+  n_ao ~ 128 the device is slower. J/K dominates the device loop from
+  n_ao = 250 up (73-83% at 970), `eigh` (host LAPACK through aten) at
+  n_ao = 114-128. Options: J/K split over NeuronCores (`neuron-jk<k>`
+  modes; 1.4x on 4 cores), resident unpacked integrals (`--jk-square`),
+  and a GEMM-only purification solver (`--solver purify`, slower than the
+  host `eigh` at every measured size; kept as the measured experiment).
+  Tests: `tests/test_scf_df_rhf.py` (CPU).
 - **Process-pool multi-core Jacobi `eigh`, opt-in (#29).**
   `TRNSOLVER_EIGH_POOL=proc` (with `TRNSOLVER_EIGH_CORES=<k>|auto`) solves a
   host batch on persistent worker processes, one per logical NeuronCore
@@ -29,6 +49,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/bench_jacobi_multicore.py --modes pool`, and
   `scripts/probe_large_n_split.py`, the step-cost probe behind the
   single-matrix multi-core verdict in #29.
+
+### Fixed
+
+- **`eigh` of a host tensor on a TorchNeuron host no longer runs the NKI
+  path (#15).** With the default backend, a CPU tensor skipped the #42
+  cutover and drove the launch-bound NKI tridiagonalization through the
+  device: 265 s for one n = 64 call on Trn2 (first call, with compiles),
+  against 0.15 ms for LAPACK. Host inputs on the native path now take the
+  cutover, i.e. host LAPACK. `TRNSOLVER_EIGH_NKI_MIN_N=0`,
+  `TRNSOLVER_REQUIRE_NKI=1` and the simulator keep the kernel path.
+- `examples/scf_eigen.py`: the closed-shell density is `P = 2 C_occ C_occ^T`
+  (was `C_occ C_occ^T`, inconsistent with `F = H + J - K/2`), the energy is
+  evaluated at the density the Fock matrix was built from, and the default
+  tolerance is 1e-5 (1e-8 is below what fp32 resolves; the demo never
+  converged).
 
 ## [0.19.0] — 2026-10-31
 

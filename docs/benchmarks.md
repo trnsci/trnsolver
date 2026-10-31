@@ -78,6 +78,58 @@ Reproduce: `AWS_PROFILE=aws ./scripts/run_cuda_tests.sh g5`.
 
 _Pending — classical Jacobi was architecturally mismatched to NKI (see [#9](https://github.com/trnsci/trnsolver/issues/9) post-mortem). Phase 1 redesign is iterating against the new NKI 0.3.0 CPU simulator (Neuron SDK 2.29, April 2026) with full-sweep Jacobi / Householder-QR / block-Jacobi candidates; hardware numbers will land once the redesigned kernel validates in simulation._
 
+## DF-RHF SCF end to end (Trn2, #15)
+
+`scripts/bench_scf.py` on trn2.3xlarge, SDK 2.33 native TorchNeuron, LNC=2,
+one logical NeuronCore, host threads pinned to one physical core
+(`OMP_NUM_THREADS=2 taskset -c 2,8`). PySCF cc-pVDZ / cc-pvdz-jkfit
+integrals (`h2-lattice:16` is the synthetic s-Gaussian system). fp32 on
+CPU and device; the reference is PySCF's float64 DF-RHF energy on the same
+integrals, which the float64 loop (`cpu64`) reproduces to 1e-11 Eh. Warm
+times; the first run of each shape pays a one-off compile (6-10 s at water,
+92-455 s at n_ao = 970). The CPU runs keep the unpacked integrals resident
+(at n_ao = 970, `--k-cache-gb 24`); the device's 24 GB per logical core
+holds them only without the packed copy (`--jk-square`).
+
+| system | n_ao / naux / nocc | CPU fp32: iters, total | device: iters, total | speedup |
+|---|---|---|---|---|
+| water | 24 / 116 / 5 | 9, 5.0 ms | 8, 37.7 ms | 0.13x |
+| benzene | 114 / 558 / 21 | 9, 97.6 ms | 8, 88.2 ms | 1.1x |
+| h2-lattice:16 | 128 / 256 / 16 | 10, 81.6 ms | 8, 52.6 ms | 1.6x |
+| C10H22 | 250 / 1206 / 41 | 16, 2.75 s | 12, 0.24 s | 11x |
+| C20H42 | 490 / 2366 / 81 | 14, 26.3 s | 14, 0.69 s | 38x |
+| C40H82 | 970 / 4686 / 161 | 22, 497 s | 22, 9.7 s (packed); 18, 5.1 s (`--jk-square`); 18, 3.9 s (`--jk-square`, J/K on 4 cores) | 51x; 97x; 128x |
+
+Median per-iteration stage times on the device (ms):
+
+| system | J/K | DIIS | eigh | other | largest |
+|---|---|---|---|---|---|
+| benzene | 3.07 | 2.10 | 3.28 | 3.23 | eigh (28%) |
+| C10H22 | 8.28 | 3.24 | 6.80 | 3.35 | J/K (38%) |
+| C20H42 | 27.9 | 6.09 | 15.7 | 1.71 | J/K (54%) |
+| C40H82 (packed) | 359 | 6.48 | 65.4 | 4.04 | J/K (83%) |
+| C40H82 (`--jk-square`) | 213 | 6.89 | 67.4 | 4.13 | J/K (73%) |
+
+On the CPU, J/K is 86-99% of every iteration from n_ao = 114 up.
+
+J/K split over logical NeuronCores at C40H82 (whole chip, `neuron-jk<k>`
+modes, one Python thread issuing to every core, inputs and partial
+results staged through the host): per iteration 441 / 340 / 322 ms on
+1 / 2 / 4 cores with packed integrals, 285 / 222 / 216 ms with
+`--jk-square`. The J/K stage itself goes 213 -> 149 ms on 4 cores (1.4x).
+Within one aux block of 532 at n_ao = 970, the gather that unpacks the
+packed triangle takes 28 ms, the half-transform GEMM 5.7 ms, the permute
+4.4 ms and the SYRK 5.8 ms; the two GEMMs run at about 28 TFLOP/s.
+
+`eigh` here is one n x n solve per iteration. On a `neuron` tensor it is
+`torch.linalg.eigh`, which TorchNeuron computes on the host: 1.5 / 2.2 /
+4.4 / 17 / 105 ms at n = 64 / 128 / 256 / 512 / 1024, against 0.15 / 0.58 /
+2.5 / 12 / 91 ms for host LAPACK on the same two threads. The batched
+Jacobi kernel and the process pool are for batches; for one n = 64 / 128
+matrix the Jacobi kernel takes 8.6 / 12 ms. A GEMM-only replacement
+(canonical purification, `--solver purify`) took 36 / 48 / 111 ms
+compiled at n = 250 / 490 / 970.
+
 ## Notes
 
 - `inv_sqrt_spd_ns` is Newton-Schulz — all GEMM. On CPU it loses to the eigendecomposition path because eigh is heavily optimized in LAPACK/MKL. On GPU it wins at n ≥ 256 because the workload shape fits the Tensor Core pipeline. Trainium's Tensor Engine should show a similar win once `trnblas` GEMM validates on hardware.

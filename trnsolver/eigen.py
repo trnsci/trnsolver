@@ -529,15 +529,34 @@ def _eigh_nki_min_n() -> int:
 def _eigh_aten_cutover(A: torch.Tensor) -> bool:
     """True iff eigh should use aten instead of the NKI kernels for A.
 
-    Applies only to tensors on the native ``neuron`` device with
-    n < ``_eigh_nki_min_n()``. ``TRNSOLVER_REQUIRE_NKI=1`` disables it, so
+    Applies to tensors on the native ``neuron`` device, and to host tensors
+    when the kernels would run on that device (:func:`_host_input_on_native_path`),
+    with n < ``_eigh_nki_min_n()``. ``TRNSOLVER_REQUIRE_NKI=1`` disables it, so
     the hardware suite keeps exercising the kernels.
     """
     if _REQUIRE_NKI:
         return False
-    if A.device.type != _NATIVE_DEVICE_TYPE:
+    if A.device.type != _NATIVE_DEVICE_TYPE and not _host_input_on_native_path(A):
         return False
     return A.shape[-1] < _eigh_nki_min_n()
+
+
+def _host_input_on_native_path(A: torch.Tensor) -> bool:
+    """True iff A is a host tensor and the NKI kernels would run on TorchNeuron.
+
+    The NKI path copies a host input to the ``neuron`` device and drives the
+    same launch-bound tridiagonalization as for a device input, so on a
+    Neuron host the default backend turned ``eigh`` of a CPU tensor into
+    minutes of kernel launches and compiles (265 s at n = 64 on Trn2, first
+    call, against 0.15 ms for LAPACK; #15). Such inputs take the cutover
+    too, which for a host tensor is host LAPACK. The simulator keeps the
+    kernel path.
+    """
+    if A.device.type != "cpu" or _use_simulator():
+        return False
+    from .nki.dispatch import _get_dispatch_path
+
+    return _get_dispatch_path() == "native"
 
 
 @torch.compiler.disable

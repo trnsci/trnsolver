@@ -31,6 +31,9 @@ def _fix_signs(V):
 def no_require(monkeypatch):
     monkeypatch.setattr(eigen, "_REQUIRE_NKI", False)
     monkeypatch.delenv("TRNSOLVER_EIGH_NKI_MIN_N", raising=False)
+    # Host inputs cut over only on the native path; pin "not native" so the
+    # tests behave the same on a Neuron host. TestHostInputNativePath covers it.
+    monkeypatch.setattr(eigen, "_host_input_on_native_path", lambda A: False)
 
 
 class TestCutoverPredicate:
@@ -121,6 +124,52 @@ class TestCutoverRouting:
         w, V = trnsolver.eigh(A)
         assert routed == []
         assert w.dtype == torch.bfloat16 and V.dtype == torch.bfloat16
+
+
+class TestHostInputNativePath:
+    """Host tensors on a TorchNeuron host take the cutover too (#15)."""
+
+    @pytest.fixture
+    def native(self, monkeypatch):
+        from trnsolver.nki import dispatch
+
+        monkeypatch.setattr(eigen, "_REQUIRE_NKI", False)
+        monkeypatch.delenv("TRNSOLVER_EIGH_NKI_MIN_N", raising=False)
+        monkeypatch.setattr(eigen, "_use_simulator", lambda: False)
+        monkeypatch.setattr(dispatch, "_get_dispatch_path", lambda: "native")
+
+    @pytest.mark.parametrize("n", [16, 64, 128])
+    def test_host_input_cuts_over(self, native, n):
+        assert eigen._eigh_aten_cutover(_stub(n, "cpu"))
+
+    def test_env_zero_keeps_kernels(self, native, monkeypatch):
+        monkeypatch.setenv("TRNSOLVER_EIGH_NKI_MIN_N", "0")
+        assert not eigen._eigh_aten_cutover(_stub(64, "cpu"))
+
+    def test_require_nki_keeps_kernels(self, native, monkeypatch):
+        monkeypatch.setattr(eigen, "_REQUIRE_NKI", True)
+        assert not eigen._eigh_aten_cutover(_stub(64, "cpu"))
+
+    @pytest.mark.parametrize("path", ["xla", "cpu"])
+    def test_other_paths_keep_kernels(self, native, monkeypatch, path):
+        from trnsolver.nki import dispatch
+
+        monkeypatch.setattr(dispatch, "_get_dispatch_path", lambda: path)
+        assert not eigen._eigh_aten_cutover(_stub(64, "cpu"))
+
+    def test_simulator_keeps_kernels(self, native, monkeypatch):
+        monkeypatch.setattr(eigen, "_use_simulator", lambda: True)
+        assert not eigen._eigh_aten_cutover(_stub(64, "cpu"))
+
+    def test_eigh_runs_lapack(self, native, monkeypatch, sym_matrix):
+        def boom(A, tol=1e-10):
+            raise AssertionError("NKI path taken for a host tensor")
+
+        monkeypatch.setattr(eigen, "_use_nki", lambda: True)
+        monkeypatch.setattr(eigen, "_householder_qr_eigh", boom)
+        A = sym_matrix(32)
+        w, _ = trnsolver.eigh(A)
+        np.testing.assert_allclose(w.numpy(), torch.linalg.eigvalsh(A).numpy(), atol=1e-5)
 
 
 class TestAtenOnDevice:
