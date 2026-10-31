@@ -7,11 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.17.0] — 2026-10-30
+## [0.18.0] — 2026-10-30
 
-Native TorchNeuron dispatch (Trn2/Trn3) alongside the PyTorch/XLA path (Trn1, maintenance); validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0) — see trnsci/trnsci#35.
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron; LNC=1 and LNC=2) — see trnsci/trnsci#35.
 
-Headline performance: batched Jacobi `eigh(A, method="jacobi")` kernel on Trn2, 40.2 ms vs 60.5 ms for CPU LAPACK at n=32, B=1024 (#50); the native `eigh` cutover to `torch.linalg.eigh` below n=512 stays the default.
+Headline performance: block Jacobi kernel for 33 ≤ n ≤ 128 and a measured `eigh(method="auto")` region; inside it batched `eigh` on Trn2 is 1.5–2.2× faster than CPU LAPACK, e.g. 321 vs 668 ms at n=128, B=1024 (#52).
 
 ### Added
 
@@ -33,6 +33,23 @@ Headline performance: batched Jacobi `eigh(A, method="jacobi")` kernel on Trn2, 
   with B >= 64), where it beats the default aten cutover. Outside it the
   cutover is unchanged. `TRNSOLVER_EIGH_JACOBI_AUTO=off|n_min-n_max:B_min,...`
   overrides it.
+
+### Changed
+
+- Jacobi device driver: eigenvectors are returned with unit columns and the
+  eigenvalues as Rayleigh quotients `v.z / v.v - sigma`; eigenvectors are
+  reordered with one row `index_select` instead of `torch.gather` (102 ms ->
+  2 ms on device at B = 1024, n = 128). The scalar kernel's partner
+  permutation matmuls set `is_stationary_onezero`.
+
+## [0.17.0] — 2026-10-30
+
+Native TorchNeuron dispatch (Trn2/Trn3) alongside the PyTorch/XLA path (Trn1, maintenance); validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0) — see trnsci/trnsci#35.
+
+Headline performance: batched Jacobi `eigh(A, method="jacobi")` kernel on Trn2, 40.2 ms vs 60.5 ms for CPU LAPACK at n=32, B=1024 (#50); the native `eigh` cutover to `torch.linalg.eigh` below n=512 stays the default.
+
+### Added
+
 - **`eigh(A, method="jacobi")`: batched Jacobi eigensolver (#48).** Accepts
   `(n, n)` or `(..., n, n)`; `TRNSOLVER_EIGH_METHOD=jacobi` selects it when
   `method` is not given. Opt-in when added: the default `auto` dispatch, including the
@@ -90,11 +107,6 @@ Headline performance: batched Jacobi `eigh(A, method="jacobi")` kernel on Trn2, 
 
 ### Changed
 
-- Jacobi device driver: eigenvectors are returned with unit columns and the
-  eigenvalues as Rayleigh quotients `v.z / v.v - sigma`; eigenvectors are
-  reordered with one row `index_select` instead of `torch.gather` (102 ms ->
-  2 ms on device at B = 1024, n = 128). The scalar kernel's partner
-  permutation matmuls set `is_stationary_onezero`.
 - **Householder tridiagonalization keeps its scalar work on the host.**
   `_householder_tridiag` reads column k of the working matrix once per step
   and computes the norm, sign, `v`, `v·v`, `v·w` and `u` on CPU copies; only
