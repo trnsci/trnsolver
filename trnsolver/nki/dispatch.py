@@ -82,6 +82,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import threading
 import warnings
 
 import torch
@@ -161,6 +162,7 @@ def _use_simulator() -> bool:
 # imports torch_xla.
 
 _NEURON_DEVICE = "neuron"
+_LAUNCH_LOCK = threading.Lock()
 _dispatch_path: str | None = None
 _native_ops: dict | None = None
 _xla_deprecation_warned = False
@@ -293,7 +295,18 @@ def _launch(
     out_device = tensors[0].device if device is None else device
     if _get_dispatch_path() == "native":
         op = _get_native_ops()[op_name]
-        return op(*(t.to(_NEURON_DEVICE) for t in tensors)).to(out_device)
+        # Launch on the output's NeuronCore when it is one (``neuron:k``, so
+        # a multi-core driver can keep each chunk on its own core), else on
+        # the current ``neuron`` device.
+        run_on = out_device if out_device.type == _NEURON_DEVICE else _NEURON_DEVICE
+        args = [t.to(run_on) for t in tensors]
+        # NKI kernel tracing (on a dispatch-cache miss) is not thread-safe:
+        # concurrent first calls from per-core threads fail inside the
+        # tracer. The call itself only enqueues work, so serialising it
+        # keeps the cores' execution concurrent.
+        with _LAUNCH_LOCK:
+            out = op(*args)
+        return out.to(out_device)
     import torch_neuronx  # noqa: F401
     import torch_xla
 
