@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-10-31
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: opt-in per-core worker-process pool for batched Jacobi `eigh` (`TRNSOLVER_EIGH_POOL=proc`): 3.65× scaling on 4 cores, 1.75–2.0× faster than 8-thread CPU at n=64–128, B≥1024 (#57); host tensors now take the host-LAPACK cutover on TorchNeuron hosts (an n=64 call was 265 s, now 0.15 ms), and a DF-RHF SCF example built from the suite (#58).
+
 ### Added
 
 - **DF-RHF SCF end to end on the trnsci libraries (#15).**
