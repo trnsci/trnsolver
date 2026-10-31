@@ -94,6 +94,14 @@ python examples/scf_eigen.py --nbasis 50 --nocc 10
 
 Demonstrates the self-consistent-field iteration: build Fock matrix → solve generalized eigenproblem `FC = SCε` → build density → check convergence. This is the headline use case for quantum-chemistry workflows, feeding into DF-MP2 via `trnblas`.
 
+`examples/scf_df_rhf.py` is the end-to-end version: density-fitted restricted Hartree–Fock with the J/K build on packed three-centre integrals (`trnblas`, `trntensor`), DIIS, and `trnsolver.eigh` every iteration, on the host or a NeuronCore. `scripts/bench_scf.py` times each stage against the CPU and float64 (PySCF integrals for real molecules if PySCF is installed; a synthetic s-Gaussian H2 lattice otherwise):
+
+```bash
+python examples/scf_df_rhf.py --system h2-lattice:16
+python scripts/bench_scf.py --systems h2-lattice:16 --modes cpu,cpu64
+python scripts/bench_scf.py --systems pyscf:alkane20 --modes cpu,neuron,neuron-nosync   # on Trn2
+```
+
 ## Status
 
 **v0.18.0** — Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron; LNC=1 and LNC=2; trnsci/trnsci#35). `eigh(A, method="jacobi")` gains a block Jacobi NKI kernel for 33 ≤ n ≤ 128 (padded sizes 64 and 128), and `eigh(method="auto")` now uses the Jacobi kernel for FP32 batches on the `neuron` device inside a measured (n, B) region, where it beats the aten cutover (#52). Inside that region batched `eigh` is 1.5–2.2× faster than CPU LAPACK; at n=128, B=1024 it takes 321 ms against 668 ms. Outside the region the default cutover is unchanged.

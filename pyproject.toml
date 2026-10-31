@@ -57,6 +57,9 @@ dev = [
     "pytest-cov>=4.0",
     "ruff>=0.6",
     "scipy>=1.11",
+    # examples/scf_df_rhf.py (tests/test_scf_df_rhf.py) composes the suite.
+    "trnblas>=0.9",
+    "trntensor>=0.20",
 ]
 
 [project.urls]
