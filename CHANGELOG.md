@@ -20,14 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against device against float64, and one `eigh` at SCF sizes
   (`--eigh-only`). The float64 loop matches PySCF's DF-RHF energy to
   1e-11 Eh. On Trn2 (one logical core, host pinned to 2 CPUs), time to
-  convergence is 11x (n_ao = 250), 38x (490) and 97x (970, unpacked
-  integrals resident) faster than the same loop on those 2 CPUs; below
-  n_ao ~ 128 the device is slower. J/K dominates the device loop from
-  n_ao = 250 up (73-83% at 970), `eigh` (host LAPACK through aten) at
-  n_ao = 114-128. Options: J/K split over NeuronCores (`neuron-jk<k>`
-  modes; 1.4x on 4 cores), resident unpacked integrals (`--jk-square`),
-  and a GEMM-only purification solver (`--solver purify`, slower than the
-  host `eigh` at every measured size; kept as the measured experiment).
+  convergence is 9.5x (n_ao = 250), 38x (490) and 51x / 78x (970, packed /
+  resident unpacked integrals) faster than the same loop on those 2 CPUs;
+  below n_ao ~ 128 the device is slower. `eigh` (host LAPACK through aten)
+  is the largest device stage up to n_ao = 250 (32-39%), J/K from 490 up
+  (54%, then 72-83% at 970). Options: J/K split over NeuronCores
+  (`neuron-jk<k>` modes; 1.5x on the J/K stage with 4 cores), resident
+  unpacked integrals (`--jk-square`), and a GEMM-only purification solver
+  (`--solver purify`; slower than the host `eigh` at every measured size,
+  kept as the measured experiment).
   Tests: `tests/test_scf_df_rhf.py` (CPU).
 - **Process-pool multi-core Jacobi `eigh`, opt-in (#29).**
   `TRNSOLVER_EIGH_POOL=proc` (with `TRNSOLVER_EIGH_CORES=<k>|auto`) solves a

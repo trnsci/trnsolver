@@ -391,7 +391,8 @@ class DFJK:
     a tensor moved between NeuronCores directly stays on its source core.
     Work is issued to every core before any result is read back, so the
     cores run concurrently. One Python thread issues it all: at n_ao = 970
-    the J/K stage went 359 -> 253 ms on 1 -> 4 logical cores (Trn2, #15).
+    the J/K stage went 213 -> 139 ms on 1 -> 4 logical cores with resident
+    squares (Trn2, #15).
     """
 
     def __init__(

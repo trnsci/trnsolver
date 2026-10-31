@@ -87,36 +87,44 @@ integrals (`h2-lattice:16` is the synthetic s-Gaussian system). fp32 on
 CPU and device; the reference is PySCF's float64 DF-RHF energy on the same
 integrals, which the float64 loop (`cpu64`) reproduces to 1e-11 Eh. Warm
 times; the first run of each shape pays a one-off compile (6-10 s at water,
-92-455 s at n_ao = 970). The CPU runs keep the unpacked integrals resident
-(at n_ao = 970, `--k-cache-gb 24`); the device's 24 GB per logical core
-holds them only without the packed copy (`--jk-square`).
+up to 455 s at n_ao = 970). The CPU runs keep the unpacked integrals
+resident (at n_ao = 970, `--k-cache-gb 24`); one logical core's 24 GB holds
+them only without the packed copy (`--jk-square`).
 
 | system | n_ao / naux / nocc | CPU fp32: iters, total | device: iters, total | speedup |
 |---|---|---|---|---|
-| water | 24 / 116 / 5 | 9, 5.0 ms | 8, 37.7 ms | 0.13x |
-| benzene | 114 / 558 / 21 | 9, 97.6 ms | 8, 88.2 ms | 1.1x |
-| h2-lattice:16 | 128 / 256 / 16 | 10, 81.6 ms | 8, 52.6 ms | 1.6x |
-| C10H22 | 250 / 1206 / 41 | 16, 2.75 s | 12, 0.24 s | 11x |
-| C20H42 | 490 / 2366 / 81 | 14, 26.3 s | 14, 0.69 s | 38x |
-| C40H82 | 970 / 4686 / 161 | 22, 497 s | 22, 9.7 s (packed); 18, 5.1 s (`--jk-square`); 18, 3.9 s (`--jk-square`, J/K on 4 cores) | 51x; 97x; 128x |
+| water | 24 / 116 / 5 | 10, 5.3 ms | 10, 60.2 ms | 0.09x |
+| benzene | 114 / 558 / 21 | 11, 113 ms | 10, 130 ms | 0.87x |
+| h2-lattice:16 | 128 / 256 / 16 | 10, 93.0 ms | 8, 61.9 ms | 1.5x |
+| C10H22 | 250 / 1206 / 41 | 16, 2.82 s | 16, 0.30 s | 9.5x |
+| C20H42 | 490 / 2366 / 81 | 15, 28.0 s | 15, 0.74 s | 38x |
+| C40H82 | 970 / 4686 / 161 | 22, 493 s | 22, 9.62 s (packed); 22, 6.36 s (`--jk-square`); 19, 4.06 s (`--jk-square`, J/K on 4 cores) | 51x; 78x; 121x |
+
+Energy against the float64 reference: the fp32 total energy is off by
+8e-6 to 6e-4 Eh on the device and up to 2e-2 Eh on the CPU (fp32
+accumulation in the host BLAS J and K; at C10H22, 1.6e-3 Eh from J and
+7e-4 from K), but re-evaluating it in float64 at the fp32 orbitals
+(`E(C)`) gives 2e-10 to 5e-7 Eh up to n_ao = 490 and 5e-8 to 1e-7 Eh at 970.
 
 Median per-iteration stage times on the device (ms):
 
 | system | J/K | DIIS | eigh | other | largest |
 |---|---|---|---|---|---|
-| benzene | 3.07 | 2.10 | 3.28 | 3.23 | eigh (28%) |
-| C10H22 | 8.28 | 3.24 | 6.80 | 3.35 | J/K (38%) |
-| C20H42 | 27.9 | 6.09 | 15.7 | 1.71 | J/K (54%) |
-| C40H82 (packed) | 359 | 6.48 | 65.4 | 4.04 | J/K (83%) |
-| C40H82 (`--jk-square`) | 213 | 6.89 | 67.4 | 4.13 | J/K (73%) |
+| water | 1.49 | 2.01 | 2.18 | 1.17 | eigh (32%) |
+| benzene | 3.84 | 3.22 | 5.48 | 3.05 | eigh (35%) |
+| C10H22 | 7.93 | 3.11 | 8.94 | 3.18 | eigh (39%) |
+| C20H42 | 27.7 | 5.02 | 16.3 | 1.86 | J/K (54%) |
+| C40H82 (packed) | 361 | 6.82 | 65.6 | 3.95 | J/K (83%) |
+| C40H82 (`--jk-square`) | 213 | 6.99 | 71.3 | 4.25 | J/K (72%) |
+| C40H82 (`--jk-square`, J/K on 4 cores) | 139 | 6.81 | 63.4 | 4.25 | J/K (65%) |
 
-On the CPU, J/K is 86-99% of every iteration from n_ao = 114 up.
+On the CPU, J/K is 74-99% of every iteration from n_ao = 114 up.
 
 J/K split over logical NeuronCores at C40H82 (whole chip, `neuron-jk<k>`
 modes, one Python thread issuing to every core, inputs and partial
-results staged through the host): per iteration 441 / 340 / 322 ms on
-1 / 2 / 4 cores with packed integrals, 285 / 222 / 216 ms with
-`--jk-square`. The J/K stage itself goes 213 -> 149 ms on 4 cores (1.4x).
+results staged through the host): per iteration 437 / 325 / 306 ms on
+1 / 2 / 4 cores with packed integrals, 289 / 221 / 214 ms with
+`--jk-square`; the J/K stage itself goes 213 -> 139 ms on 4 cores (1.5x).
 Within one aux block of 532 at n_ao = 970, the gather that unpacks the
 packed triangle takes 28 ms, the half-transform GEMM 5.7 ms, the permute
 4.4 ms and the SYRK 5.8 ms; the two GEMMs run at about 28 TFLOP/s.
