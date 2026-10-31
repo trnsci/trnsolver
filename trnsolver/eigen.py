@@ -5,10 +5,11 @@ Symmetric eigenvalue problem: A @ V = V @ diag(eigenvalues)
 
 Methods:
 - NKI path: Householder tridiagonalization via NKI kernels (matvec +
-  rank-2 update on the Tensor Engine) followed by pure-host implicit-
-  shift QR iteration on the tridiagonal. Eigenvector matrix is assembled
-  on host from stored Householder reflectors and accumulated Givens
-  rotations.
+  rank-2 update on the Tensor Engine) followed by a host LAPACK solve of
+  the tridiagonal (TRNSOLVER_EIGH_TRIDIAG_SOLVER=qr selects the older
+  implicit-shift QR iteration). Eigenvectors are assembled by applying
+  the stored Householder reflectors to the tridiagonal eigenvectors,
+  then refined by one Rayleigh-Ritz step.
 - PyTorch path: torch.linalg.eigh (LAPACK / MAGMA depending on device).
 
 Primary use case: SCF eigenvalue problem FC = SCε in quantum chemistry.
@@ -28,6 +29,8 @@ import torch
 
 from .factor import _cholesky_lower, _restore, _to_fp32
 from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki, _use_simulator
+from .nki.tridiag import householder_tridiag_device as _householder_tridiag_device
+from .nki.tridiag import use_device_tridiag as _use_device_tridiag
 
 
 def eigh(
@@ -579,7 +582,7 @@ def _householder_tridiag(
 
 
 # ----------------------------------------------------------------------
-# Implicit-shift QR iteration (stage 2, pure host)
+# Implicit-shift QR iteration (stage 2 reference, TRNSOLVER_EIGH_TRIDIAG_SOLVER=qr)
 # ----------------------------------------------------------------------
 
 
@@ -713,6 +716,79 @@ def _qr_iterate(
 
 
 # ----------------------------------------------------------------------
+# Tridiagonal eigensolve (stage 2): LAPACK by default, scalar QR on request
+# ----------------------------------------------------------------------
+
+_TRIDIAG_SOLVER_ENV = "TRNSOLVER_EIGH_TRIDIAG_SOLVER"
+_TRIDIAG_SOLVERS = ("lapack", "qr")
+
+
+def _tridiag_solver() -> str:
+    """Stage-2 solver: ``lapack`` (default) or ``qr``.
+
+    Read from ``TRNSOLVER_EIGH_TRIDIAG_SOLVER`` on every call. ``qr`` keeps
+    the pure-Python implicit-shift QR iteration (``_qr_iterate``) reachable
+    for one release as a reference; it is about two orders of magnitude
+    slower at n = 128 (#42).
+    """
+    raw = os.environ.get(_TRIDIAG_SOLVER_ENV, "").strip().lower()
+    if not raw:
+        return "lapack"
+    if raw not in _TRIDIAG_SOLVERS:
+        raise ValueError(f"{_TRIDIAG_SOLVER_ENV}={raw!r}: expected one of {_TRIDIAG_SOLVERS}")
+    return raw
+
+
+def _lapack_tridiag_eigh(
+    diag: torch.Tensor, subdiag: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Vectorized eigensolve of the symmetric tridiagonal (diag, subdiag) on host.
+
+    Solves in float64 and returns (eigenvalues ascending, Q_right) in
+    ``diag.dtype`` on CPU, with T = Q_right diag(w) Q_rightᵀ.
+
+    Uses ``scipy.linalg.eigh_tridiagonal`` (LAPACK ``stemr``, O(n²)) when
+    scipy is importable; scipy is not a runtime dependency, so otherwise it
+    falls back to ``torch.linalg.eigh`` on the dense n×n tridiagonal
+    (LAPACK ``syevd``). Both are backward stable; at n ≤ 128 either costs
+    well under a millisecond.
+    """
+    dtype = diag.dtype
+    d = diag.detach().to("cpu", torch.float64)
+    e = subdiag.detach().to("cpu", torch.float64)
+    try:
+        import scipy.linalg
+    except ImportError:
+        scipy = None
+    if scipy is not None:
+        try:
+            w, Q = scipy.linalg.eigh_tridiagonal(d.numpy(), e.numpy())
+            return torch.from_numpy(w).to(dtype), torch.from_numpy(Q).to(dtype)
+        except (scipy.linalg.LinAlgError, ValueError):
+            pass  # stemr failure is rare; the dense solve below is the fallback
+    T = torch.diag(d) + torch.diag(e, 1) + torch.diag(e, -1)
+    w, Q = torch.linalg.eigh(T)
+    return w.to(dtype), Q.to(dtype)
+
+
+def _tridiag_eigh_host(
+    diag: torch.Tensor, subdiag: torch.Tensor, tol: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stage 2 on host CPU: (eigenvalues, Q_right) of the tridiagonal.
+
+    The eigenvalue order and column signs of Q_right do not reach the
+    caller: the Rayleigh-Ritz step in ``_householder_qr_eigh`` re-diagonalizes
+    and sorts ascending.
+    """
+    host = torch.device("cpu")
+    diag = diag.detach().to(host, copy=True)
+    subdiag = subdiag.detach().to(host, copy=True)
+    if _tridiag_solver() == "qr":
+        return _qr_iterate(diag, subdiag, tol)
+    return _lapack_tridiag_eigh(diag, subdiag)
+
+
+# ----------------------------------------------------------------------
 # Eigenvector assembly (apply reflectors to accumulated Givens rotations)
 # ----------------------------------------------------------------------
 
@@ -753,8 +829,9 @@ def _householder_qr_eigh(
     Two stages:
       1. NKI-kernel-driven reduction A → T (symmetric tridiagonal) via
          Householder reflections. Reflectors stored in V_refs.
-      2. Pure-host implicit-shift QR iteration on (diag, subdiag) with
-         deflation. Accumulates Givens rotations into Q_right.
+      2. Host eigensolve of (diag, subdiag): LAPACK by default, or the
+         implicit-shift QR iteration with TRNSOLVER_EIGH_TRIDIAG_SOLVER=qr.
+         Gives the tridiagonal eigenvectors Q_right.
 
     Eigenvectors = Q_left · Q_right where Q_left is built by applying the
     stored reflectors to the identity from the right.
@@ -765,16 +842,20 @@ def _householder_qr_eigh(
     if n == 1:
         return A[0].clone().unsqueeze(0), torch.eye(1, dtype=A.dtype, device=A.device)
 
-    diag, subdiag, V_refs = _householder_tridiag(A)
+    # TRNSOLVER_EIGH_TRIDIAG=device: one-launch on-chip reduction (#42),
+    # no per-step host syncs. Default off; the host-driven loop stays the
+    # reference path.
+    if _use_device_tridiag(n):
+        diag, subdiag, V_refs = _householder_tridiag_device(A)
+    else:
+        diag, subdiag, V_refs = _householder_tridiag(A)
 
-    # The QR iteration is scalar host code: about 20 element reads/writes per
-    # Givens rotation and O(n^2) rotations per call. Run it on CPU tensors so
-    # a device-resident input does not pay one launch or sync per element
-    # (#42). CPU inputs already ran here, so their results are unchanged.
-    host = torch.device("cpu")
-    eigenvalues, Q_right = _qr_iterate(
-        diag.detach().to(host, copy=True), subdiag.detach().to(host, copy=True), tol
-    )
+    # Stage 2 runs on host CPU tensors so a device-resident input does not
+    # pay one launch or sync per element (#42). The default is one
+    # vectorized LAPACK call; the scalar Givens QR iteration (about 20
+    # element reads/writes per rotation, O(n^2) rotations, ~0.2 s at
+    # n = 128) stays behind TRNSOLVER_EIGH_TRIDIAG_SOLVER=qr.
+    eigenvalues, Q_right = _tridiag_eigh_host(diag, subdiag, tol)
     Q_right = Q_right.to(A.device)
     V = _call_apply_reflectors(V_refs, Q_right)
 
@@ -783,8 +864,8 @@ def _householder_qr_eigh(
     # H = V^T A V, re-diagonalize via LAPACK eigh (exact for this small
     # problem), and rotate V to the eigenbasis of H. The eigh eigenvalues of
     # H are Rayleigh quotients — quadratically convergent from the already-
-    # good V — and supersede the raw QR-iteration estimates. The rotation
-    # Q_corr also corrects FP32 rounding that accumulated in the Givens-
+    # good V — and supersede the raw stage-2 estimates. The rotation
+    # Q_corr also corrects FP32 rounding that accumulated in the stage-2-
     # rotation and Householder-application steps, reducing
     # ||A V - V diag(w)||_F by ~1–2 orders of magnitude for n ≥ 64.
     # Cost: one extra n×n GEMM (V^T @ AV, reuses AV) + one n×n LAPACK call.

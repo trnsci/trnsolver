@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Trn2/Trn3) every hardware NKI kernel is registered as a PyTorch custom op
   with `torch_neuronx.nki_op` and launched on `device="neuron"`, with no
   `torch_xla` import. Ops: `trnsolver::matvec`, `rank2_update`, `matmul`,
-  `matmul_fp32out`, `apply_reflectors`. Kernel bodies are unchanged.
+  `matmul_fp32out`, `apply_reflectors`, `householder_tridiag`. Kernel bodies
+  are unchanged.
   - The dispatch path is detected on the first kernel launch: native when
     `torch_neuronx` exports `nki_op` and a `neuron` device is available, XLA
     when `torch_xla` is installed, otherwise none. The XLA path (Trn1) is
@@ -39,7 +40,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     two `test_eigh_neuron.py` tests that call kernels on `torch_xla` tensors
     are skipped off the XLA path.
 
+- **Single-launch on-device Householder tridiagonalization for `eigh`,
+  behind `TRNSOLVER_EIGH_TRIDIAG=device` (default off).**
+  `householder_tridiag_kernel` (`trnsolver/nki/tridiag.py`) reduces a
+  symmetric n <= 128 matrix to tridiagonal form in one NKI launch, with the
+  matrix resident in SBUF. Each reflector and its scalars (norm, sign, beta,
+  the v.w correction) are computed on chip: rows move across partitions
+  through exact selection matmuls on the Tensor Engine, and scalars come from
+  `nl.rsqrt` with two Newton steps on the Vector Engine. The host-driven
+  reduction needs 2(n-2) launches and about 7(n-2) host syncs per call; this
+  kernel needs one launch and one sync. The QR iteration still runs on host
+  copies of the O(n) tridiagonal. CPU simulator: eigenvalues within 1e-4 of
+  `torch.linalg.eigh` and `Q^T A Q = T` to 2e-5 for n = 8..128. The MLIR
+  verifier passes for trn1 and trn2. On-device latency has not been measured
+  yet.
+  On TorchNeuron the kernel is registered as the custom op
+  `trnsolver::householder_tridiag` and launched through `dispatch._launch`
+  like the other kernels, with no `torch_xla` import; the XLA path is
+  unchanged. (#42)
+
 ### Changed
+
+- **NKI `eigh` stage 2 is one LAPACK call (#42).** The host eigensolve of the
+  tridiagonal (d, e) now uses `scipy.linalg.eigh_tridiagonal` in float64 when
+  scipy is importable, else `torch.linalg.eigh` on the dense tridiagonal
+  (scipy stays a dev-only dependency). It replaces the scalar Python
+  implicit-shift QR iteration, which took about 566 of 575 ms per warm call
+  at n = 128 on Trn2. CPU stage-2 time: n = 64 211 ms → 0.13 ms, n = 128
+  946 ms → 0.41 ms. Reflector assembly and the Rayleigh-Ritz step are
+  unchanged, so output ordering (ascending) and accuracy are preserved.
+  `TRNSOLVER_EIGH_TRIDIAG_SOLVER=qr` keeps the old iteration for one release;
+  the default is `lapack`.
 
 - **Householder tridiagonalization keeps its scalar work on the host.**
   `_householder_tridiag` reads column k of the working matrix once per step
