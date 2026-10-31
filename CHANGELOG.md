@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Process-pool multi-core Jacobi `eigh`, opt-in (#29).**
+  `TRNSOLVER_EIGH_POOL=proc` (with `TRNSOLVER_EIGH_CORES=<k>|auto`) solves a
+  host batch on persistent worker processes, one per logical NeuronCore
+  (`TRNSOLVER_EIGH_POOL_CORES`, else `NEURON_RT_VISIBLE_CORES`), instead of
+  one host thread per core. Inputs go through per-worker shared-memory
+  segments; workers write results straight into a shared output buffer
+  that the returned tensors are views of, reused once the caller drops
+  them. Workers start on the first call and stay up
+  (`trnsolver.nki.eigh_pool.shutdown()` frees the cores); a failed pool
+  shuts down and `eigh` falls back to one core. The calling process must
+  not use the pool's cores itself, so device-resident input keeps the
+  thread split. Trn2, n = 128, B = 4096, 8 host CPUs: 1 / 2 / 4 cores
+  1182 / 607 / 324 ms (thread split 1227 / 763 / 531 ms; 8-thread
+  batch-parallel LAPACK 655 ms). Default (unset) unchanged.
+- `TRNSOLVER_JACOBI_SWEEPS_PER_LAUNCH=<k>`: the scalar kernel (padded
+  n <= 32) runs its first sweeps k per launch (5-14% faster on Trn2 at
+  n = 32). Default 1, unchanged.
+- `scripts/bench_jacobi_multicore.py --modes pool`, and
+  `scripts/probe_large_n_split.py`, the step-cost probe behind the
+  single-matrix multi-core verdict in #29.
+
 ## [0.19.0] — 2026-10-31
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

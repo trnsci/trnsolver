@@ -60,6 +60,9 @@ def eigh(
     :func:`_jacobi_auto`; ``TRNSOLVER_EIGH_JACOBI_AUTO`` overrides it).
     ``TRNSOLVER_EIGH_CORES=<k>|auto`` splits the kernel's batch across
     logical NeuronCores (:func:`_jacobi_devices`); unset, it uses one.
+    With ``TRNSOLVER_EIGH_POOL=proc`` a host batch is split over persistent
+    per-core worker processes instead of threads
+    (``trnsolver/nki/eigh_pool.py``).
 
     The NKI path (Householder tridiagonalization + implicit-shift QR) is
     eager-only: deflation and shift selection are data-dependent Python
@@ -413,6 +416,37 @@ def _jacobi_devices(X: torch.Tensor) -> list[torch.device]:
     return [torch.device(_NATIVE_DEVICE_TYPE, (first + i) % count) for i in range(want)]
 
 
+def _jacobi_pool_split(X: torch.Tensor) -> tuple[list[int], int]:
+    """(pool core ids, cores to split over) for ``TRNSOLVER_EIGH_POOL=proc``.
+
+    ``([], 1)`` when the pool does not apply. The pool always starts one
+    worker per pool core, so a call that splits over fewer reuses them.
+
+    The pool needs host input: a tensor on a NeuronCore means this process
+    holds the cores, which the workers then cannot open. Once requested,
+    every host call goes through the pool, even one that splits over a
+    single core, so this process never opens a core the workers hold. The
+    count follows ``TRNSOLVER_EIGH_CORES`` as for the thread split (unset
+    means 1), over the pool's cores (``TRNSOLVER_EIGH_POOL_CORES``, else
+    ``NEURON_RT_VISIBLE_CORES``).
+    """
+    from .nki.eigh_pool import pool_cores, pool_requested
+
+    if not pool_requested() or X.device.type != "cpu" or _use_simulator():
+        return [], 1
+    cores = pool_cores()
+    if not cores:
+        return [], 1
+    want = _eigh_cores()
+    if want == "auto":
+        from .nki.jacobi import block_layout
+
+        ne = block_layout(X.shape[-1])[0]
+        per = _MULTICORE_MIN_PER_CORE.get(ne, _MULTICORE_MIN_PER_CORE[32])
+        want = max(1, min(len(cores), X.shape[0] // per))
+    return cores, min(want, len(cores))
+
+
 @torch.compiler.disable
 def _jacobi_eigh(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """``eigh(method="jacobi")`` for (n, n) or (..., n, n) input (#48)."""
@@ -431,8 +465,18 @@ def _jacobi_eigh(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         try:
             from .nki.jacobi import jacobi_eigh_device, jacobi_eigh_multicore
 
-            devices = _jacobi_devices(X)
-            if len(devices) > 1:
+            pool_cores, parts = _jacobi_pool_split(X)
+            devices = [X.device] if pool_cores else _jacobi_devices(X)
+            if pool_cores:
+                from .nki.eigh_pool import jacobi_eigh_pool
+
+                try:
+                    w, V = jacobi_eigh_pool(X, pool_cores, parts)
+                except Exception:
+                    if _REQUIRE_NKI:
+                        raise
+                    w, V = jacobi_eigh_device(X)
+            elif len(devices) > 1:
                 try:
                     w, V = jacobi_eigh_multicore(X, devices)
                 except Exception:

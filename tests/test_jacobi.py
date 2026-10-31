@@ -262,6 +262,8 @@ def no_env(monkeypatch):
     monkeypatch.delenv("TRNSOLVER_JACOBI_BLOCK", raising=False)
     monkeypatch.delenv("TRNSOLVER_EIGH_JACOBI_AUTO", raising=False)
     monkeypatch.delenv("TRNSOLVER_EIGH_CORES", raising=False)
+    monkeypatch.delenv("TRNSOLVER_EIGH_POOL", raising=False)
+    monkeypatch.delenv("TRNSOLVER_EIGH_POOL_CORES", raising=False)
 
 
 class TestTorchJacobi:
@@ -609,6 +611,107 @@ class TestMulticore:
         assert calls == [3]
 
 
+class TestProcessPool:
+    """`trnsolver/nki/eigh_pool.py` with the torch Jacobi in the workers."""
+
+    @pytest.mark.parametrize(
+        "raw,cores",
+        [("0-3", [0, 1, 2, 3]), ("2", [2]), ("0,2", [0, 2]), (" 3,0-1 ", [0, 1, 3]), ("", [])],
+    )
+    def test_parse_cores(self, raw, cores):
+        from trnsolver.nki.eigh_pool import parse_cores
+
+        assert parse_cores(raw) == cores
+
+    def test_split_choice(self, no_env, monkeypatch):
+        monkeypatch.setattr(eigen, "_use_simulator", lambda: False)
+        X = torch.empty(1024, 128, 128)
+        assert eigen._jacobi_pool_split(X) == ([], 1)  # not requested: unchanged
+        monkeypatch.setenv("TRNSOLVER_EIGH_POOL", "proc")
+        monkeypatch.setenv("TRNSOLVER_EIGH_POOL_CORES", "0-3")
+        # Requested: every host call uses the pool, so this process never
+        # opens a core a worker holds.
+        assert eigen._jacobi_pool_split(X) == ([0, 1, 2, 3], 1)
+        monkeypatch.setenv("TRNSOLVER_EIGH_CORES", "2")
+        assert eigen._jacobi_pool_split(X) == ([0, 1, 2, 3], 2)
+        monkeypatch.setenv("TRNSOLVER_EIGH_CORES", "8")
+        assert eigen._jacobi_pool_split(X) == ([0, 1, 2, 3], 4)
+        monkeypatch.setenv("TRNSOLVER_EIGH_CORES", "auto")
+        per = eigen._MULTICORE_MIN_PER_CORE[128]
+        assert eigen._jacobi_pool_split(X[: 2 * per]) == ([0, 1, 2, 3], 2)
+        meta = torch.empty(1024, 128, 128, device="meta")
+        assert eigen._jacobi_pool_split(meta) == ([], 1)  # device input: threads
+
+    def test_pool_matches_eigh(self, no_env):
+        from trnsolver.nki import eigh_pool
+
+        try:
+            for nb, n, parts in [(9, 8, 2), (40, 8, 2), (5, 7, 1), (12, 16, 2)]:
+                A = _separated(nb, n, seed=nb + n)
+                w, V = eigh_pool.jacobi_eigh_pool(A, [0, 1], parts, simulate=True)
+                assert w.shape == (nb, n) and V.shape == (nb, n, n)
+                _check(A, w, V)
+                assert JK.last_sweeps > 0
+            pool = eigh_pool._POOL
+            assert pool is not None and pool.cores == [0, 1]
+            # Results are views of a shared output buffer: one the caller
+            # still holds is never overwritten; a dropped one is reused.
+            A1, A2 = _separated(16, 8, seed=21), _separated(16, 8, seed=22)
+            w1, V1 = eigh_pool.jacobi_eigh_pool(A1, [0, 1], simulate=True)
+            w1c = w1.clone()
+            w2, V2 = eigh_pool.jacobi_eigh_pool(A2, [0, 1], simulate=True)
+            torch.testing.assert_close(w1, w1c)
+            assert w1.untyped_storage().data_ptr() != w2.untyped_storage().data_ptr()
+            _check(A2, w2, V2)
+            del w1, V1, w2, V2
+            made = pool._next_id
+            w3, V3 = eigh_pool.jacobi_eigh_pool(A2, [0, 1], simulate=True)
+            assert pool._next_id == made  # reused, nothing allocated
+            # In use: the loop's last (w, V) and (w3, V3); plus spares.
+            assert sum(not b.free() for b in pool.bufs) == 2
+            assert len(pool.bufs) <= 2 + eigh_pool._KEEP_FREE
+            _check(A2, w3, V3)
+            del w3, V3
+            pool.procs[1].kill()
+            pool.procs[1].join()
+            A = _separated(9, 8, seed=1)
+            w, V = eigh_pool.jacobi_eigh_pool(A, [0, 1], simulate=True)  # restarts
+            _check(A, w, V)
+            assert eigh_pool._POOL is not pool
+            # A failure mid-call closes the pool, and later calls skip it.
+            eigh_pool._POOL.conns[0].close()
+            with pytest.raises(Exception):  # noqa: B017
+                eigh_pool.jacobi_eigh_pool(A, [0, 1], simulate=True)
+            assert eigh_pool._POOL is None and eigh_pool._FAILED
+            with pytest.raises(RuntimeError, match="failed earlier"):
+                eigh_pool.jacobi_eigh_pool(A, [0, 1], simulate=True)
+        finally:
+            eigh_pool.shutdown()
+        assert eigh_pool._POOL is None and not eigh_pool._FAILED
+
+    def test_pool_failure_falls_back(self, emulated_kernel, monkeypatch):
+        from trnsolver.nki import eigh_pool
+
+        monkeypatch.setenv("TRNSOLVER_EIGH_POOL", "proc")
+        monkeypatch.setenv("TRNSOLVER_EIGH_POOL_CORES", "0-1")
+        monkeypatch.setenv("TRNSOLVER_EIGH_CORES", "2")
+        monkeypatch.setattr(eigen, "_use_simulator", lambda: False)
+
+        def boom(X, cores, parts):
+            assert (cores, parts) == ([0, 1], 2)
+            raise RuntimeError("worker died")
+
+        monkeypatch.setattr(eigh_pool, "jacobi_eigh_pool", boom)
+        monkeypatch.setattr(eigen, "_REQUIRE_NKI", False)
+        A = _separated(9, 32, seed=4)
+        w, V = trnsolver.eigh(A, method="jacobi")
+        _check(A, w, V)
+        assert emulated_kernel  # fell back to the single-core kernel
+        monkeypatch.setattr(eigen, "_REQUIRE_NKI", True)
+        with pytest.raises(RuntimeError, match="worker died"):
+            trnsolver.eigh(A, method="jacobi")
+
+
 # ----------------------------------------------------------------------
 # NKI simulator and MLIR verifier
 # ----------------------------------------------------------------------
@@ -798,3 +901,41 @@ class TestJacobiNeuron:
             # 300 x 128 columns: the sign normalisation in _check is ambiguous
             # for a few, so check residual and orthogonality, not V itself.
             _check(A, w.cpu(), V.cpu(), tol=5e-5, vecs=False)
+
+    def test_process_pool(self):
+        # The pool's workers must own their cores, and this test process
+        # holds every core it can see once it has used one. So the pool
+        # runs from a fresh interpreter on cores this process does not see,
+        # e.g. NEURON_RT_VISIBLE_CORES=0-1 TRNSOLVER_TEST_POOL_CORES=2-3.
+        import subprocess
+        import sys
+
+        cores = os.environ.get("TRNSOLVER_TEST_POOL_CORES", "").strip()
+        if not cores:
+            pytest.skip("set TRNSOLVER_TEST_POOL_CORES to >= 2 cores this process does not see")
+        code = (
+            "import os, torch, trnsolver\n"
+            "from trnsolver.nki import jacobi as JK\n"
+            "g = torch.Generator().manual_seed(5)\n"
+            "X = torch.randn(300, 128, 128, generator=g, dtype=torch.float64)\n"
+            "A = ((X + X.transpose(1, 2)) / 2)\n"
+            "for _ in range(2):\n"
+            "    w, V = trnsolver.eigh(A.float(), method='jacobi')\n"
+            "    ref = torch.linalg.eigvalsh(A)\n"
+            "    err = float((w.double() - ref).abs().max() / ref.abs().max())\n"
+            "    r = A.float() @ V - V * w[:, None, :]\n"
+            "    assert err < 5e-5 and float(r.abs().max()) < 1e-3, (err, float(r.abs().max()))\n"
+            "print('OK', JK.last_sweeps)\n"
+        )
+        env = dict(
+            os.environ,
+            NEURON_RT_VISIBLE_CORES=cores,
+            TRNSOLVER_EIGH_POOL_CORES=cores,
+            TRNSOLVER_EIGH_POOL="proc",
+            TRNSOLVER_EIGH_CORES="2",
+            TRNSOLVER_REQUIRE_NKI="1",
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=900
+        )
+        assert out.returncode == 0 and "OK" in out.stdout, out.stderr[-3000:]
