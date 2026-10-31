@@ -24,6 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/bench_jacobi_multicore.py`: the 1 / 2 / 4-core, process-per-core
   and CPU (batched, and batch-parallel threads) measurements.
 
+### Corrected
+
+- **The v0.18.0 headline overstated the CPU comparison.** Its "1.5–2.2×
+  faster than CPU LAPACK" compared against batched `torch.linalg.eigh`,
+  which barely uses extra threads at these sizes. Splitting the batch
+  across the same 2 threads is 1.6–5.8× faster. Against that baseline the
+  single-core kernel at n = 128, B = 1024 is 310 vs 352 ms (1.13×), not
+  321 vs 668 ms (#54).
+
 ### Fixed
 
 - Native launches run on the input's NeuronCore (`neuron:k`) instead of
@@ -34,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron; LNC=1 and LNC=2) — see trnsci/trnsci#35.
 
-Headline performance: block Jacobi kernel for 33 ≤ n ≤ 128 and a measured `eigh(method="auto")` region; inside it batched `eigh` on Trn2 is 1.5–2.2× faster than CPU LAPACK, e.g. 321 vs 668 ms at n=128, B=1024 (#52).
+Headline performance: block Jacobi kernel for 33 ≤ n ≤ 128 and a measured `eigh(method="auto")` region; inside it batched `eigh` on Trn2 is 1.5–2.2× faster than CPU LAPACK, e.g. 321 vs 668 ms at n=128, B=1024 (#52). *Corrected in the next release: that baseline is batched `torch.linalg.eigh`; against the batch split over the same threads the gain is about 1.13× (#54).*
 
 ### Added
 
