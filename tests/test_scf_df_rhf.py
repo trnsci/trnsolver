@@ -205,3 +205,24 @@ def test_split_over_devices_matches_single():
     assert len(split.blocks) == 2
     torch.testing.assert_close(split.k(C), one.k(C))
     torch.testing.assert_close(split.j(2 * C @ C.T), one.j(2 * C @ C.T))
+
+
+def test_fused_k_matches_unpacked():
+    """trntensor.df_exchange / df_coulomb (trntensor#60) give the same J and K
+    as the unpack + einsum + syrk blocks, including when split over devices."""
+    trntensor = pytest.importorskip("trntensor")
+    if not hasattr(trntensor, "df_exchange"):
+        pytest.skip("trntensor without df_exchange (< 0.21)")
+    system = scf.h2_lattice(2)
+    n = system.nao
+    g = torch.Generator().manual_seed(4)
+    C = torch.randn(n, system.nocc, generator=g, dtype=torch.float64)
+    ref = scf.DFJK(system.B, n, k_cache_bytes=0, k_block=7, fused=False)
+    for kw in ({}, {"devices": ["cpu", "cpu"]}):
+        fused = scf.DFJK(system.B, n, fused=True, **kw)
+        assert fused.fused and fused.B3 is None
+        assert len(fused.blocks) == len(kw.get("devices", [None]))
+        torch.testing.assert_close(fused.k(C), ref.k(C))
+        torch.testing.assert_close(fused.j(2 * C @ C.T), ref.j(2 * C @ C.T))
+    # The default keeps the unpack path off the neuron device.
+    assert not scf.DFJK(system.B, n).fused
