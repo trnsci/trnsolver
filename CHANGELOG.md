@@ -25,6 +25,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`orthogonalizer(S, method, lindep)` and `eigh_generalized(F, S, X=X)`:
+  a tolerance for near-singular overlaps (#72, for #15).** `"symmetric"`
+  (Loewdin S^-1/2, the default), `"canonical"` (keeps the eigenvalues of S
+  above `lindep` x max, n x m X) and `"cholesky"` (pivoted Cholesky, no
+  eigensolve, O(n m^2)). It returns `X` with X^H S X = I on the kept
+  subspace and the kept `rank`. It is built once, in float64 on the host,
+  for real or complex Hermitian S, batched, and differentiable.
+  `eigh_generalized(F, S, X=X)` then needs only two GEMMs, an m x m `eigh`
+  and a back-transform, in F's dtype and on F's device, and no Cholesky of
+  S. `examples/scf_df_rhf.py` uses them (`--orth`, `--lindep`, and
+  `pyscf:<name>@<basis>` systems for diffuse bases). The default results
+  are unchanged: every current test system is far from the 1e-7 threshold,
+  so `symmetric` is still S^-1/2, and its energies match the previous
+  release to all printed digits (fp64 and fp32, h2-lattice, water, benzene,
+  C10H22). With a diffuse basis, dropping the dependencies is what lets an
+  FP32 SCF converge. benzene/aug-cc-pVTZ (n = 414): with three functions
+  dropped, it converges in 23 iterations, and the float64 energy at its
+  orbitals is 4.7e-6 Eh from PySCF. Plain S^-1/2, the Cholesky of S, or
+  `cholesky` at 1e-7 do not converge in 80 iterations.
+  C20H42/aug-cc-pVDZ (n = 838, two functions dropped) converges in FP32
+  either way. In float64, dropping the two functions raises the energy by
+  2.8e-5 Eh: lower `lindep` when that matters more than FP32 conditioning.
 - **DF-RHF example: J and K from trntensor's fused packed-integral kernels
   (trntensor#60).** `DFJK(fused=None)` (and `run_scf(jk_fused=...)`,
   `bench_scf.py --jk-k auto|fused|unpack`) builds K with

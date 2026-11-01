@@ -63,6 +63,10 @@ w, V = trnsolver.eigh(A)
 # Generalized eigenproblem: A x = λ B x  (the SCF problem)
 w, V = trnsolver.eigh_generalized(F, S)
 
+# Large / diffuse basis: build X once (fp64, host), drop near-dependencies
+orth = trnsolver.orthogonalizer(S, "canonical", lindep=1e-7)  # X: (n, m), rank m
+w, V = trnsolver.eigh_generalized(F, S, X=orth.X)  # X^T F X, eigh, X C'
+
 # Factorizations + direct solves
 L = trnsolver.cholesky(A)
 U, s, Vh = trnsolver.svd(A)  # economy SVD: A = U @ diag(s) @ Vh
@@ -139,6 +143,7 @@ python scripts/bench_scf.py --systems pyscf:alkane20 --modes cpu,neuron,neuron-n
 | Category | Shipped (v0.20.0) | Deferred |
 |----------|-------------------|----------|
 | Eigensolvers | `eigh`, `eigh_generalized`, `eigh_randomized` | — |
+| Orthogonalizers | `orthogonalizer` (symmetric, canonical, pivoted Cholesky) | — |
 | Factorizations | `cholesky`, `lu`, `qr`, `svd`, `pinv`, `schur` | — |
 | Direct solvers | `solve`, `solve_spd`, `inv_spd`, `inv_sqrt_spd`, `inv_sqrt_spd_ns` | — |
 | Iterative | `cg` (w/ preconditioner), `gmres`, `gmres_ir` | — |
@@ -170,7 +175,8 @@ python scripts/bench_scf.py --systems pyscf:alkane20 --modes cpu,neuron,neuron-n
 | Category | Operation | Description |
 |----------|-----------|-------------|
 | Eigen | `eigh` | Symmetric eigendecomposition (Jacobi / torch) |
-| Eigen | `eigh_generalized` | Generalized: `Ax = λBx` via Cholesky reduction |
+| Eigen | `eigh_generalized` | Generalized: `Ax = λBx` via Cholesky reduction, or via a precomputed `X=` |
+| Eigen | `orthogonalizer` | X with XᵀSX = I on S's kept subspace: Löwdin, canonical or pivoted Cholesky, dropping near-linear dependencies |
 | Eigen | `eigh_randomized` | Randomized: k dominant eigenpairs, O(n²k), sRR |
 | Factor | `cholesky` | `A = LL^T` |
 | Factor | `lu` | `A = PLU` |

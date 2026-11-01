@@ -23,6 +23,7 @@ trnsolver/
 ├── eigen.py        # eigh, eigh_generalized, eigh_randomized
 ├── _jacobi.py      # torch batched Jacobi (off-device / FP64 / n > 128)
 ├── factor.py       # cholesky, lu, qr, svd, pinv, schur, solve, solve_spd, inv_spd, inv_sqrt_spd(_ns)
+├── orthogonalize.py  # orthogonalizer: symmetric / canonical / pivoted-Cholesky X for S
 ├── iterative.py    # cg, gmres, gmres_ir, preconditioners
 └── nki/
     ├── __init__.py
@@ -42,6 +43,7 @@ The headline use case is the SCF iteration for quantum chemistry. At each SCF st
 |----------|------|----------------|
 | Overlap Cholesky | `S = L Lᵀ` | `cholesky(S)` |
 | Reduce to standard | `A' = L⁻¹ F L⁻ᵀ` | `eigh_generalized(F, S)` |
+| …or, near-singular S | `X = orthogonalizer(S).X` once, `A' = Xᵀ F X` | `eigh_generalized(F, S, X=X)` |
 | Eigensolve | `A' V = V Λ` | `eigh(A')` (Jacobi on NKI) |
 | Back-transform | `C = L⁻ᵀ V` | `trsm` (in trnblas) |
 | Density | `P = C_occ @ C_occᵀ` | `syrk` (in trnblas) |

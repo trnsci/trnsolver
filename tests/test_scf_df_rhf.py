@@ -226,3 +226,58 @@ def test_fused_k_matches_unpacked():
         torch.testing.assert_close(fused.j(2 * C @ C.T), ref.j(2 * C @ C.T))
     # The default keeps the unpack path off the neuron device.
     assert not scf.DFJK(system.B, n).fused
+
+
+def _with_duplicate_ao(system, idx):
+    """The same system with copies of AOs ``idx`` appended: S is exactly singular."""
+    import trntensor
+
+    n = system.nao
+    order = list(range(n)) + list(idx)
+    H = system.H[order][:, order]
+    S = system.S[order][:, order]
+    B3 = trntensor.unpack_tril(system.B, n)[order][:, order]
+    return scf.System(
+        system.name + "+dup", H, S, trntensor.pack_tril(B3), system.nocc, system.e_nuc
+    )
+
+
+def test_orthogonalizer_variants_agree():
+    system = scf.h2_lattice(3)
+    base = scf.run_scf(system, dtype=torch.float64)
+    assert base.info["rank"] == system.nao
+    for orth in ("canonical", "cholesky"):
+        res = scf.run_scf(system, dtype=torch.float64, orth=orth)
+        assert res.converged and res.info["rank"] == system.nao
+        assert res.energy == pytest.approx(base.energy, abs=1e-10)
+
+
+@pytest.mark.parametrize("orth", ["symmetric", "canonical", "cholesky"])
+@pytest.mark.parametrize("solver", ["orth", "purify"])
+def test_duplicate_basis_functions_are_dropped(orth, solver):
+    system = scf.h2_lattice(2)
+    base = scf.run_scf(system, dtype=torch.float64)
+    dup = _with_duplicate_ao(system, [0, 5, 11])
+    res = scf.run_scf(dup, dtype=torch.float64, solver=solver, orth=orth)
+    assert res.converged
+    assert res.info["rank"] == system.nao
+    assert res.eps.shape[0] == system.nao
+    assert res.energy == pytest.approx(base.energy, abs=1e-10)
+
+
+def test_duplicate_basis_functions_break_cholesky_of_s():
+    dup = _with_duplicate_ao(scf.h2_lattice(2), [3])
+    with pytest.raises(torch.linalg.LinAlgError):
+        scf.run_scf(dup, dtype=torch.float64, solver="generalized")
+
+
+def test_make_system_basis_suffix(monkeypatch):
+    seen = {}
+
+    def fake(name, **kw):
+        seen.update(kw, name=name)
+        return None
+
+    monkeypatch.setattr(scf, "pyscf_system", fake)
+    scf.make_system("pyscf:benzene@aug-cc-pvdz")
+    assert seen == {"name": "benzene", "basis": "aug-cc-pvdz", "auxbasis": "aug-cc-pvdz-jkfit"}
