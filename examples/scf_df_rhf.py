@@ -385,6 +385,16 @@ class DFJK:
     per iteration, which at n_ao = 970 was 28 of the 44 ms per aux block of
     532 (Trn2, #15). J then comes from the squares.
 
+    ``fused=True`` builds K with ``trntensor.df_exchange`` and J with
+    ``trntensor.df_coulomb`` when present (trntensor#60). For K,
+    two NKI launches per group of aux chunks gather the packed rows in
+    place, form the half-transformed ``(P, i, ν)`` intermediate and
+    accumulate ``K`` in PSUM; J streams each block twice at DMA rate. No
+    square is built, and the packed copy is held in one block per device
+    (blocks of 1024 aux columns without ``df_coulomb``). The default
+    (``None``) uses it on a
+    ``neuron`` device when trntensor provides it and ``square`` is off.
+
     With several ``devices`` (NeuronCores) the blocks are dealt round-robin
     and each core builds partial J and K for its blocks. The inputs (packed
     P, C_occ) and the partial results are staged through the host, because
@@ -405,10 +415,15 @@ class DFJK:
         dtype: torch.dtype | None = None,
         devices=None,
         square: bool = False,
+        fused: bool | None = None,
     ):
         import trntensor
 
         dev = torch.device(device) if device is not None else B.device
+        if fused is None:
+            # trntensor >= 0.21: K straight from the packed rows (trntensor#60).
+            fused = hasattr(trntensor, "df_exchange") and dev.type == "neuron" and not square
+        self.fused = bool(fused)
         self.devices = [torch.device(d) for d in devices] if devices else [dev]
         self.device = self.devices[0] if devices else dev
         dtype = dtype or B.dtype
@@ -424,6 +439,14 @@ class DFJK:
         self.pair_w = w.to(self.device)
         self.sym = _sym_to_packed_index(n).to(self.device)
         full_bytes = n * n * naux * torch.finfo(dtype).bits // 8
+        if k_block is None and self.fused:
+            # No square is ever built: one block per device. Without
+            # trntensor.df_coulomb, J is two GEMVs per block, and one 8.8 GB
+            # block at n_ao = 970 compiled to a 26.7 GB graph, so blocks of
+            # 1024 aux columns then.
+            k_block = -(-naux // len(self.devices))
+            if not hasattr(trntensor, "df_coulomb"):
+                k_block = min(1024, k_block)
         if k_block is None:
             if full_bytes <= k_cache_bytes:
                 k_block = naux
@@ -438,7 +461,7 @@ class DFJK:
             d = self.devices[i % len(self.devices)]
             self.blocks.append(B[:, q0 : q0 + self.k_block].to(dtype).contiguous().to(d))
         self.B3 = None
-        if len(self.blocks) == 1 and not square:
+        if len(self.blocks) == 1 and not square and not self.fused:
             self.B3 = trntensor.unpack_tril(self.blocks[0], n)  # (n, n, naux), once
         if square:
             # Unpack every block once and drop the packed copy: twice the
@@ -464,6 +487,7 @@ class DFJK:
 
     def j(self, P: torch.Tensor) -> torch.Tensor:
         import trnblas
+        import trntensor
 
         if self.squares is not None:
             ps = self._scatter(P.reshape(-1))
@@ -477,6 +501,12 @@ class DFJK:
         p = P.reshape(-1).index_select(0, self.tril) * self.pair_w
         ps = self._scatter(p)
         parts = {}
+        if self.fused and hasattr(trntensor, "df_coulomb"):
+            # trntensor#60: d and J each stream a block once (packed in, packed out).
+            for Bb in self.blocks:
+                jb = trntensor.df_coulomb(Bb, ps[Bb.device])
+                parts[Bb.device] = jb if Bb.device not in parts else parts[Bb.device] + jb
+            return self._gather(parts).index_select(0, self.sym).reshape(self.n, self.n)
         for Bb in self.blocks:
             d = trnblas.gemv(1.0, Bb, ps[Bb.device], trans=True)  # (nq,)
             jb = trnblas.gemv(1.0, Bb, d)  # (npair,)
@@ -492,6 +522,11 @@ class DFJK:
         n, nocc = C_occ.shape
         cs = self._scatter(C_occ)
         parts = {}
+        if self.fused:
+            for Bb in self.blocks:
+                Kb = trntensor.df_exchange(Bb, cs[Bb.device], alpha=2.0)
+                parts[Bb.device] = Kb if Bb.device not in parts else parts[Bb.device] + Kb
+            return self._gather(parts)
         for i, Bb in enumerate(self.blocks):
             if self.squares is not None:
                 B3 = self.squares[i]
@@ -720,6 +755,7 @@ def run_scf(
     k_block: int | None = None,
     jk_devices=None,
     jk_square: bool = False,
+    jk_fused: bool | None = None,
     verbose: bool = False,
 ) -> SCFResult:
     """Run DF-RHF to convergence; every tensor op runs on ``device`` in ``dtype``.
@@ -737,9 +773,11 @@ def run_scf(
     whose float64 energy was 1.2e-4 Eh high).
     ``stage_sync`` synchronises the device around every stage so the stage
     times add up; turn it off to time the loop as an application would.
-    ``jk_devices`` splits the J/K build over several NeuronCores and
-    ``jk_square`` keeps the unpacked integrals resident (:class:`DFJK`);
-    everything else stays on ``device``.
+    ``jk_devices`` splits the J/K build over several NeuronCores,
+    ``jk_square`` keeps the unpacked integrals resident and ``jk_fused``
+    picks the fused packed-integral K (:class:`DFJK`; default: on a neuron
+    device when trntensor has ``df_exchange``); everything else stays on
+    ``device``.
     """
     import trnblas
 
@@ -771,6 +809,7 @@ def run_scf(
         dtype=dtype,
         devices=jk_devices,
         square=jk_square,
+        fused=jk_fused,
     )
     sync()
     setup["upload"] = 1e3 * (time.perf_counter() - t0)

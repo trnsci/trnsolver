@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **DF-RHF example: J and K from trntensor's fused packed-integral kernels
+  (trntensor#60).** `DFJK(fused=None)` (and `run_scf(jk_fused=...)`,
+  `bench_scf.py --jk-k auto|fused|unpack`) builds K with
+  `trntensor.df_exchange` and J with `trntensor.df_coulomb` on a `neuron`
+  device when trntensor provides them. The packed integrals stay in one
+  block per device and are never unpacked. Trn2, LNC=2, one logical core,
+  time to convergence against the unpack + einsum + syrk path: C10H22
+  352 -> 229 ms, C20H42 756 -> 587 ms, C40H82 9.68 -> 4.71 s (J/K stage
+  365 -> 163 ms per iteration). At LNC=1, C40H82 runs in 7.7 s fused; the
+  unpack path no longer fits there (12 GB per physical core). Older
+  trntensor keeps the unpack path.
+
 ## [0.20.0] — 2026-10-31
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

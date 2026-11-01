@@ -79,7 +79,12 @@ def _run_mode(system: System, mode: str, args):
     """(warm-up result, timed result). The warm-up runs ``--warmup-iters``
     iterations, which touch every op shape of the loop (device compiles,
     library first-call costs); its time is reported as ``cold``."""
-    kw = dict(solver=args.solver, k_cache_gb=args.k_cache_gb, jk_square=args.jk_square)
+    kw = dict(
+        solver=args.solver,
+        k_cache_gb=args.k_cache_gb,
+        jk_square=args.jk_square,
+        jk_fused={"auto": None, "fused": True, "unpack": False}[args.jk_k],
+    )
     if mode in ("cpu", "cpu64"):
         _set_backends("pytorch")
         kw.update(device="cpu", dtype=torch.float64 if mode == "cpu64" else torch.float32)
@@ -283,6 +288,13 @@ def main() -> None:
         "--jk-square",
         action="store_true",
         help="keep the unpacked (n, n, naux) integrals resident in aux blocks",
+    )
+    ap.add_argument(
+        "--jk-k",
+        default="auto",
+        choices=("auto", "fused", "unpack"),
+        help="K build: trntensor.df_exchange from packed rows (fused), the unpack + einsum "
+        "+ syrk blocks (unpack), or fused on a device when available (auto)",
     )
     ap.add_argument("--cache-dir", default=None, help="cache built systems as .pt files")
     ap.add_argument(
