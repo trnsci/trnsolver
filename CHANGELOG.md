@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`lu` documented the wrong permutation convention (#71).** The docstring,
+  API docs, quickstart and README said `P @ A = L @ U`; `lu` returns
+  `A = P @ L @ U` (the `torch.linalg.lu` convention), which differs whenever
+  the pivot permutation is not its own inverse. The docs now match; the
+  returned values are unchanged. Affected docs: every release through 0.20.0.
+
 ### Added
 
 - **DF-RHF example: J and K from trntensor's fused packed-integral kernels

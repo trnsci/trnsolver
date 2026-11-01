@@ -270,3 +270,29 @@ class TestInvSqrtSpdNS:
         _, iters, res = trnsolver.inv_sqrt_spd_ns(A)
         assert isinstance(iters, int) and iters >= 1
         assert isinstance(res, float)
+
+
+class TestLUConvention:
+    """lu returns A = P @ L @ U (torch.linalg.lu), as documented (trnsolver#71)."""
+
+    def _cyclic(self):
+        # Pivot order (2, 0, 1) is a 3-cycle, so P != P.T and the two
+        # conventions P @ A = L @ U and A = P @ L @ U differ.
+        A = torch.tensor([[4.0, 5.0, 6.0], [7.0, 8.0, 10.0], [1.0, 2.0, 3.0]], dtype=torch.float64)
+        P, L, U = trnsolver.lu(A)
+        assert not torch.equal(P, P.T)
+        return A, P, L, U
+
+    def test_a_equals_plu(self):
+        A, P, L, U = self._cyclic()
+        torch.testing.assert_close(P @ L @ U, A)
+        torch.testing.assert_close(P.T @ A, L @ U)
+
+    def test_docs_state_the_returned_convention(self):
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parents[1]
+        assert "A = P @ L @ U" in trnsolver.lu.__doc__.splitlines()[0]
+        assert "`A = P L U`" in (root / "docs/api/factor.md").read_text()
+        assert "PA = LU" not in (root / "docs/quickstart.md").read_text()
+        assert "`PA = LU`" not in (root / "README.md").read_text()

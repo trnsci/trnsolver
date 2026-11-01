@@ -31,7 +31,7 @@ eigenvalues, eigenvectors = trnsolver.eigh_generalized(F, S)
 
 ```python
 L = trnsolver.cholesky(A_spd)  # A = LL^T
-P, L, U = trnsolver.lu(A)  # PA = LU
+P, L, U = trnsolver.lu(A)  # A = PLU (torch.linalg.lu convention)
 Q, R = trnsolver.qr(A)  # A = QR
 ```
 

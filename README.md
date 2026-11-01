@@ -168,7 +168,7 @@ python scripts/bench_scf.py --systems pyscf:alkane20 --modes cpu,neuron,neuron-n
 | Eigen | `eigh_generalized` | Generalized: `Ax = λBx` via Cholesky reduction |
 | Eigen | `eigh_randomized` | Randomized: k dominant eigenpairs, O(n²k), sRR |
 | Factor | `cholesky` | `A = LL^T` |
-| Factor | `lu` | `PA = LU` |
+| Factor | `lu` | `A = PLU` |
 | Factor | `qr` | `A = QR` |
 | Factor | `svd` | `A = U diag(s) Vh` (economy by default) |
 | Factor | `pinv` | Moore-Penrose pseudoinverse (truncated SVD) |

@@ -10,7 +10,8 @@ L = trnsolver.cholesky(A_spd)
 
 ## `lu(A)`
 
-Pivoted LU decomposition. Returns `(P, L, U)` with `P A = L U`.
+Pivoted LU decomposition. Returns `(P, L, U)` with `A = P L U`, the
+`torch.linalg.lu` convention (equivalently `Pᵀ A = L U`).
 
 ## `qr(A)`
 
