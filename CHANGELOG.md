@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   since 0.5.0, `ssor_preconditioner` since 0.8.0). Complex input to
   `eigh_randomized` (eigenvalue error 1.35) now also stays off the real NKI
   matmul kernel.
+  `eigh` sends complex and batched input (as from `eigh_generalized`) to
+  aten instead of the real single-matrix NKI Householder path, which raised
+  for them under `TRNSOLVER_REQUIRE_NKI=1` on a Neuron host.
 
 - **A real matrix with a complex right-hand side dropped the imaginary part
   (#66).** `solve`, `solve_spd` and `eigh_generalized` cast B to A's dtype,

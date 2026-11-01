@@ -179,3 +179,26 @@ def test_eigh_randomized_complex_hermitian(dtype):
     ref = torch.tensor([-20.0, 10.0, 30.0], dtype=w.dtype)
     torch.testing.assert_close(w, ref, atol=1e-5, rtol=1e-5)
     _close(V.mH @ V, torch.eye(k, dtype=dtype), dtype)
+
+
+@pytest.mark.parametrize(
+    "dtype,batch",
+    [(torch.complex64, ()), (torch.complex128, ()), (torch.float64, (N,)), (torch.float32, (2, 3))],
+)
+def test_eigh_complex_batch_skip_householder_under_require_nki(monkeypatch, dtype, batch):
+    # The Householder kernels take one real (n, n) matrix. Under
+    # TRNSOLVER_REQUIRE_NKI=1 on a Neuron host, complex or batched eigh (the
+    # inner call of eigh_generalized) raised there instead of taking aten.
+    from trnsolver import eigen
+
+    def _no_householder(*a, **k):
+        raise AssertionError("Householder path called for complex/batched input")
+
+    monkeypatch.setattr(eigen, "_REQUIRE_NKI", True)
+    monkeypatch.setattr(eigen, "_use_nki", lambda: True)
+    monkeypatch.setattr(eigen, "_householder_qr_eigh", _no_householder)
+    A = _hpd(N, dtype, batch=batch)
+    w, V = trnsolver.eigh(A)
+    w_ref, _ = torch.linalg.eigh(A)
+    _close(w, w_ref, dtype)
+    _close(V @ torch.diag_embed(w.to(V.dtype)) @ V.mH, A, dtype)

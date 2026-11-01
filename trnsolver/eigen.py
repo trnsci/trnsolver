@@ -83,7 +83,7 @@ def eigh(
     if resolved == "jacobi" or (resolved == "auto" and _jacobi_auto(A)):
         return _jacobi_eigh(A)
     A, orig = _to_fp32(A)
-    if _use_nki() and _eigh_aten_cutover(A):
+    if _use_nki() and (_eigh_aten_cutover(A) or not _householder_fits(A)):
         w, V = _aten_eigh_on_device(A)
     elif _use_nki():
         try:
@@ -548,6 +548,17 @@ def _eigh_aten_cutover(A: torch.Tensor) -> bool:
     if A.device.type != _NATIVE_DEVICE_TYPE and not _host_input_on_native_path(A):
         return False
     return A.shape[-1] < _eigh_nki_min_n()
+
+
+def _householder_fits(A: torch.Tensor) -> bool:
+    """True iff the NKI Householder path can take A: one real (n, n) matrix.
+
+    Its kernels are real and single-matrix, so complex Hermitian input and
+    batches (both reachable through ``eigh_generalized``) take aten eigh,
+    also under ``TRNSOLVER_REQUIRE_NKI=1``, where they used to raise
+    (``torch.sign`` of a complex entry; the square-matrix assert on a batch).
+    """
+    return A.dim() == 2 and not A.is_complex()
 
 
 def _host_input_on_native_path(A: torch.Tensor) -> bool:
