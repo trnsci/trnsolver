@@ -10,7 +10,8 @@ L = trnsolver.cholesky(A_spd)
 
 ## `lu(A)`
 
-Pivoted LU decomposition. Returns `(P, L, U)` with `P A = L U`.
+Pivoted LU decomposition. Returns `(P, L, U)` with `A = P L U`, the
+`torch.linalg.lu` convention (equivalently `Pᵀ A = L U`).
 
 ## `qr(A)`
 
@@ -42,7 +43,8 @@ M = trnsolver.inv_sqrt_spd(metric)
 Returns `(X, iters, residual)` where `X ≈ A⁻¹ᐟ²`, computed via the coupled
 Newton-Schulz iteration `T = ½(3I − ZY); Y ← YT; Z ← TZ` starting from a
 Frobenius-norm-scaled `Y₀`. All operations are GEMMs, which maps cleanly to
-the Trainium Tensor Engine via `trnblas.gemm` once that backend validates.
+the Trainium Tensor Engine via `trnblas.gemm` (when trnblas is installed; on the
+native `neuron` device its `auto` backend routes dense GEMMs to aten, trnblas 0.9.0).
 
 Choose this over `inv_sqrt_spd` when the NKI backend is active **and** `A` is
 well-conditioned (condition number ≲ 10⁶). For ill-conditioned SPD, stick

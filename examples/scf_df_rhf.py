@@ -9,8 +9,11 @@ The loop, per iteration (closed shell, P = 2 C_occ C_occ^T):
                K_mn = 2 sum_{iQ} Y_{m,iQ} Y_{n,iQ}   trnblas.syrk
     Fock       F = H + J - K/2, E = tr P (H + F) / 2 + E_nuc
     DIIS       Pulay on e = F P S - S P F (host-side solve of the small system)
-    eigh       F' = X^T F X, trnsolver.eigh(F'), C = X C'   (X = S^{-1/2}, once)
-               or trnsolver.eigh_generalized(F, S) with --solver generalized
+    eigh       trnsolver.eigh_generalized(F, X=X): F' = X^T F X, eigh(F'), C = X C'
+               (X from trnsolver.orthogonalizer(S), once, float64 on the host;
+               Loewdin S^{-1/2} unless S has near-linear dependencies, which
+               are dropped), or trnsolver.eigh_generalized(F, S) (Cholesky of S
+               every iteration) with --solver generalized
     density    P = 2 C_occ C_occ^T                    trnblas.syrk
 
 B is the density-fitted three-centre tensor B_{Q,mn} = sum_P (L^{-1})_{QP} (P|mn),
@@ -28,11 +31,15 @@ Systems:
     pyscf:<name>         PySCF integrals (cc-pVDZ / cc-pvdz-jkfit) for
                          water, benzene or alkane<k> (C_k H_{2k+2}, zigzag
                          geometry). Needs PySCF.
+    pyscf:<name>@<basis> the same in another basis, fitted with <basis>-jkfit
+                         (e.g. pyscf:alkane40@aug-cc-pvdz, n_ao = 1658, whose
+                         diffuse functions make S near-singular).
 
 Usage:
     python examples/scf_df_rhf.py --system h2-lattice:4
     python examples/scf_df_rhf.py --system h2-lattice:16 --dtype float64
     python examples/scf_df_rhf.py --system pyscf:benzene --device neuron
+    python examples/scf_df_rhf.py --system pyscf:benzene@aug-cc-pvdz --orth canonical
 
 ``scripts/bench_scf.py`` runs the CPU / device / fp64 comparison on top of
 :func:`run_scf`.
@@ -275,7 +282,11 @@ def pyscf_system(
     auxbasis: str = "cc-pvdz-jkfit",
     reference: bool = True,
 ) -> System:
-    """Real-molecule integrals from PySCF; ``reference`` also runs PySCF's DF-RHF."""
+    """Real-molecule integrals from PySCF; ``reference`` also runs PySCF's DF-RHF.
+
+    For a basis other than cc-pVDZ the reference removes S's linear
+    dependencies the PySCF way (``scf.addons.remove_linear_dep_``).
+    """
     from pyscf import df, gto, lib, scf
 
     if name == "benzene":
@@ -293,9 +304,12 @@ def pyscf_system(
         mf = scf.RHF(mol).density_fit(auxbasis=auxbasis)
         mf.with_df._cderi = cderi
         mf.conv_tol = 1e-11
+        if basis.lower() != "cc-pvdz":
+            mf = scf.addons.remove_linear_dep_(mf)
         ref = float(mf.kernel())
     B = torch.from_numpy(lib.transpose(cderi))  # (npair, naux)
-    return System(f"pyscf:{name}", H, S, B, mol.nelectron // 2, float(mol.energy_nuc()), ref)
+    tag = name if basis.lower() == "cc-pvdz" else f"{name}@{basis}"
+    return System(f"pyscf:{tag}", H, S, B, mol.nelectron // 2, float(mol.energy_nuc()), ref)
 
 
 def make_system(spec: str, **kw) -> System:
@@ -303,7 +317,11 @@ def make_system(spec: str, **kw) -> System:
     if kind == "h2-lattice":
         return h2_lattice(int(arg or 4))
     if kind == "pyscf":
-        return pyscf_system(arg or "water", **kw)
+        name, _, basis = (arg or "water").partition("@")
+        if basis:
+            kw.setdefault("basis", basis)
+            kw.setdefault("auxbasis", f"{basis}-jkfit")
+        return pyscf_system(name, **kw)
     raise ValueError(f"unknown system {spec!r}")
 
 
@@ -744,6 +762,8 @@ def run_scf(
     device: str | torch.device = "cpu",
     dtype: torch.dtype = torch.float32,
     solver: str = "orth",
+    orth: str = "symmetric",
+    lindep: float = 1e-7,
     diis: bool = True,
     diis_space: int = 8,
     max_iter: int = 60,
@@ -761,9 +781,16 @@ def run_scf(
 ) -> SCFResult:
     """Run DF-RHF to convergence; every tensor op runs on ``device`` in ``dtype``.
 
-    ``solver="orth"`` diagonalises X^T F X with X = S^{-1/2} (built once in
-    float64 on the host by ``trnsolver.inv_sqrt_spd``); ``"generalized"`` calls
-    ``trnsolver.eigh_generalized(F, S)`` every iteration; ``"purify"`` replaces
+    ``solver="orth"`` diagonalises X^T F X (``trnsolver.eigh_generalized(F,
+    X=X)``), with X built once in float64 on the host by
+    ``trnsolver.orthogonalizer(S, orth, lindep)``: for the default
+    ``orth="symmetric"``, X = S^{-1/2} when no eigenvalue of S is below
+    ``lindep`` x its largest, otherwise the canonical n x m X on the kept
+    subspace (``"canonical"`` always, ``"cholesky"`` pivoted Cholesky). The
+    kept rank is ``info["rank"]``, and ``eps`` has that many entries.
+    ``"generalized"`` calls
+    ``trnsolver.eigh_generalized(F, S)`` every iteration (a Cholesky of S, which
+    fails when S is numerically singular); ``"purify"`` replaces
     the per-iteration eigh by :func:`purify_occupied` on X^T F X (GEMMs only;
     the guess and one final solve still use eigh, so ``eps`` is reported);
     ``"subspace"`` replaces it by ``trnsolver.occupied_subspace`` on X^T F X,
@@ -798,7 +825,8 @@ def run_scf(
     setup = {}
 
     t0 = time.perf_counter()
-    X64 = trnsolver.inv_sqrt_spd(system.S)  # float64, host
+    orth_res = trnsolver.orthogonalizer(system.S, orth, lindep)  # float64, host
+    X64 = orth_res.X
     setup["orthogonalizer"] = 1e3 * (time.perf_counter() - t0)
 
     t0 = time.perf_counter()
@@ -821,13 +849,8 @@ def run_scf(
 
     def solve(F):
         if solver == "generalized":
-            eps, C = trnsolver.eigh_generalized(F, S)
-        else:
-            Fp = trnblas.gemm(1.0, X, trnblas.gemm(1.0, F, X), transA=True)
-            Fp = 0.5 * (Fp + Fp.T)
-            eps, Cp = trnsolver.eigh(Fp)
-            C = trnblas.gemm(1.0, X, Cp)
-        return eps, C
+            return trnsolver.eigh_generalized(F, S)
+        return trnsolver.eigh_generalized(F, None, X=X)
 
     # Core guess.
     t0 = time.perf_counter()
@@ -836,8 +859,9 @@ def run_scf(
     P = trnblas.syrk(2.0, C_occ)
     Q_occ = None
     if solver == "purify":
-        # Occupied orbitals in the orthonormal basis: Q = X^{-1} C_occ = X S C_occ.
-        Q_occ = trnblas.gemm(1.0, X, trnblas.gemm(1.0, S, C_occ))
+        # Occupied orbitals in the orthonormal basis: Q = X^T S C_occ
+        # (X^T S is X's left inverse on the kept subspace).
+        Q_occ = trnblas.gemm(1.0, X, trnblas.gemm(1.0, S, C_occ), transA=True)
     purify_steps = []
     sub_state = None
     sub_info = []
@@ -936,6 +960,7 @@ def run_scf(
             "naux": system.naux,
             "nao": n,
             "nocc": nocc,
+            "rank": n if solver == "generalized" else orth_res.rank,
             "purify_steps": purify_steps,
             "subspace": sub_info,
         },
@@ -1005,6 +1030,8 @@ def main():
     ap.add_argument(
         "--solver", default="orth", choices=("orth", "generalized", "purify", "subspace")
     )
+    ap.add_argument("--orth", default="symmetric", choices=("symmetric", "canonical", "cholesky"))
+    ap.add_argument("--lindep", type=float, default=1e-7)
     ap.add_argument("--no-diis", action="store_true")
     ap.add_argument("--max-iter", type=int, default=60)
     args = ap.parse_args()
@@ -1022,11 +1049,16 @@ def main():
         device=args.device,
         dtype=getattr(torch, args.dtype),
         solver=args.solver,
+        orth=args.orth,
+        lindep=args.lindep,
         diis=not args.no_diis,
         max_iter=args.max_iter,
         verbose=True,
     )
-    print(f"E = {res.energy:.10f}  converged={res.converged} iterations={res.iterations}")
+    print(
+        f"E = {res.energy:.10f}  converged={res.converged} iterations={res.iterations} "
+        f"rank={res.info['rank']}/{system.nao} ({args.orth}, lindep={args.lindep:g})"
+    )
     if system.ref_energy is not None:
         print(
             f"PySCF reference {system.ref_energy:.10f}  diff {res.energy - system.ref_energy:.2e}"

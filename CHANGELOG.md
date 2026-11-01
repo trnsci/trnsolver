@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`cg`/`gmres` returned `x0` (or zeros) with residual 0.0 for a zero or
+  small-scale right-hand side (#68).** `b = 0` with an `x0` returned `x0`
+  in place of the solution 0. Any `‖b‖ < 1e-15` returned without
+  iterating, and `cg` stopped a small-scale problem before its first step
+  (`|pAp| < 1e-30`). Now only `b == 0` short-circuits (to zeros), and `cg`
+  stops on exact breakdown. `jacobi_preconditioner` scaled the columns of
+  a block `r` of shape (n, k); it now scales rows. Affected: every
+  release through 0.20.0 (`jacobi_preconditioner` since 0.2.0).
+- **`lu` documented the wrong permutation convention (#71).** The docstring,
+  API docs, quickstart and README said `P @ A = L @ U`; `lu` returns
+  `A = P @ L @ U` (the `torch.linalg.lu` convention), which differs whenever
+  the pivot permutation is not its own inverse. The docs now match; the
+  returned values are unchanged. Affected docs: every release through 0.20.0.
+
 ### Added
 
 - **`occupied_subspace(F, k, guess=state)`: lowest-k eigensolver for SCF
@@ -20,6 +36,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `examples/scf_df_rhf.py --solver subspace`, `bench_scf.py --solver
   subspace`, `scripts/bench_occupied_subspace.py`. Simulator and MLIR
   verified (lnc = 1, 2); **needs Trn2 validation**.
+- **`orthogonalizer(S, method, lindep)` and `eigh_generalized(F, S, X=X)`:
+  a tolerance for near-singular overlaps (#72, for #15).** `"symmetric"`
+  (Loewdin S^-1/2, the default), `"canonical"` (keeps the eigenvalues of S
+  above `lindep` x max, n x m X) and `"cholesky"` (pivoted Cholesky, no
+  eigensolve, O(n m^2)). It returns `X` with X^H S X = I on the kept
+  subspace and the kept `rank`. It is built once, in float64 on the host,
+  for real or complex Hermitian S, batched, and differentiable.
+  `eigh_generalized(F, S, X=X)` then needs only two GEMMs, an m x m `eigh`
+  and a back-transform, in F's dtype and on F's device, and no Cholesky of
+  S. `examples/scf_df_rhf.py` uses them (`--orth`, `--lindep`, and
+  `pyscf:<name>@<basis>` systems for diffuse bases). The default results
+  are unchanged: every current test system is far from the 1e-7 threshold,
+  so `symmetric` is still S^-1/2, and its energies match the previous
+  release to all printed digits (fp64 and fp32, h2-lattice, water, benzene,
+  C10H22). With a diffuse basis, dropping the dependencies is what lets an
+  FP32 SCF converge. benzene/aug-cc-pVTZ (n = 414): with three functions
+  dropped, it converges in 23 iterations, and the float64 energy at its
+  orbitals is 4.7e-6 Eh from PySCF. Plain S^-1/2, the Cholesky of S, or
+  `cholesky` at 1e-7 do not converge in 80 iterations.
+  C20H42/aug-cc-pVDZ (n = 838, two functions dropped) converges in FP32
+  either way. In float64, dropping the two functions raises the energy by
+  2.8e-5 Eh: lower `lindep` when that matters more than FP32 conditioning.
 - **DF-RHF example: J and K from trntensor's fused packed-integral kernels
   (trntensor#60).** `DFJK(fused=None)` (and `run_scf(jk_fused=...)`,
   `bench_scf.py --jk-k auto|fused|unpack`) builds K with

@@ -219,7 +219,12 @@ def cholesky(A: torch.Tensor, upper: bool = False) -> torch.Tensor:
 
 
 def lu(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """LU factorization with partial pivoting: P @ A = L @ U
+    """LU factorization with partial pivoting: A = P @ L @ U
+
+    The ``torch.linalg.lu`` convention: P permutes the rows of L @ U back to
+    A, so ``P.mT @ A == L @ U``. (Before 0.20.1 this docstring said
+    ``P @ A = L @ U``, which holds only when the pivot permutation is its own
+    inverse.)
 
     Returns:
         P: Permutation matrix (n, n)

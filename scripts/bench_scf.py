@@ -87,6 +87,8 @@ def _run_mode(system: System, mode: str, args):
     kw = dict(
         solver=args.solver,
         subspace_opts=json.loads(args.subspace_opts) if args.subspace_opts else None,
+        orth=args.orth,
+        lindep=args.lindep,
         k_cache_gb=args.k_cache_gb,
         jk_square=args.jk_square,
         jk_fused={"auto": None, "fused": True, "unpack": False}[args.jk_k],
@@ -294,6 +296,8 @@ def main() -> None:
         default="",
         help="JSON keyword arguments for occupied_subspace, e.g. '{\"passes\": 2}'",
     )
+    ap.add_argument("--orth", default="symmetric", choices=("symmetric", "canonical", "cholesky"))
+    ap.add_argument("--lindep", type=float, default=1e-7)
     ap.add_argument("--max-iter", type=int, default=60)
     ap.add_argument("--warmup-iters", type=int, default=3)
     ap.add_argument("--k-cache-gb", type=float, default=4.0)

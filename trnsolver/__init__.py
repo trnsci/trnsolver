@@ -39,6 +39,9 @@ from .iterative import (
 # Backend control
 from .nki import HAS_NKI, get_backend, set_backend
 
+# Orthogonalizers (overlap matrices with near-linear dependencies)
+from .orthogonalize import Orthogonalizer, orthogonalizer
+
 # Occupied-subspace solver for SCF (Chebyshev-filtered subspace iteration)
 from .subspace import SubspaceResult, SubspaceState, occupied_subspace
 
@@ -62,6 +65,9 @@ __all__ = [
     "pinv",
     "schur",
     "svd",
+    # Orthogonalizers
+    "orthogonalizer",
+    "Orthogonalizer",
     # Iterative
     "cg",
     "gmres",
