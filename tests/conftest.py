@@ -12,6 +12,24 @@ import torch
 os.environ.setdefault("NKI_ENABLE_TRACE_CACHE", "0")
 
 
+def pytest_addoption(parser):
+    # Reference-conformance suite (tests/test_conformance.py): run the same
+    # cases against a non-default backend and/or with device inputs on a
+    # Trainium box, e.g. ``pytest tests/test_conformance.py --backend nki
+    # --conformance-device neuron``.
+    parser.addoption(
+        "--backend",
+        default="pytorch",
+        choices=("pytorch", "nki", "auto"),
+        help="trnsolver backend for tests/test_conformance.py (default: pytorch)",
+    )
+    parser.addoption(
+        "--conformance-device",
+        default="cpu",
+        help="device for tests/test_conformance.py inputs (default: cpu; e.g. neuron)",
+    )
+
+
 def pytest_configure(config):
     config.addinivalue_line("markers", "neuron: requires Neuron hardware")
 
