@@ -8,7 +8,8 @@ Part of the trnsci scientific computing suite ([github.com/trnsci](https://githu
 
 ## Features
 
-- **Symmetric & generalized eigensolvers** — `eigh` (batched Jacobi with `method="jacobi"`), `eigh_generalized` (Cholesky reduction), `eigh_randomized` (k dominant eigenpairs)
+- **Symmetric & generalized eigensolvers** — `eigh` (batched Jacobi with `method="jacobi"`), `eigh_generalized` (Cholesky reduction, or a precomputed orthogonalizer), `eigh_randomized` (k dominant eigenpairs)
+- **Orthogonalizers** — `orthogonalizer(S)`: Löwdin, canonical or pivoted-Cholesky X with XᵀSX = I, dropping near-linear dependencies of large-basis overlaps
 - **Factorizations** — `cholesky`, `lu`, `qr`, `svd`, `pinv`, `schur`
 - **Direct solvers** — `solve`, `solve_spd`, `inv_spd`, `inv_sqrt_spd`, `inv_sqrt_spd_ns` (Newton-Schulz)
 - **Iterative solvers** — `cg` (SPD systems, with preconditioner support), `gmres` (general), `gmres_ir` (iterative refinement, FP64 outer residual)
