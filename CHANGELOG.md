@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`occupied_subspace(F, k, guess=state)`: lowest-k eigensolver for SCF
+  (#77).** Warm-started Chebyshev-filtered subspace iteration. Per pass,
+  one NKI launch (`trnsolver/nki/subspace.py`) keeps F resident in SBUF,
+  runs the degree-8 filter as Tensor Engine GEMMs, forms the correction
+  E = Y - X X^T Y and the six Gram blocks of span[X, E]; the 2kb x 2kb
+  Rayleigh-Ritz runs in float64 on the host. FP32 DF-RHF on the host
+  reference filter converges in the same iterations as with a full `eigh`
+  (water 10 / 10, benzene 11 / 10, H2 lattice 9 / 10, C10H22 16 / 16).
+  `examples/scf_df_rhf.py --solver subspace`, `bench_scf.py --solver
+  subspace`, `scripts/bench_occupied_subspace.py`. Simulator and MLIR
+  verified (lnc = 1, 2); **needs Trn2 validation**.
 - **DF-RHF example: J and K from trntensor's fused packed-integral kernels
   (trntensor#60).** `DFJK(fused=None)` (and `run_scf(jk_fused=...)`,
   `bench_scf.py --jk-k auto|fused|unpack`) builds K with

@@ -34,3 +34,18 @@ eigenvalues, eigenvectors = trnsolver.eigh_generalized(F, S)
 ## Backend notes
 
 Householder tridiagonalization is n − 2 dependent BLAS-2 steps and leaves the Tensor Engine idle (#48). A parallel-ordered Jacobi step rotates n/2 disjoint pairs at once, so a batch of matrices advances in lockstep with no long dependency chain. In the kernel the Tensor Engine applies the step's partner permutation (an exact matmul shared by every tile) and the Vector Engine applies the rotations. For measurements against batched CPU LAPACK see #48.
+
+## `occupied_subspace(F, k, *, guess=None, buffer=None, passes=2, tol=None, degree=None, upper="gershgorin", refresh=3e-2)`
+
+Lowest `k` eigenpairs of a symmetric `F` for SCF, where `F` changes little between calls. Returns `(eigenvalues (k,), eigenvectors (n, k), state)`; pass `state` as `guess` on the next call.
+
+- `guess=None` is a cold start: one full float64 host `eigh`, returned exactly.
+- With a warm start, each pass runs a degree-8 scaled Chebyshev filter `Y = p(F) X` on a block of `kb = k + buffer` vectors (`buffer` defaults to about 15%, at least 8), splits off the correction `E = Y - X XᵀY`, and does a float64 Rayleigh-Ritz on `span[X, E]` on the host.
+- For FP32 `F` on the native `neuron` device, one pass is one NKI launch (`trnsolver/nki/subspace.py`, n·kb ≤ about 1024 × 512). `F` stays resident in SBUF, the filter is Tensor Engine GEMMs, and only the six kb × kb Gram blocks reach the host. Elsewhere the same arithmetic runs as PyTorch (`subspace.filter_reference`).
+- `refresh`: when the first pass finds the block far from `F` (relative residual above `refresh`, as in the first SCF iterations), the call returns a full `eigh` instead.
+- `tol`: stop early once the wanted residuals are below `tol` relative to the spectral scale.
+- `upper`: the spectral upper bound for the filter: Gershgorin (default), `"cached"`, or a number.
+
+The correction form matters in FP32. The filter grows core levels far below the HOMO much faster than the HOMO itself, and a Rayleigh-Ritz on `YᵀY` loses the HOMO. Degrees above about 12 lose accuracy even in the correction form, so the default is 8.
+
+`examples/scf_df_rhf.py --solver subspace` uses it on `XᵀFX`.

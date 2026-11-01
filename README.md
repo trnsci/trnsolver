@@ -134,7 +134,7 @@ python scripts/bench_scf.py --systems pyscf:alkane20 --modes cpu,neuron,neuron-n
 
 | Category | Shipped (v0.18.0) | Deferred |
 |----------|-------------------|----------|
-| Eigensolvers | `eigh`, `eigh_generalized`, `eigh_randomized` | — |
+| Eigensolvers | `eigh`, `eigh_generalized`, `eigh_randomized`, `occupied_subspace` | — |
 | Factorizations | `cholesky`, `lu`, `qr`, `svd`, `pinv`, `schur` | — |
 | Direct solvers | `solve`, `solve_spd`, `inv_spd`, `inv_sqrt_spd`, `inv_sqrt_spd_ns` | — |
 | Iterative | `cg` (w/ preconditioner), `gmres`, `gmres_ir` | — |
@@ -167,6 +167,7 @@ python scripts/bench_scf.py --systems pyscf:alkane20 --modes cpu,neuron,neuron-n
 | Eigen | `eigh` | Symmetric eigendecomposition (Jacobi / torch) |
 | Eigen | `eigh_generalized` | Generalized: `Ax = λBx` via Cholesky reduction |
 | Eigen | `eigh_randomized` | Randomized: k dominant eigenpairs, O(n²k), sRR |
+| Eigen | `occupied_subspace` | Lowest k eigenpairs for SCF: warm-started Chebyshev-filtered subspace iteration, one NKI launch per pass (F resident in SBUF) |
 | Factor | `cholesky` | `A = LL^T` |
 | Factor | `lu` | `PA = LU` |
 | Factor | `qr` | `A = QR` |
