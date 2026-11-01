@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cg`/`gmres` returned `x0` (or zeros) with residual 0.0 for a zero or
+  small-scale right-hand side (#68).** `b = 0` with an `x0` returned `x0`
+  in place of the solution 0. Any `‖b‖ < 1e-15` returned without
+  iterating, and `cg` stopped a small-scale problem before its first step
+  (`|pAp| < 1e-30`). Now only `b == 0` short-circuits (to zeros), and `cg`
+  stops on exact breakdown. `jacobi_preconditioner` scaled the columns of
+  a block `r` of shape (n, k); it now scales rows. Affected: every
+  release through 0.20.0 (`jacobi_preconditioner` since 0.2.0).
 - **`lu` documented the wrong permutation convention (#71).** The docstring,
   API docs, quickstart and README said `P @ A = L @ U`; `lu` returns
   `A = P @ L @ U` (the `torch.linalg.lu` convention), which differs whenever
