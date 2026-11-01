@@ -155,3 +155,27 @@ def test_pinv_cutoff_is_per_matrix():
 def test_pinv_empty(shape):
     A = torch.zeros(shape, dtype=torch.float64)
     assert trnsolver.pinv(A).shape == torch.linalg.pinv(A).shape
+
+
+@pytest.mark.parametrize("dtype", CDT)
+def test_eigh_randomized_complex_hermitian(dtype):
+    n, k = 40, 3
+    g = torch.Generator().manual_seed(7)
+    Q, _ = torch.linalg.qr(
+        torch.complex(
+            torch.randn(n, n, generator=g, dtype=torch.float64),
+            torch.randn(n, n, generator=g, dtype=torch.float64),
+        )
+    )
+    lam = torch.cat(
+        [
+            torch.tensor([30.0, -20.0, 10.0], dtype=torch.float64),
+            1e-3 * torch.rand(n - 3, generator=g, dtype=torch.float64),
+        ]
+    )
+    A = ((Q * lam.to(Q.dtype)) @ Q.mH).to(dtype)
+    w, V = trnsolver.eigh_randomized(A, k, seed=0)
+    # Sketch error from the 1e-3 tail: compare at 1e-5, not to rounding.
+    ref = torch.tensor([-20.0, 10.0, 30.0], dtype=w.dtype)
+    torch.testing.assert_close(w, ref, atol=1e-5, rtol=1e-5)
+    _close(V.mH @ V, torch.eye(k, dtype=dtype), dtype)

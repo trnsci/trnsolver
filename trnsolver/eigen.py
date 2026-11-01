@@ -259,9 +259,10 @@ def eigh_randomized(
         Q, _ = torch.linalg.qr(Y, mode="reduced")
         AQ = _call_matmul(A, Q)
 
-    # Project: B = Q^T A Q  (ℓ × ℓ, always FP32 in both paths)
-    B = Q.T @ AQ
-    B = 0.5 * (B + B.T)  # symmetrize for FP32 safety
+    # Project: B = Q^H A Q  (ℓ × ℓ, always FP32 in both paths). ``.mH``
+    # conjugates complex Hermitian A; for real A it is ``.T``.
+    B = Q.mH @ AQ
+    B = 0.5 * (B + B.mH)  # symmetrize for FP32 safety
 
     # Small eigenproblem: exact LAPACK eigh on (ℓ × ℓ) — always FP32
     eig_vals, V_small = torch.linalg.eigh(B)  # (ℓ,) ascending, (ℓ, ℓ)
@@ -642,7 +643,8 @@ def _call_matmul(A, V):
     callers such as eigh_randomized that call it unconditionally — on non-Neuron
     hardware the NKI guard ensures torch.matmul is used transparently.
     """
-    if not _use_nki() or A.shape[0] > 128 or V.shape[1] > 128:
+    # The kernels are real; complex operands always take torch.matmul.
+    if not _use_nki() or A.is_complex() or V.is_complex() or A.shape[0] > 128 or V.shape[1] > 128:
         return torch.matmul(A, V)
 
     orig_device = A.device
