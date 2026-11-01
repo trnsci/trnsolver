@@ -405,9 +405,21 @@ class TestNeuron:
 
     @pytest.mark.parametrize("n,k", [(250, 41), (490, 81)])
     def test_occupied_subspace_on_device(self, n, k):
+        # A 1e-2 perturbation is large for this spectrum (start error ~0.1),
+        # and a degree-8 pass contracts it about 2-3x, so 4 passes reach
+        # ~1e-2 on any backend (Trn2: 6.1e-3 / 1.4e-2 at n = 250 / 490; the
+        # host reference filter agrees to < 1%). Check the device run
+        # against the same calls on the host, and that it contracts.
         A0 = _fock_like(n, k, seed=n, dtype=torch.float32)
         A1 = _perturb(A0, 1e-2)
         st = trnsolver.occupied_subspace(A0.to("neuron"), k).state
+        before = _proj_err(st.X[:, :k].cpu(), A1, k)
         w, V, st = trnsolver.occupied_subspace(A1.to("neuron"), k, guess=st, passes=4)
         assert V.device.type == "neuron"
-        assert _proj_err(V.cpu(), A1, k) < 5e-5
+        st_h = trnsolver.occupied_subspace(A0, k).state
+        w_h, V_h, _ = trnsolver.occupied_subspace(A1, k, guess=st_h, passes=4)
+        err, err_h = _proj_err(V.cpu(), A1, k), _proj_err(V_h, A1, k)
+        assert err < 0.2 * before
+        assert abs(err - err_h) <= 0.05 * err_h + 1e-5
+        scale = float(torch.linalg.eigvalsh(A1.double()).abs().max())
+        assert float((w.cpu().double() - w_h.double()).abs().max()) < 1e-4 * scale
