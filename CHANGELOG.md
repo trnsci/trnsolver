@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `eigh_randomized` (eigenvalue error 1.35) now also stays off the real NKI
   matmul kernel.
 
+- **A real matrix with a complex right-hand side dropped the imaginary part
+  (#66).** `solve`, `solve_spd` and `eigh_generalized` cast B to A's dtype,
+  so a complex B lost its imaginary part with only a UserWarning, and the
+  result was real. A real A is now promoted to complex when B is complex.
+  Real B is unchanged. Affected: 0.7.0–0.20.0.
+
 ### Added
 
 - **DF-RHF example: J and K from trntensor's fused packed-integral kernels

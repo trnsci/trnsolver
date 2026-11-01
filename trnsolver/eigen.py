@@ -26,7 +26,7 @@ import os
 
 import torch
 
-from .factor import _cholesky_lower, _restore, _to_fp32
+from .factor import _cholesky_lower, _complex_if, _restore, _to_fp32
 from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki, _use_simulator
 
 
@@ -116,7 +116,7 @@ def eigh_generalized(
     otherwise. The inner eigh call dispatches to NKI per backend setting.
     Closes #11.
     """
-    A, orig = _to_fp32(A)
+    A, orig = _to_fp32(_complex_if(A, B))
     B = B.to(A.dtype)
 
     try:
