@@ -121,7 +121,7 @@ def ssor_preconditioner(
         raise ValueError("ssor_preconditioner: diagonal has near-zero entries")
     # Lower triangular factor: D + ω * L_strictly_lower
     L_factor = omega * torch.tril(A, diagonal=-1) + torch.diag(d)
-    U_factor = L_factor.T  # valid for symmetric A
+    U_factor = L_factor.mH  # D + omega L^H: valid for symmetric / Hermitian A
     dscale = omega * (2.0 - omega) * d
 
     def apply(r: torch.Tensor) -> torch.Tensor:

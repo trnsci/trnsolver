@@ -105,9 +105,11 @@ def eigh_generalized(
     """Generalized symmetric eigenvalue problem: A @ x = λ B @ x
 
     Reduces to standard form via Cholesky of B:
-        B = L @ L^T
-        (L^{-1} A L^{-T}) y = λ y
-        x = L^{-T} y
+        B = L @ L^H
+        (L^{-1} A L^{-H}) y = λ y
+        x = L^{-H} y
+
+    Real symmetric or complex Hermitian; leading batch dims are allowed.
 
     The triangular solves use trnblas.trsm (NKI-accelerated blocked path)
     when trnblas is installed; they fall back to torch.linalg.solve_triangular
@@ -124,22 +126,28 @@ def eigh_generalized(
 
     L = _cholesky_lower(B)
 
-    if _tb is not None:
+    # trnblas.trsm takes one real (n, n) matrix. Complex (Hermitian) input
+    # and batches take torch.linalg.solve_triangular with conjugate
+    # transposes of the last two dims (``.mH``): the reduction is
+    # L^{-1} A L^{-H}, and ``.T`` neither conjugated nor kept batch dims.
+    use_tb = _tb is not None and A.dim() == 2 and not A.is_complex()
+
+    if use_tb:
         # NKI path: trnblas.trsm dispatches to the blocked NKI GEMM path on
         # Trainium; falls back to torch.linalg.solve_triangular on CPU.
         L_inv_A = _tb.trsm(1.0, L, A, side="left", uplo="lower", trans=False)
         A_prime = _tb.trsm(1.0, L, L_inv_A.T, side="left", uplo="lower", trans=False).T
     else:
         L_inv_A = torch.linalg.solve_triangular(L, A, upper=False)
-        A_prime = torch.linalg.solve_triangular(L, L_inv_A.T, upper=False).T
+        A_prime = torch.linalg.solve_triangular(L, L_inv_A.mH, upper=False).mH
 
-    A_prime = 0.5 * (A_prime + A_prime.T)
+    A_prime = 0.5 * (A_prime + A_prime.mH)
     eigenvalues, V_prime = eigh(A_prime, tol)
 
-    if _tb is not None:
+    if use_tb:
         eigenvectors = _tb.trsm(1.0, L, V_prime, side="left", uplo="lower", trans=True)
     else:
-        eigenvectors = torch.linalg.solve_triangular(L.T, V_prime, upper=True)
+        eigenvectors = torch.linalg.solve_triangular(L.mH, V_prime, upper=True)
 
     return _restore(eigenvalues, orig), _restore(eigenvectors, orig)
 

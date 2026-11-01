@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Complex Hermitian and batched input gave wrong results with no error (#64).**
+  `cholesky(upper=True)`, `solve_spd` (including `iterative_refinement=True`),
+  `inv_spd`, `inv_sqrt_spd`, `eigh_generalized`, `pinv` and
+  `ssor_preconditioner` now follow the conjugate transpose and per-matrix
+  semantics of `torch.linalg`. Before, they used `.T`, which drops the
+  conjugation and reverses batch dims; a batch of size n kept its shape.
+  Relative error was 0.3–0.5 for complex input, and 0.4–2.5 or non-finite
+  for a batch of size n. `pinv` used the first matrix's singular values as
+  the cutoff for the whole batch and raised on empty input. Real (n, n)
+  results are unchanged. Affected: every release through 0.20.0 (`pinv`
+  since 0.5.0, `ssor_preconditioner` since 0.8.0).
+
 ### Added
 
 - **DF-RHF example: J and K from trntensor's fused packed-integral kernels
