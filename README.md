@@ -10,7 +10,7 @@
 
 Linear solvers and eigendecomposition for AWS Trainium via NKI.
 
-Eigenvalue problems, matrix factorizations, and iterative solvers for scientific computing on Trainium. The Jacobi eigensolver is the primary NKI acceleration target — each Givens rotation maps to a 2-row matmul on the Tensor Engine. The Newton-Schulz matrix-sqrt-inverse is the secondary target: an all-GEMM iteration whose shape aligns with the Tensor Engine pipeline.
+Eigenvalue problems, matrix factorizations, and iterative solvers for scientific computing on Trainium. The batched Jacobi eigensolver is the primary NKI acceleration target — whole sweeps run SBUF-resident, with the Tensor Engine doing the pair permutations (and, for 33 ≤ n ≤ 128, the Gram and rotation matmuls) and the Vector Engine the rotations. The Newton-Schulz matrix-sqrt-inverse is the secondary target: an all-GEMM iteration whose shape aligns with the Tensor Engine pipeline.
 
 Part of the **trnsci** scientific computing suite ([github.com/trnsci](https://github.com/trnsci)).
 
@@ -18,10 +18,10 @@ Part of the **trnsci** scientific computing suite ([github.com/trnsci](https://g
 
 trnsolver follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Active work is tracked in phase-labeled GitHub issues:
 
-- **[Phase 1 — correctness](https://github.com/trnsci/trnsolver/issues/26)** (active): NKI Jacobi kernel validated on hardware, eigh_generalized on NKI path, SCF example end-to-end. Target release: **v0.4.0**.
-- **[Phase 2 — precision](https://github.com/trnsci/trnsolver/issues/27)**: iterative refinement for eigh / solve_spd, Kahan summation in CG / GMRES.
-- **[Phase 3 — perf](https://github.com/trnsci/trnsolver/issues/28)**: Newton-Schulz NKI backend, preconditioner suite, NEFF cache reuse.
-- **[Phase 4 — multi-chip](https://github.com/trnsci/trnsolver/issues/29)**: parallel Jacobi sweeps across NeuronCores.
+- **[Phase 1 — correctness](https://github.com/trnsci/trnsolver/issues/26)** (done, v0.4.0): NKI Householder-QR `eigh` validated on hardware, eigh_generalized on NKI path.
+- **[Phase 2 — precision](https://github.com/trnsci/trnsolver/issues/27)** (done): iterative refinement for eigh / solve_spd, Newton-Schulz variants.
+- **[Phase 3 — perf](https://github.com/trnsci/trnsolver/issues/28)** (active): NEFF cache reuse, sparse CG/GMRES on trnsparse matrices.
+- **[Phase 4 — multi-chip](https://github.com/trnsci/trnsolver/issues/29)** (active): parallel Jacobi sweeps across NeuronCores; batched Jacobi across logical NeuronCores shipped (opt-in) in v0.19.0 / v0.20.0.
 - **[Phase 5 — generation](https://github.com/trnsci/trnsolver/issues/30)**: trn2 rotation-block tuning.
 
 ## Install
@@ -104,7 +104,11 @@ python scripts/bench_scf.py --systems pyscf:alkane20 --modes cpu,neuron,neuron-n
 
 ## Status
 
-**v0.18.0** — Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron; LNC=1 and LNC=2; trnsci/trnsci#35). `eigh(A, method="jacobi")` gains a block Jacobi NKI kernel for 33 ≤ n ≤ 128 (padded sizes 64 and 128), and `eigh(method="auto")` now uses the Jacobi kernel for FP32 batches on the `neuron` device inside a measured (n, B) region, where it beats the aten cutover (#52). Inside that region batched `eigh` is 1.5–2.2× faster than CPU LAPACK; at n=128, B=1024 it takes 321 ms against 668 ms. Outside the region the default cutover is unchanged.
+**v0.20.0** — Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron; trnsci/trnsci#35). Opt-in per-core worker-process pool for batched Jacobi `eigh` (`TRNSOLVER_EIGH_POOL=proc` with `TRNSOLVER_EIGH_CORES`): 3.65× scaling on 4 cores; at n = 128, B = 4096 it takes 324 ms against 531 ms for the thread split and 655 ms for 8-thread batch-parallel CPU LAPACK (#57). `eigh` of a host tensor on a TorchNeuron host now takes the host-LAPACK cutover instead of the NKI path (an n = 64 call was 265 s, now 0.15 ms). New `examples/scf_df_rhf.py`: DF-RHF SCF end to end on the trnsci libraries (#58).
+
+**v0.19.0** — Opt-in batched Jacobi `eigh` across logical NeuronCores (`TRNSOLVER_EIGH_CORES=<k>|auto`, one host thread per core): n = 128, B = 1024 goes 310 → 152 ms on four cores (#54). Corrects the v0.18.0 headline: against a CPU baseline that splits the batch over the same threads, single core at n = 128, B = 1024 is 1.13× (310 vs 352 ms), and the best multi-core result is at most 1.25× faster than 8 CPU threads (#54, #55).
+
+**v0.18.0** — Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron; LNC=1 and LNC=2; trnsci/trnsci#35). `eigh(A, method="jacobi")` gains a block Jacobi NKI kernel for 33 ≤ n ≤ 128 (padded sizes 64 and 128), and `eigh(method="auto")` now uses the Jacobi kernel for FP32 batches on the `neuron` device inside a measured (n, B) region, where it beats the aten cutover (#52). Outside the region the default cutover is unchanged. *The release's "1.5–2.2× faster than CPU LAPACK" (321 vs 668 ms at n=128, B=1024) used batched `torch.linalg.eigh` as the baseline; corrected in v0.19.0.*
 
 **v0.17.0** — Native TorchNeuron dispatch (Trn2/Trn3) alongside the PyTorch/XLA path (Trn1, maintenance); validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0; trnsci/trnsci#35). New `eigh(A, method="jacobi")`: a batched one-sided Jacobi NKI kernel for FP32 n ≤ 128 on the `neuron` device, with a batched-matmul torch path everywhere else (#50). At n=32, B=1024 it takes 40.2 ms against 60.5 ms for CPU LAPACK. The default `eigh` dispatch and its small-n cutover to `torch.linalg.eigh` are unchanged.
 
@@ -132,7 +136,7 @@ python scripts/bench_scf.py --systems pyscf:alkane20 --modes cpu,neuron,neuron-n
 
 **API coverage:**
 
-| Category | Shipped (v0.18.0) | Deferred |
+| Category | Shipped (v0.20.0) | Deferred |
 |----------|-------------------|----------|
 | Eigensolvers | `eigh`, `eigh_generalized`, `eigh_randomized` | — |
 | Factorizations | `cholesky`, `lu`, `qr`, `svd`, `pinv`, `schur` | — |
@@ -157,8 +161,9 @@ python scripts/bench_scf.py --systems pyscf:alkane20 --modes cpu,neuron,neuron-n
 - **v0.16.0** — Trn2 validation on Neuron SDK 2.33 (native TorchNeuron device): `eigh` small-n cutover, NKI 0.7.0 kernel fixes, `torch.compile`-traceable factorizations ✓
 - **v0.17.0** — Native TorchNeuron dispatch; batched Jacobi `eigh(method="jacobi")` kernel on Trn2 ✓
 - **v0.18.0** — Block Jacobi kernel for 33 ≤ n ≤ 128; `eigh(method="auto")` uses the Jacobi kernel in a measured region on Trn2 ✓
-- **v0.19.0** — BF16 inner matvec for GMRES-IR via `matmul_kernel_fp32out` + SR (Principle 3); block RHS support
-- **v0.20.0+** — NKI Hessenberg reduction kernel, multi-NeuronCore parallel Jacobi (#20)
+- **v0.19.0** — Batched Jacobi `eigh` across logical NeuronCores, opt-in `TRNSOLVER_EIGH_CORES` (#54) ✓
+- **v0.20.0** — Per-core worker-process pool for batched Jacobi (`TRNSOLVER_EIGH_POOL=proc`, #57); DF-RHF SCF example (#58) ✓
+- **Later** — BF16 inner matvec for GMRES-IR via `matmul_kernel_fp32out` + SR (Principle 3); block RHS support; NKI Hessenberg reduction kernel
 
 ## Operations
 
@@ -186,7 +191,7 @@ python scripts/bench_scf.py --systems pyscf:alkane20 --modes cpu,neuron,neuron-n
 
 ## Benchmarks
 
-CPU baselines (torch.linalg, scipy.linalg, trnsolver PyTorch path) run on every CI build; CUDA baselines (`benchmarks/bench_cuda.py`, cuSOLVER via torch.linalg) run on a vintage-matched g5.xlarge A10G instance; NKI numbers are pending v0.4.0 hardware validation. See the [benchmarks page](https://trnsci.dev/trnsolver/benchmarks/) for the latest table and vintage-matching rationale.
+CPU baselines (torch.linalg, scipy.linalg, trnsolver PyTorch path) run on every CI build; CUDA baselines (`benchmarks/bench_cuda.py`, cuSOLVER via torch.linalg) run on a vintage-matched g5.xlarge A10G instance; Trn2 numbers (batched Jacobi `eigh`, DF-RHF SCF) are measured by `scripts/bench_jacobi_multicore.py` and `scripts/bench_scf.py`. See the [benchmarks page](https://trnsci.dev/trnsolver/benchmarks/) for the latest table and vintage-matching rationale.
 
 ## Related projects in the trnsci suite
 
@@ -195,12 +200,12 @@ All six siblings are on PyPI, along with the umbrella meta-package:
 | Project | What | Latest |
 |---------|------|-------:|
 | [trnsci](https://github.com/trnsci/trnsci) | Umbrella meta-package pulling the whole suite | v0.1.0 |
-| [trnfft](https://github.com/trnsci/trnfft) | FFT and complex-valued tensors | v0.8.0 |
-| [trnblas](https://github.com/trnsci/trnblas) | BLAS Level 1–3 | v0.4.0 |
-| [trnrand](https://github.com/trnsci/trnrand) | Philox / Sobol / Halton RNG | v0.1.0 |
-| trnsolver | Linear solvers and eigendecomposition | **v0.18.0** |
-| [trnsparse](https://github.com/trnsci/trnsparse) | Sparse matrix operations | v0.1.1 |
-| [trntensor](https://github.com/trnsci/trntensor) | Tensor contractions (einsum, TT/Tucker) | v0.1.1 |
+| [trnfft](https://github.com/trnsci/trnfft) | FFT and complex-valued tensors | v0.26.0 |
+| [trnblas](https://github.com/trnsci/trnblas) | BLAS Level 1–3 | v0.9.1 |
+| [trnrand](https://github.com/trnsci/trnrand) | Philox / Sobol / Halton RNG | v0.12.1 |
+| trnsolver | Linear solvers and eigendecomposition | **v0.20.0** |
+| [trnsparse](https://github.com/trnsci/trnsparse) | Sparse matrix operations | v0.12.1 |
+| [trntensor](https://github.com/trnsci/trntensor) | Tensor contractions (einsum, TT/Tucker) | v0.22.0 |
 
 ## License
 
