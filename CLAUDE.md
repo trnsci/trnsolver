@@ -52,21 +52,27 @@ trnsolver/
 
 ## NKI Jacobi Strategy
 
-The Jacobi eigensolver maps to Trainium hardware:
+The batched one-sided (Hestenes) Jacobi kernels in `trnsolver/nki/jacobi.py`
+map to Trainium hardware:
 
-- **Each Givens rotation** is a 2-row/col update — rank-2 matmul on Tensor Engine
-- **Off-diagonal max finding** maps to Vector Engine reduction
-- **Sweep convergence check** is a scalar reduction on Scalar Engine
-- **Eigenvector accumulation** V' = V @ G is a batched column update
+- **Parallel order:** each step rotates n/2 disjoint column pairs, so a batch
+  advances in lockstep; up to 128 tiles of 128 / n matrices stay in SBUF
+  for a whole sweep (one launch per sweep)
+- **Tensor Engine:** the step's partner permutation (exact matmul); for
+  33 <= n <= 128 also the Gram matrix and block-pair rotations
+- **Vector Engine:** the rotations (block kernel: 16 x 16 pair Gram blocks)
+- **Convergence check** after the expected sweep count, at most 15 sweeps
 
-The Jacobi method is preferred over Householder tridiagonalization on
-Trainium because each rotation is a fixed-size operation that maps cleanly
-to the 128×128 tile, vs Householder which requires growing reflector chains.
+Jacobi is preferred over Householder tridiagonalization on Trainium because
+Householder is n - 2 dependent BLAS-2 steps that leave the Tensor Engine
+idle; batched on device it still lost to CPU LAPACK (#48).
 
 ## Known Gaps & Design Notes
 
-- **NKI Jacobi kernel is a stub.** Falls back to torch.linalg.eigh until
-  validated on hardware. The rotation kernel scaffold is in nki/dispatch.py.
+- **NKI Jacobi kernels are batched and n <= 128.** `trnsolver/nki/jacobi.py`
+  (scalar n <= 32, block 33 <= n <= 128), validated on Trn2. Householder-QR
+  `eigh` is single-tile (n <= 128); the default aten cutover (n < 512) and
+  the > 128 fallback send single matrices to `torch.linalg.eigh`.
 
 - **Jacobi is O(n³) per sweep with O(n) sweeps** — cubic overall but with
   a large constant. For n > ~500, Householder + QR iteration would be faster.
@@ -77,9 +83,8 @@ to the 128×128 tile, vs Householder which requires growing reflector chains.
   benefit from NKI Level 1/2 kernels in trnblas, but the iteration logic
   stays on the host.
 
-- **inv_sqrt_spd uses eigendecomposition**, not the Newton-Schulz iteration.
-  Newton-Schulz (X_{k+1} = 0.5 X_k (3I - A X_k²)) is all GEMMs and would
-  map better to trnblas, but needs good initial scaling.
+- **inv_sqrt_spd uses eigendecomposition.** The all-GEMM Newton-Schulz
+  variant is `inv_sqrt_spd_ns` (GEMMs via `trnblas.gemm` when installed).
 
 ## Dependencies
 
@@ -101,7 +106,7 @@ Sibling repos in the trn-* suite:
 - `trnfft` — FFT + complex ops (https://github.com/trnsci/trnfft)
 - `trnblas` — BLAS operations (https://github.com/trnsci/trnblas)
 - `trnsolver` — Linear solvers, eigendecomposition (this repo)
-- `trnrand` — Random number generation (planned)
+- `trnrand` — Random number generation
 
 All repos: Python/NKI, Apache 2.0.
 
