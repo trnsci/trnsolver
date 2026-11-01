@@ -21,6 +21,7 @@ trnsolver/
 │   ├── __init__.py          # Re-exports all solver operations
 │   ├── eigen.py             # eigh, eigh_generalized (Jacobi + torch fallback)
 │   ├── factor.py            # cholesky, lu, qr, solve, solve_spd, inv_sqrt_spd
+│   ├── orthogonalize.py     # orthogonalizer(S): symmetric / canonical / pivoted Cholesky
 │   ├── iterative.py         # cg, gmres
 │   └── nki/
 │       ├── __init__.py
@@ -45,6 +46,7 @@ trnsolver/
 |----------|------|---------------|
 | Overlap Cholesky | S = L L^T | `cholesky(S)` |
 | Reduce to standard | A' = L^{-1} F L^{-T} | `eigh_generalized(F, S)` |
+| ...near-singular S | X = orthogonalizer(S).X once, A' = X^T F X | `eigh_generalized(F, S, X=X)` |
 | Eigensolve | A' V = V Λ | `eigh(A')` (Jacobi on NKI) |
 | Back-transform | C = L^{-T} V | `trsm` (in trnblas) |
 | Density | P = C_occ @ C_occ^T | `syrk` (in trnblas) |
