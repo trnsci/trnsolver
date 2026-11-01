@@ -92,3 +92,12 @@ Lowest `k` eigenpairs of a symmetric `F` for SCF, where `F` changes little betwe
 The correction form matters in FP32. The filter grows core levels far below the HOMO much faster than the HOMO itself, and a Rayleigh-Ritz on `YᵀY` loses the HOMO. Degrees above about 12 lose accuracy even in the correction form, so the default is 8.
 
 `examples/scf_df_rhf.py --solver subspace` uses it on `XᵀFX`.
+
+Measured on Trn2 (one logical NeuronCore, host pinned to 2 CPUs; #78):
+
+- **Per call, default 2 passes, n = 250 / 490 / 970:** 13 / 16 / 44 ms, against 3.8 / 12.6 / 68 ms for aten `eigh` on the device tensor. With one pass it is 4.5 / 7.9 / 21 ms.
+- **Where the time goes:** the kernel takes 0.5–0.7 ms per pass. The float64 host Rayleigh-Ritz takes 1.2 / 3.5 / 16 ms per pass, and the rest is the per-pass host round trip.
+- **Host threads:** when the host threads share CPUs with the Neuron runtime, libgomp's default spin-wait after each host LAPACK call delays the next device operations by up to about 4 ms. `GOMP_SPINCOUNT=10000` removes that delay without slowing LAPACK: the per-call times become 7.8 / 12 / 40 ms. `OMP_WAIT_POLICY=PASSIVE` also removes it, but slows LAPACK.
+- **DF-RHF time to convergence:** the full `eigh` was faster at every size measured (n_ao = 114–970).
+  - At n_ao = 970 the default `refresh` turned 14 of 18 solves into full `eigh`s.
+  - With `refresh=None` the eigh stage drops from 74 to 44 ms, but the SCF needs 26 iterations instead of 17.

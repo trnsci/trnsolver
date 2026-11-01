@@ -159,6 +159,9 @@ def bench_scf(args) -> None:
                 + ",".join(f"{k}:{v:.1f}" for k, v in res.setup_ms.items()),
                 flush=True,
             )
+            if res.info.get("subspace"):
+                # (degree, passes) per iteration; (0, 0) is a full eigh (cold or refresh).
+                print("SUBSPACE " + json.dumps(res.info["subspace"]), flush=True)
         for row in rows:
             if row["system"] == system.name:
                 row["ref"] = ref
