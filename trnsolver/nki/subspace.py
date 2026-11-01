@@ -289,7 +289,9 @@ def kernel_inputs(F: torch.Tensor, X: torch.Tensor, table: torch.Tensor):
     """(F, X, table (128, w), sched) as the kernel takes them, on F's device."""
     kb = X.shape[1]
     m = (table.numel() - kb) // 3
-    tab = table.to(F.device, torch.float32).reshape(1, -1).expand(PMAX, -1).contiguous()
+    # Expanded and cast on the host: one small H2D copy, no device ops.
+    tab = table.to(torch.float32).reshape(1, -1).expand(PMAX, -1).contiguous()
+    tab = tab.to(F.device)
     return (
         F.contiguous(),
         X.to(F.device, torch.float32).contiguous(),

@@ -272,6 +272,19 @@ def _run_filter(F: torch.Tensor, X: torch.Tensor, table: torch.Tensor) -> torch.
     return filter_reference(F, X, table.to(F.device))
 
 
+def _to(t: torch.Tensor, device, dtype) -> torch.Tensor:
+    """``t.to(device, dtype)``, casting on the host first for a host ``t``.
+
+    On TorchNeuron a float64 host tensor sent with ``.to("neuron",
+    torch.float32)`` is cast after the copy, which took 6.3 ms for the
+    (372, 186) Ritz block on Trn2; cast and made contiguous on the host it
+    is 0.1 ms.
+    """
+    if t.device.type == "cpu" and torch.device(device).type != "cpu":
+        return t.to(dtype).contiguous().to(device)
+    return t.to(device, dtype)
+
+
 def _gershgorin_upper(F: torch.Tensor) -> float:
     """Upper bound on the spectrum: max_i (f_ii + sum_{j != i} |f_ij|)."""
     d = torch.diagonal(F)
@@ -281,7 +294,7 @@ def _gershgorin_upper(F: torch.Tensor) -> float:
 def _cold_start(F: torch.Tensor, kb: int) -> tuple[torch.Tensor, torch.Tensor, float]:
     """(X, theta, top eigenvalue) from one full float64 host eigh of F."""
     w, V = torch.linalg.eigh(F.detach().to("cpu", torch.float64))
-    return V[:, :kb].to(F.device, F.dtype), w[:kb].clone(), float(w[-1])
+    return _to(V[:, :kb], F.device, F.dtype), w[:kb].clone(), float(w[-1])
 
 
 def _complete(X: torch.Tensor, theta: torch.Tensor, kb: int, seed: int):
@@ -296,7 +309,7 @@ def _complete(X: torch.Tensor, theta: torch.Tensor, kb: int, seed: int):
     g = torch.Generator().manual_seed(seed)
     extra = torch.randn(X.shape[0], kb - r, generator=g, dtype=torch.float64)
     extra = extra / extra.norm(dim=0, keepdim=True)
-    X = torch.cat([X, extra.to(X.device, X.dtype)], dim=1)
+    X = torch.cat([X, _to(extra, X.device, X.dtype)], dim=1)
     return X, torch.cat([theta, theta[-1:].expand(kb - r)])
 
 
@@ -305,7 +318,7 @@ def _rr_block(F: torch.Tensor, X: torch.Tensor, kb: int):
     G = (X.T @ X).to("cpu", torch.float64)
     H = (X.T @ (F @ X)).to("cpu", torch.float64)
     theta, Q = rayleigh_ritz(G, H)
-    return _complete(X @ Q.to(X.device, X.dtype), theta, kb, seed=kb)
+    return _complete(X @ _to(Q, X.device, X.dtype), theta, kb, seed=kb)
 
 
 @torch.compiler.disable
@@ -379,7 +392,7 @@ def occupied_subspace(
         # A full eigh is the answer (and the warm start for the next call).
         X, theta, bound = cold()
         state = SubspaceState(X=X, theta=theta, upper=bound)
-        return SubspaceResult(theta[:k].to(F.device, F.dtype), X[:, :k], state)
+        return SubspaceResult(_to(theta[:k], F.device, F.dtype), X[:, :k], state)
 
     cached = None
     if isinstance(guess, SubspaceState):
@@ -397,6 +410,7 @@ def occupied_subspace(
         b = float(upper)
 
     resid = None
+    w_dev = None  # theta[:k] on F's device, from the last pass's copy
     m = 0
     done = 0
     for _ in range(max(1, passes)):
@@ -404,7 +418,7 @@ def occupied_subspace(
         if not (a0 < a < b):
             # Degenerate block, or a bound below the block: refresh exactly.
             X, theta, b = cold()
-            resid = None
+            resid = w_dev = None
             break
         m = degree or choose_degree(theta, k, b, amp_max=amp_max, max_degree=max_degree)
         table = filter_table(chebyshev_coefficients(m, a0, a, b), theta)
@@ -420,11 +434,19 @@ def occupied_subspace(
             # The block is far from the new F (early SCF): solve exactly.
             X, theta, b = cold()
             m = done = 0
+            w_dev = None
             break
         if tol is not None and worst <= tol:
             break
         theta, Q = rayleigh_ritz(G, H, kb=kb)
-        Q = Q[:, :kb].to(F.device, F.dtype)
+        # One H2D copy for the new block's coefficients and its Ritz values:
+        # on Trn2 a second small copy right after the update took up to
+        # 3.8 ms (a (41,) vector at n = 250), the packed one ~0.3 ms.
+        w = min(kb, Q.shape[1])
+        pk = _to(torch.cat([Q[:, :w], theta[:w].reshape(1, w)], 0), F.device, F.dtype)
+        Q, w_dev = pk[:-1], (pk[-1, :k] if w >= k else None)
         X, theta = _complete(X @ Q[:kb] + out[:n] @ Q[kb:], theta[:kb], kb, seed=done)
     state = SubspaceState(X=X, theta=theta, upper=b, degree=m, passes=done, residual=resid)
-    return SubspaceResult(theta[:k].to(F.device, F.dtype), X[:, :k], state)
+    if w_dev is None:
+        w_dev = _to(theta[:k], F.device, F.dtype)
+    return SubspaceResult(w_dev, X[:, :k], state)
