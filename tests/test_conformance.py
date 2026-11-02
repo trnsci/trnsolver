@@ -261,10 +261,6 @@ def _pending(issue, pr, what):
     return pytest.mark.xfail(strict=False, reason=f"trnsci/trnsolver#{issue}, fix in #{pr}: {what}")
 
 
-def _decide(what):
-    return pytest.mark.xfail(strict=True, reason=f"trnsci/trnsolver#76 needs decision: {what}")
-
-
 KNOWN: dict[str, pytest.MarkDecorator] = {}  # filled in next to each case table
 
 
@@ -1251,7 +1247,6 @@ GRAD = [
             )
         ),
     ),
-    ("schur-T", lambda A: ts.schur(A)[1], (spd(_n),), None),
     (
         "cg-b",
         lambda b: ts.cg(_A_s, b, tol=1e-14)[0],
@@ -1267,11 +1262,16 @@ GRAD = [
     ),
     ("gmres_ir-Ab", lambda A, b: ts.gmres_ir(A, b, tol=1e-14)[0], (_A_g, _b_r), torch.linalg.solve),
 ]
-KNOWN["schur-T"] = _decide("schur silently detaches (no gradient)")
-KNOWN["cg-A"] = _decide("cg gradient w.r.t. A is wrong")
-KNOWN["cg-A-gradgrad"] = _decide("cg gradient w.r.t. A is wrong")
-KNOWN["gmres-Ab"] = _decide("gmres backward raises (in-place op on a saved tensor)")
-KNOWN["gmres-Ab-gradgrad"] = _decide("gmres backward raises (in-place op on a saved tensor)")
+
+
+def test_schur_requires_grad_raises():
+    """schur is not differentiable: it raises rather than detach silently (#76)."""
+    A = dev(spd(_n)).requires_grad_(True)
+    with pytest.raises(RuntimeError, match="not differentiable"):
+        ts.schur(A)
+    with torch.no_grad():
+        Q, T = ts.schur(A)
+    assert_close(host(Q @ T @ Q.mT), host(A.detach()), 1e-8, "QTQ^T under no_grad")
 
 
 def _skip_grad_off_cpu():
