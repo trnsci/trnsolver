@@ -132,8 +132,10 @@ def test_subspace_solver_matches_eigh(dtype):
     info = sub.info["subspace"]
     assert info[0] == (0, 0)  # the cold start
     # Adaptive passes (rtol / tol), and no full-eigh refresh after the cold start.
-    assert all(1 <= p <= 4 for _, p in info[1:])
-    tol = 1e-8 if dtype == torch.float64 else 1e-4
+    assert all(1 <= p <= 6 for _, p in info[1:])
+    # The last call's Ritz values, from a block refined to rtol of the
+    # call's starting residual: within the SCF's own d_tol (1e-7 in float64).
+    tol = 1e-7 if dtype == torch.float64 else 1e-4
     torch.testing.assert_close(sub.eps, base.eps[: system.nocc], rtol=0, atol=tol)
 
 

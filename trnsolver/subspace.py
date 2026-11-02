@@ -430,14 +430,14 @@ def occupied_subspace(
     *,
     guess: SubspaceState | torch.Tensor | None = None,
     buffer: int | None = None,
-    passes: int = 4,
+    passes: int = 6,
     tol: float | str | None = "auto",
     degree: int | None = None,
     max_degree: int = _MAX_DEGREE,
     amp_max: float = _AMP_MAX,
     upper: float | str = "gershgorin",
     refresh: float | None = None,
-    rtol: float | None = 0.1,
+    rtol: float | None = 0.05,
 ) -> SubspaceResult:
     """Lowest k eigenpairs of a symmetric F by Chebyshev-filtered subspace iteration.
 
@@ -471,12 +471,14 @@ def occupied_subspace(
         refresh: if the first pass finds a wanted residual above
            ``refresh * max(|theta_1|, |upper|)``, return a full host eigh
            instead (which also resets the warm start). None (default):
-           never. The defaults (``passes=4, rtol=0.1, tol="auto",
-           refresh=None``) are the measured SCF setting (trnsolver#78):
-           DF-RHF in FP32 takes the same iterations as with a full eigh
-           without any full eigh after the cold start, where the earlier
-           fixed ``passes=2, refresh=3e-2`` fell back to a full eigh on
-           most early iterations (14 of 18 at n_ao = 970).
+           never. The defaults (``passes=6, rtol=0.05, tol="auto",
+           refresh=None``) are the measured SCF setting (trnsolver#85):
+           FP32 DF-RHF on Trn2 then takes within one iteration of a full
+           eigh (n_ao = 114 / 250 / 490 / 970: 11 / 14 / 15 / 18 against
+           11 / 14 / 16 / 17) with no full eigh after the cold start. The
+           earlier fixed ``passes=2, refresh=3e-2`` fell back to a full
+           eigh on most early iterations (14 of 21 at n_ao = 970) and took
+           22 iterations there.
         upper: spectral upper bound: a number, ``"gershgorin"`` (default;
            one reduction and one host sync per call), or ``"cached"`` (the
            state's bound: the cold start's top eigenvalue plus 5% of the

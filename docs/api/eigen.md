@@ -78,15 +78,21 @@ C20H42/aug-cc-pVDZ (n = 838, smallest eigenvalue 4.1e-7) is milder. At lindep 1e
 
 Householder tridiagonalization is n − 2 dependent BLAS-2 steps and leaves the Tensor Engine idle (#48). A parallel-ordered Jacobi step rotates n/2 disjoint pairs at once, so a batch of matrices advances in lockstep with no long dependency chain. In the kernel the Tensor Engine applies the step's partner permutation (an exact matmul shared by every tile) and the Vector Engine applies the rotations. For measurements see #48; the fair CPU baseline splits the batch across the same threads, which is 1.6–5.8× faster than one batched `torch.linalg.eigh` call (#54, v0.19.0).
 
-## `occupied_subspace(F, k, *, guess=None, buffer=None, passes=2, tol=None, degree=None, upper="gershgorin", refresh=3e-2)`
+## `occupied_subspace(F, k, *, guess=None, buffer=None, passes=4, tol="auto", rtol=0.1, degree=None, upper="gershgorin", refresh=None)`
 
 Lowest `k` eigenpairs of a symmetric `F` for SCF, where `F` changes little between calls. Returns `(eigenvalues (k,), eigenvectors (n, k), state)`; pass `state` as `guess` on the next call.
 
 - `guess=None` is a cold start: one full float64 host `eigh`, returned exactly.
 - With a warm start, each pass runs a degree-8 scaled Chebyshev filter `Y = p(F) X` on a block of `kb = k + buffer` vectors (`buffer` defaults to about 15%, at least 8), splits off the correction `E = Y - X XᵀY`, and does a float64 Rayleigh-Ritz on `span[X, E]` on the host.
-- For FP32 `F` on the native `neuron` device, one pass is one NKI launch (`trnsolver/nki/subspace.py`, n·kb ≤ about 1024 × 512). `F` stays resident in SBUF, the filter is Tensor Engine GEMMs, and only the six kb × kb Gram blocks reach the host. Elsewhere the same arithmetic runs as PyTorch (`subspace.filter_reference`).
-- `refresh`: when the first pass finds the block far from `F` (relative residual above `refresh`, as in the first SCF iterations), the call returns a full `eigh` instead.
-- `tol`: stop early once the wanted residuals are below `tol` relative to the spectral scale.
+- The Rayleigh-Ritz keeps only the lowest `kb` of the `2 kb` Ritz pairs. When the unit-diagonal Gram of `[X, E]` is well conditioned (its smallest eigenvalue, bounded below by `1 / ‖L⁻¹‖²_F`, is above the drop threshold), one Cholesky reduces the pencil to a standard problem, which needs one `eigh` instead of two eigendecompositions. Otherwise it takes the rank-revealing path, which drops dependent correction columns.
+- For FP32 `F` on the native `neuron` device, one pass is one NKI launch (`trnsolver/nki/subspace.py`, n·kb ≤ about 1024 × 512). `F` stays resident in SBUF, the filter is Tensor Engine GEMMs, and only the six kb × kb Gram blocks reach the host.
+  - Each launch after a call's first one starts by applying the previous pass's block update, `X ← [X, E] Q`, on chip (`subspace_step_kernel`). `Q` arrives in the same host-to-device copy as the filter's scalars.
+  - Only the last pass's update runs as device ops. `TRNSOLVER_SUBSPACE_FOLD=0` turns the folding off.
+  - Elsewhere the same arithmetic runs as PyTorch (`subspace.filter_reference`, `subspace.step_reference`).
+- The number of passes adapts to how far `F` moved:
+  - `rtol`: stop once the wanted residuals of the block entering a pass have dropped to `rtol` times those the call started with. Early SCF iterations take up to `passes` passes, and late ones take one Rayleigh-Ritz.
+  - `tol`: stop once they are below `tol` relative to the spectral scale. `"auto"` is 30 units of `F`'s rounding (3.6e-6 for FP32), the residual's noise floor. A converged SCF then gets the same orbitals back, so an FP32 energy test can see two identical energies in a row.
+  - `refresh` (default off): return a full `eigh` when the first residual is above `refresh`.
 - `upper`: the spectral upper bound for the filter: Gershgorin (default), `"cached"`, or a number.
 
 The correction form matters in FP32. The filter grows core levels far below the HOMO much faster than the HOMO itself, and a Rayleigh-Ritz on `YᵀY` loses the HOMO. Degrees above about 12 lose accuracy even in the correction form, so the default is 8.
