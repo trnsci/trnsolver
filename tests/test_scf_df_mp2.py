@@ -113,3 +113,14 @@ def test_fp32_scf_and_mp2_match_pyscf():
     e_hf, e_corr = mp2.pyscf_df_mp2_reference("alkane3")
     assert abs(out.e_hf - e_hf) < 1e-7
     assert abs(out.e_corr - e_corr) < 1e-6
+
+
+def test_matched_basis_reference_with_dropped_functions():
+    pytest.importorskip("pyscf")
+    system = scf.pyscf_system("alkane3", "aug-cc-pvdz", "aug-cc-pvdz-jkfit", reference=False)
+    res = scf.run_scf(system, dtype=torch.float64, orth="canonical", lindep=1e-3)
+    assert res.info["rank"] < system.nao
+    out = mp2.run_mp2(system, res, orth="canonical", lindep=1e-3)
+    e_hf, e_corr = mp2.pyscf_df_mp2_reference("alkane3", "aug-cc-pvdz", lindep=1e-3)
+    assert out.e_hf == pytest.approx(e_hf, abs=1e-8)
+    assert out.e_corr == pytest.approx(e_corr, abs=1e-7)

@@ -251,20 +251,49 @@ def run_mp2(
     )
 
 
-def pyscf_df_mp2_reference(name: str, basis: str = "cc-pvdz", auxbasis: str | None = None):
-    """(E_HF, E_corr) from PySCF: DF-RHF then ``mp.dfmp2.DFMP2`` with the same jkfit basis."""
+def pyscf_df_mp2_reference(
+    name: str,
+    basis: str = "cc-pvdz",
+    auxbasis: str | None = None,
+    lindep: float | None = None,
+):
+    """(E_HF, E_corr) from PySCF: DF-RHF then ``mp.dfmp2.DFMP2`` with the same jkfit basis.
+
+    ``lindep`` (relative to S's largest eigenvalue, as for
+    ``trnsolver.orthogonalizer``) drops the same near-linear dependencies
+    from PySCF's basis, so the reference is in the SCF's kept basis. PySCF
+    >= 2.9 does this through ``scf.hf.remove_overlap_zero_eigenvalue``;
+    ``scf.addons.remove_linear_dep_`` there only acts below 1e-10 and kept
+    all 510 functions of C12H26 / aug-cc-pVDZ (1.6e-4 Eh of E_HF and 1.1e-3
+    of E_MP2 against the canonical 1e-6 basis).
+    """
+    import numpy as np
     from pyscf import mp
     from pyscf import scf as pscf
+    from pyscf.scf import hf
 
     mol = scf.pyscf_mol(name, basis)
-    mf = pscf.RHF(mol).density_fit(auxbasis=auxbasis or f"{basis}-jkfit")
-    mf.conv_tol = 1e-11
-    if basis.lower() != "cc-pvdz":
-        mf = pscf.addons.remove_linear_dep_(mf)
-    e_hf = float(mf.kernel())
-    pt = mp.dfmp2.DFMP2(mf)
-    # with_t2=False: the amplitudes need not fit in memory at ladder sizes.
-    e_corr = float(pt.kernel(with_t2=False)[0])
+    old = (
+        getattr(hf, "remove_overlap_zero_eigenvalue", None),
+        getattr(hf, "overlap_zero_eigenvalue_threshold", None),
+    )
+    try:
+        mf = pscf.RHF(mol).density_fit(auxbasis=auxbasis or f"{basis}-jkfit")
+        mf.conv_tol = 1e-11
+        if lindep is not None:
+            thr = lindep * float(np.linalg.eigvalsh(mol.intor("int1e_ovlp")).max())
+            if old[0] is not None:
+                hf.remove_overlap_zero_eigenvalue = True
+                hf.overlap_zero_eigenvalue_threshold = thr
+            else:  # older PySCF
+                mf = pscf.addons.remove_linear_dep_(mf, threshold=thr, lindep=thr)
+        e_hf = float(mf.kernel())
+        pt = mp.dfmp2.DFMP2(mf)
+        # with_t2=False: the amplitudes need not fit in memory at ladder sizes.
+        e_corr = float(pt.kernel(with_t2=False)[0])
+    finally:
+        if old[0] is not None:
+            hf.remove_overlap_zero_eigenvalue, hf.overlap_zero_eigenvalue_threshold = old
     return e_hf, e_corr
 
 
@@ -327,7 +356,8 @@ def main():
     if args.reference:
         kind, _, arg = args.system.partition(":")
         name, _, basis = arg.partition("@")
-        e_hf, e_corr = pyscf_df_mp2_reference(name, basis or "cc-pvdz")
+        lindep = args.lindep if args.orth == "canonical" else None
+        e_hf, e_corr = pyscf_df_mp2_reference(name, basis or "cc-pvdz", lindep=lindep)
         print(
             f"PySCF: E_HF = {e_hf:.10f} (diff {mp.e_hf - e_hf:+.2e})  "
             f"E_MP2 = {e_corr:.10f} (diff {mp.e_corr - e_corr:+.2e})"
