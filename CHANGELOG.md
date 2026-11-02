@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`examples/scf_df_rhf.py`: J/K streamed over aux chunks (#15).**
+  `DFJK(stream=True)` (and `run_scf(jk_stream=..., jk_resident_gb=...,
+  jk_prefetch=...)`) hands B to `trntensor.AuxStream` (trntensor#102).
+  - Aux chunks are under 2 GiB, below the 4 GiB transposed-LHS limit of
+    aws-neuron-sdk#1457, and dealt round-robin over `jk_devices`
+    (`neuron:0..3`).
+  - Chunks are kept resident up to `DEVICE_RESIDENT_GB` = 20 GB per
+    NeuronCore (one LNC=2 core has 24 GiB) and uploaded every iteration
+    otherwise. A loader thread works one chunk ahead per device, so the
+    upload overlaps the kernels on the previous chunk.
+  - J and K come from one pass: `df_coulomb` + `df_exchange` per chunk, with
+    each streamed chunk uploaded once.
+  - The default streams an out-of-core `DFStore` B from its memory-mapped
+    chunk files when trntensor has `AuxStream`. In-memory B keeps the
+    resident blocks as before.
+  - The float64 re-evaluation `energy_at_orbitals` streams too, so it no
+    longer needs a float64 copy of B.
+  - `info["stream"]` records the chunk count, width, resident count and the
+    bytes streamed / wait / load time per iteration.
+  - Flags: `--jk-stream`, `--resident-gb` and `--jk-devices` on the example;
+    `--jk-stream`, `--resident-gb` and `--prefetch` on `bench_scf.py`.
+  - J/K are identical to the block path on one and three devices,
+    all-streamed or all-resident, with or without host pack (CPU tests).
+    The tests skip without `AuxStream`.
+
 - **`examples/df_store.py`: out-of-core DF integrals (#15).** At n_ao 1658
   PySCF's in-core build held two float64 copies of B (133 GB, over the 124 GB
   host), and window 3 had to go through a 67 GB HDF5 file and a separate fp32
