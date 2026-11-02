@@ -88,6 +88,9 @@ def eigh(
     elif _use_nki():
         try:
             w, V = _householder_qr_eigh(A, tol)
+            # The kernels compute in fp32; keep the caller's dtype (float64
+            # input came back float32).
+            w, V = w.to(A.dtype), V.to(A.dtype)
         except Exception:
             if _REQUIRE_NKI:
                 raise
@@ -1075,7 +1078,8 @@ def _householder_qr_eigh(
     """
     n = A.shape[0]
     if n == 1:
-        return A[0].clone().unsqueeze(0), torch.eye(1, dtype=A.dtype, device=A.device)
+        # (1,) eigenvalues: `A[0].unsqueeze(0)` gave a (1, 1) tensor.
+        return A.reshape(1).clone(), torch.eye(1, dtype=A.dtype, device=A.device)
 
     diag, subdiag, V_refs = _householder_tridiag(A)
 

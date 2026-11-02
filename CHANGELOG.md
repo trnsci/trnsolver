@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`eigh` on the NKI Householder path: n = 1 returned `(1, 1)` eigenvalues
+  and float64 input returned float32** (silent, #83). The path runs under
+  `TRNSOLVER_REQUIRE_NKI=1` or on a non-native NKI device. It now returns
+  `(1,)` eigenvalues for n = 1 (0.4.0 through 0.20.0) and the caller's dtype.
+  `eigh_generalized` with n = 1 inherited the shape bug. Found by the round-3
+  device harness on Trn2 (trnsci/trnsci#35).
 - **`cg`/`gmres` returned `x0` (or zeros) with residual 0.0 for a zero or
   small-scale right-hand side (#68).** `b = 0` with an `x0` returned `x0`
   in place of the solution 0. Any `‖b‖ < 1e-15` returned without
