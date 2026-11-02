@@ -99,12 +99,14 @@ def eigh(
 
 def eigh_generalized(
     A: torch.Tensor,
-    B: torch.Tensor,
+    B: torch.Tensor | None,
     tol: float = 1e-10,
+    *,
+    X: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generalized symmetric eigenvalue problem: A @ x = λ B @ x
 
-    Reduces to standard form via Cholesky of B:
+    Without ``X``, reduces to standard form via Cholesky of B:
         B = L @ L^H
         (L^{-1} A L^{-H}) y = λ y
         x = L^{-H} y
@@ -114,8 +116,21 @@ def eigh_generalized(
     The triangular solves use trnblas.trsm (NKI-accelerated blocked path)
     when trnblas is installed; they fall back to torch.linalg.solve_triangular
     otherwise. The inner eigh call dispatches to NKI per backend setting.
-    Closes #11.
+    Closes #11. The Cholesky fails (or loses all accuracy) when B is
+    numerically singular, as large or diffuse basis-set overlaps are.
+
+    With ``X`` (n, m) from :func:`trnsolver.orthogonalizer` (X^H B X = I on
+    B's kept subspace; ``B`` is then not used and may be None), it solves
+    (X^H A X) y = λ y and returns x = X y: m eigenpairs, with the
+    near-linear dependencies of B removed. X is cast to A's dtype and
+    device, so with an FP32 A on the device the two reduction GEMMs and the
+    back-transform run there (trnblas.gemm for real 2-D input); X itself is
+    built once, in float64 on the host (#72).
     """
+    if X is not None:
+        return _eigh_generalized_orth(A, X, tol)
+    if B is None:
+        raise ValueError("eigh_generalized needs B, or X from trnsolver.orthogonalizer")
     A, orig = _to_fp32(A)
     B = B.to(A.dtype)
 
@@ -150,6 +165,32 @@ def eigh_generalized(
         eigenvectors = torch.linalg.solve_triangular(L.mH, V_prime, upper=True)
 
     return _restore(eigenvalues, orig), _restore(eigenvectors, orig)
+
+
+def _eigh_generalized_orth(
+    A: torch.Tensor, X: torch.Tensor, tol: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """eigh_generalized with a precomputed orthogonalizer X (#72)."""
+    A, orig = _to_fp32(A)
+    X = X.to(device=A.device, dtype=A.dtype)
+    if X.shape[-2] != A.shape[-1]:
+        raise ValueError(f"X has {X.shape[-2]} rows, A is {A.shape[-1]} x {A.shape[-1]}")
+    plain = A.dim() == 2 and X.dim() == 2 and not A.is_complex()
+    try:
+        import trnblas as _tb
+    except ImportError:
+        _tb = None
+    if plain and _tb is not None:
+        Ap = _tb.gemm(1.0, X, _tb.gemm(1.0, A, X), transA=True)
+    else:
+        Ap = X.mH @ (A @ X)
+    Ap = 0.5 * (Ap + Ap.mH)
+    if plain:
+        w, Vp = eigh(Ap, tol)
+    else:
+        w, Vp = torch.linalg.eigh(Ap)
+    V = _tb.gemm(1.0, X, Vp) if plain and _tb is not None else X @ Vp
+    return _restore(w, orig), _restore(V, orig)
 
 
 def eigh_randomized(

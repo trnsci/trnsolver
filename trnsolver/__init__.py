@@ -39,6 +39,9 @@ from .iterative import (
 # Backend control
 from .nki import HAS_NKI, get_backend, set_backend
 
+# Orthogonalizers (overlap matrices with near-linear dependencies)
+from .orthogonalize import Orthogonalizer, orthogonalizer
+
 __all__ = [
     # Eigen
     "eigh",
@@ -56,6 +59,9 @@ __all__ = [
     "pinv",
     "schur",
     "svd",
+    # Orthogonalizers
+    "orthogonalizer",
+    "Orthogonalizer",
     # Iterative
     "cg",
     "gmres",

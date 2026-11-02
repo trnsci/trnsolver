@@ -26,7 +26,7 @@ kernels on whichever one is installed:
 
 | Lineage | Instances | Stack | Kernel dispatch |
 |---|---|---|---|
-| TorchNeuron (native) | Trn2, Trn3 | Neuron SDK 2.33+, Python ≥ 3.12, `torch` 2.14, `torch-neuronx` 2.14.* | Each kernel is a PyTorch custom op (`torch.ops.trnsolver.matvec`, `rank2_update`, `matmul`, `matmul_fp32out`, `apply_reflectors`) registered with `torch_neuronx.nki_op`; tensors live on `device="neuron"`. |
+| TorchNeuron (native) | Trn2, Trn3 | Neuron SDK 2.33+, Python ≥ 3.12, `torch` 2.14, `torch-neuronx` 2.14.* | Each kernel is a PyTorch custom op (`torch.ops.trnsolver.matvec`, `rank2_update`, `matmul`, `matmul_fp32out`, `apply_reflectors`, `jacobi_sweeps`, `jacobi_block`) registered with `torch_neuronx.nki_op`; tensors live on `device="neuron"`. |
 | PyTorch/XLA | Trn1 (also Inf2) | `torch-neuronx` 2.9 lineage, `torch_xla` | Unchanged: kernels run on the `torch_xla` device. |
 
 Selection is automatic, on the first kernel launch:
@@ -64,6 +64,16 @@ with `pip install -e`, turn it off before starting Python:
 export NKI_ENABLE_TRACE_CACHE=0
 ```
 
+The test suite keeps the cache on, as users run it, but gives each session
+a fresh, empty cache directory (`NKI_TRACE_CACHE_URL`), so edits never hit
+a stale entry.
+
+The cache also ignores constants captured in a kernel's closure
+([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454));
+trnsolver's kernels take every specialising value as an argument
+(`tests/test_trace_cache_safety.py`). Set `NKI_ENABLE_TRACE_CACHE=0` if
+you write NKI kernels that a factory specialises through a closure.
+
 See the TorchNeuron
 [environment variables](https://github.com/aws-neuron/torch-neuronx/blob/main/docs/environment_variables.md)
 reference.
@@ -93,11 +103,10 @@ pytest tests/ -v
 - Python >= 3.10
 - PyTorch >= 2.1
 - NumPy >= 1.24
-- neuronxcc >= 2.15 (optional, for Trainium hardware)
-- torch-neuronx >= 2.1 (optional, for Trainium hardware)
+- Trainium hardware (optional): `[torchneuron]` — `torch>=2.14`, `torch-neuronx>=2.14`, `nki>=0.6`, Python ≥ 3.12; or `[neuron]` (XLA lineage) — `nki>=0.3.0`, `neuronxcc>=2.24`, `torch-neuronx>=2.9`
 
 ## Hardware compatibility
 
-The NKI Jacobi rotation kernel is scaffolded but not yet validated on hardware — `trnsolver.eigh` falls back to `torch.linalg.eigh` whenever the NKI path isn't selected. CPU/PyTorch correctness is preserved across all platforms.
+The NKI kernels, including the batched Jacobi `eigh` kernels, are validated on Trn2 (Neuron SDK 2.33, native TorchNeuron; trnsci/trnsci#35); the Householder-QR `eigh` path was validated on trn1.2xlarge in v0.4.0. Without NKI, or when a kernel path fails (unless `TRNSOLVER_REQUIRE_NKI=1`), every operation runs its PyTorch path. CPU/PyTorch correctness is preserved across all platforms.
 
 For a pre-built CI instance, see [AWS Setup](aws_setup.md) and the Terraform module in `infra/terraform/`.

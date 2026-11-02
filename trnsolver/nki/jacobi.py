@@ -102,6 +102,11 @@ _BLOCK_CHAINS_MAX = {64: 2, 128: 2}
 _BLOCK_SWEEPS0 = {64: 7, 128: 8}
 _INNER_SWEEPS = 1
 # Tell the Tensor Engine the step permutation is 0/1 (half the FP32 passes).
+# Read once at import and passed to the kernels as the ``onezero`` argument,
+# never read from the kernel body: the NKI trace cache (on under
+# torch_neuronx, persistent on disk) keys on kernel arguments but not on
+# module globals, so a global would let another process's setting win
+# (aws-neuron/aws-neuron-sdk#1454; tests/test_trace_cache_safety.py).
 _ONEZERO = os.environ.get("TRNSOLVER_JACOBI_ONEZERO", "1").strip() != "0"
 
 # Sweep count of the last `jacobi_eigh_device` call (benchmarks report it).
@@ -446,7 +451,7 @@ if HAS_NKI:
         return G, 0
 
     @nki.jit
-    def jacobi_sweeps_kernel(Z, V, consts, sched):
+    def jacobi_sweeps_kernel(Z, V, consts, sched, onezero):
         """Run ``sched.shape[0]`` one-sided Jacobi sweeps on G compact tiles.
 
         Args:
@@ -454,6 +459,8 @@ if HAS_NKI:
             consts : from `jacobi_constants`.
             sched  : (sweeps, ne, chains) FP32, shape only: sweep count, padded
                      block size and the number of independent dependency chains.
+            onezero: int, nonzero to mark the step permutation 0/1 for the
+                     Tensor Engine (``TRNSOLVER_JACOBI_ONEZERO``, `_ONEZERO`).
 
         Returns:
             out : (2, G, P, ne) FP32: Z^T and V^T after the sweeps.
@@ -493,7 +500,7 @@ if HAS_NKI:
                 sig = sigt[0:P, r : r + 1]
                 for k in range(nchain):
                     if bounds[k + 1] > bounds[k]:
-                        _step(X, bounds[k], bounds[k + 1], ne, pibd, sig, per_tile, _ONEZERO)
+                        _step(X, bounds[k], bounds[k + 1], ne, pibd, sig, per_tile, onezero != 0)
 
         for gi in range(G):
             nisa.dma_copy(dst=out[0, base + gi, 0:P, 0:ne], src=X[0:P, gi, 0:ne])
@@ -501,7 +508,7 @@ if HAS_NKI:
         return out
 
     @nki.jit
-    def jacobi_block_kernel(Z, V, consts, sched):
+    def jacobi_block_kernel(Z, V, consts, sched, onezero):
         """One block one-sided Jacobi sweep on G compact tiles (n >= 64).
 
         Args:
@@ -509,6 +516,7 @@ if HAS_NKI:
             consts : from `block_constants`.
             sched  : (inner_sweeps, S, chains) FP32, shape only: inner sweeps
                      per block pair, pair width S = 2 * block size, chains.
+            onezero: as for `jacobi_sweeps_kernel`.
 
         Returns:
             out : (2, G, P, ne) FP32: Z^T and V^T after the sweep.
@@ -648,7 +656,7 @@ if HAS_NKI:
             for _sw in range(s_in):
                 for r, sig in plan:
                     for g0, g1 in chains:
-                        _step(Y, g0, g1, S, pib[0:P, r, 0:P], sig, False, _ONEZERO, False)
+                        _step(Y, g0, g1, S, pib[0:P, r, 0:P], sig, False, onezero != 0, False)
             for g0, g1 in chains:
                 update(g0, g1)
 
@@ -687,12 +695,22 @@ def _run_kernel(
             V.detach().cpu().contiguous().numpy(),
             consts.numpy(),
             sched.numpy(),
+            int(_ONEZERO),
         )
         return torch.from_numpy(res).to(Z.device)
     from .dispatch import _launch
 
     consts, sched = _consts_on(n, chains, Z.device, sweeps)
-    return _launch(jacobi_sweeps_kernel, "jacobi_sweeps", Z, V, consts, sched, device=Z.device)
+    return _launch(
+        jacobi_sweeps_kernel,
+        "jacobi_sweeps",
+        Z,
+        V,
+        consts,
+        sched,
+        device=Z.device,
+        static=(int(_ONEZERO),),
+    )
 
 
 def _block_consts_on(n: int, chains: int, device: torch.device):
@@ -717,12 +735,22 @@ def _run_block_kernel(Z: torch.Tensor, V: torch.Tensor, n: int, chains: int) -> 
             V.detach().cpu().contiguous().numpy(),
             consts.numpy(),
             sched.numpy(),
+            int(_ONEZERO),
         )
         return torch.from_numpy(res).to(Z.device)
     from .dispatch import _launch
 
     consts, sched = _block_consts_on(n, chains, Z.device)
-    return _launch(jacobi_block_kernel, "jacobi_block", Z, V, consts, sched, device=Z.device)
+    return _launch(
+        jacobi_block_kernel,
+        "jacobi_block",
+        Z,
+        V,
+        consts,
+        sched,
+        device=Z.device,
+        static=(int(_ONEZERO),),
+    )
 
 
 def _env_int(name: str, default: int) -> int:

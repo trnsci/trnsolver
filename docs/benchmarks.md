@@ -4,7 +4,7 @@ Performance numbers for trnsolver across three axes:
 
 1. **CPU baselines** — torch.linalg, scipy.linalg (LAPACK), and the trnsolver PyTorch path. Run on every CI build.
 2. **GPU baselines** — `torch.linalg` on CUDA (cuSOLVER / cuBLAS) on a vintage-matched Nvidia instance.
-3. **Trainium NKI** — the NKI path of trnsolver on trn1 / trn2. Pending hardware validation.
+3. **Trainium NKI** — the NKI path of trnsolver on Trn2 (native TorchNeuron): batched Jacobi `eigh` and the DF-RHF SCF example below.
 
 ## Vintage matching
 
@@ -74,9 +74,18 @@ Run on AWS `g5.xlarge` (1× A10G, 24 GB, Ampere). Numbers include an explicit `t
 
 Reproduce: `AWS_PROFILE=aws ./scripts/run_cuda_tests.sh g5`.
 
-## Trainium results (trn1 / trn2)
+## Trainium results — batched Jacobi `eigh` (Trn2)
 
-_Pending — classical Jacobi was architecturally mismatched to NKI (see [#9](https://github.com/trnsci/trnsolver/issues/9) post-mortem). Phase 1 redesign is iterating against the new NKI 0.3.0 CPU simulator (Neuron SDK 2.29, April 2026) with full-sweep Jacobi / Householder-QR / block-Jacobi candidates; hardware numbers will land once the redesigned kernel validates in simulation._
+`scripts/bench_jacobi_multicore.py` on trn2.3xlarge, SDK 2.33 native TorchNeuron, LNC=2 (4 logical cores). End to end, host input to host output, warm medians, ms. The CPU baselines split the batch across the same host threads ("batch-parallel"); that is 1.6–5.8× faster than one batched `torch.linalg.eigh` call, which the v0.18.0 headline had compared against (corrected in v0.19.0, #54, #55).
+
+| n | B | host CPUs | split | CPU batch-parallel | 1 core | 2 cores | 4 cores |
+|---|---|---|---|---:|---:|---:|---:|
+| 128 | 1024 | 2 | threads | 352 | 310 | 208 | 152 |
+| 128 | 1024 | 8 | threads | 159 | 309 | 202 | 127 |
+| 128 | 4096 | 8 | threads | 655 | 1227 | 763 | 531 |
+| 128 | 4096 | 8 | process pool | 655 | 1182 | 607 | 324 |
+
+Single core at n = 128, B = 1024 is 1.13× faster than the 2-thread batch-parallel CPU; against 8 CPU threads the thread split wins by at most 1.25×, and the process pool (`TRNSOLVER_EIGH_POOL=proc`, v0.20.0, #57) by 1.75–2.0× at n = 64–128, B ≥ 1024. Per-shape tables: [#48](https://github.com/trnsci/trnsolver/issues/48), [#29](https://github.com/trnsci/trnsolver/issues/29).
 
 ## DF-RHF SCF end to end (Trn2, #15)
 
@@ -160,5 +169,5 @@ compiled at n = 250 / 490 / 970.
 
 ## Notes
 
-- `inv_sqrt_spd_ns` is Newton-Schulz — all GEMM. On CPU it loses to the eigendecomposition path because eigh is heavily optimized in LAPACK/MKL. On GPU it wins at n ≥ 256 because the workload shape fits the Tensor Core pipeline. Trainium's Tensor Engine should show a similar win once `trnblas` GEMM validates on hardware.
+- `inv_sqrt_spd_ns` is Newton-Schulz — all GEMM. On CPU it loses to the eigendecomposition path because eigh is heavily optimized in LAPACK/MKL. On GPU it wins at n ≥ 256 because the workload shape fits the Tensor Core pipeline. It has not been measured on Trainium; on the native `neuron` device `trnblas.gemm` under `auto` routes dense GEMMs to aten (trnblas 0.9.0).
 - cuSOLVER is invoked indirectly via `torch.linalg` on a CUDA tensor. We don't link cuSOLVER directly.
