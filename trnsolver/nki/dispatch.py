@@ -284,6 +284,7 @@ def _launch(
     *tensors: torch.Tensor,
     device: torch.device | None = None,
     sync: bool = True,
+    static: tuple = (),
 ) -> torch.Tensor:
     """Run one kernel launch on the Neuron device.
 
@@ -291,6 +292,10 @@ def _launch(
     path; the XLA path calls ``kernel`` directly on torch_xla tensors and,
     when ``sync`` is set, materialises the result with ``torch_xla.sync()``.
     The result is returned on ``device`` (default: the first input's device).
+    ``static`` are trailing Python scalars passed after the tensors (static
+    ``nki_op`` arguments on the native path). A value that specialises a
+    kernel must arrive this way, not through a global or closure, so the NKI
+    trace cache keys on it (aws-neuron/aws-neuron-sdk#1454).
     """
     out_device = tensors[0].device if device is None else device
     if _get_dispatch_path() == "native":
@@ -305,13 +310,13 @@ def _launch(
         # tracer. The call itself only enqueues work, so serialising it
         # keeps the cores' execution concurrent.
         with _LAUNCH_LOCK:
-            out = op(*args)
+            out = op(*args, *static)
         return out.to(out_device)
     import torch_neuronx  # noqa: F401
     import torch_xla
 
     work_device = torch_xla.device()
-    out = kernel(*(t.to(work_device) for t in tensors))
+    out = kernel(*(t.to(work_device) for t in tensors), *static)
     if sync:
         torch_xla.sync()
     return out.to(out_device)

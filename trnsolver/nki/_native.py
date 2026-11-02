@@ -77,29 +77,31 @@ def apply_reflectors(V_refs: torch.Tensor, Q_in: torch.Tensor) -> torch.Tensor:
 @nki_op(
     "trnsolver::jacobi_sweeps",
     mutates_args={},
-    fake_fn=lambda Z, V, consts, sched: Z.new_empty((2,) + tuple(Z.shape)),
+    fake_fn=lambda Z, V, consts, sched, onezero: Z.new_empty((2,) + tuple(Z.shape)),
 )
 def jacobi_sweeps(
-    Z: torch.Tensor, V: torch.Tensor, consts: torch.Tensor, sched: torch.Tensor
+    Z: torch.Tensor, V: torch.Tensor, consts: torch.Tensor, sched: torch.Tensor, onezero: int
 ) -> torch.Tensor:
     # The Jacobi kernel lives in its own module (nki/jacobi.py), imported
     # here at call time like the dispatch kernels above.
+    # `onezero` is a static op argument, so the compiled kernel and the NKI
+    # trace cache key on it (aws-neuron/aws-neuron-sdk#1454).
     from . import jacobi as _j
 
-    return _j.jacobi_sweeps_kernel(Z, V, consts, sched)
+    return _j.jacobi_sweeps_kernel(Z, V, consts, sched, int(onezero))
 
 
 @nki_op(
     "trnsolver::jacobi_block",
     mutates_args={},
-    fake_fn=lambda Z, V, consts, sched: Z.new_empty((2,) + tuple(Z.shape)),
+    fake_fn=lambda Z, V, consts, sched, onezero: Z.new_empty((2,) + tuple(Z.shape)),
 )
 def jacobi_block(
-    Z: torch.Tensor, V: torch.Tensor, consts: torch.Tensor, sched: torch.Tensor
+    Z: torch.Tensor, V: torch.Tensor, consts: torch.Tensor, sched: torch.Tensor, onezero: int
 ) -> torch.Tensor:
     from . import jacobi as _j
 
-    return _j.jacobi_block_kernel(Z, V, consts, sched)
+    return _j.jacobi_block_kernel(Z, V, consts, sched, int(onezero))
 
 
 @nki_op(

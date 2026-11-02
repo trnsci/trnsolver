@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Complex Hermitian and batched input gave wrong results with no error (#64).**
+  `cholesky(upper=True)`, `solve_spd` (including `iterative_refinement=True`),
+  `inv_spd`, `inv_sqrt_spd`, `eigh_generalized`, `eigh_randomized`, `pinv`
+  and `ssor_preconditioner` now follow the conjugate transpose and per-matrix
+  semantics of `torch.linalg`. Before, they used `.T`, which drops the
+  conjugation and reverses batch dims; a batch of size n kept its shape.
+  Relative error was 0.3–0.5 for complex input, and 0.4–2.5 or non-finite
+  for a batch of size n. `pinv` used the first matrix's singular values as
+  the cutoff for the whole batch and raised on empty input. Real (n, n)
+  results are unchanged. Affected: every release through 0.20.0 (`pinv`
+  since 0.5.0, `ssor_preconditioner` since 0.8.0). Complex input to
+  `eigh_randomized` (eigenvalue error 1.35) now also stays off the real NKI
+  matmul kernel.
+  `eigh` sends complex and batched input (as from `eigh_generalized`) to
+  aten instead of the real single-matrix NKI Householder path, which raised
+  for them under `TRNSOLVER_REQUIRE_NKI=1` on a Neuron host.
+  Every conjugate transpose that reaches a matmul or triangular solve, or is
+  returned (`cholesky(upper=True)`), is materialized with `resolve_conj()`:
+  on a Neuron device matmul ignores the lazy conj bit of a `.mH` view
+  (aws-neuron/aws-neuron-sdk#1455), so `A.mH @ B` computed `A.mT @ B`.
 - **`cg`/`gmres` returned `x0` (or zeros) with residual 0.0 for a zero or
   small-scale right-hand side (#68).** `b = 0` with an `x0` returned `x0`
   in place of the solution 0. Any `‖b‖ < 1e-15` returned without
@@ -63,6 +83,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   C20H42/aug-cc-pVDZ (n = 838, two functions dropped) converges in FP32
   either way. In float64, dropping the two functions raises the energy by
   2.8e-5 Eh: lower `lindep` when that matters more than FP32 conditioning.
+- **Guard against the NKI trace-cache closure bug ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454),
+  trnsci/trnsci#35).** `tests/test_trace_cache_safety.py` (CPU) finds every
+  `@nki.jit` kernel and fails if its body, or a helper it calls, reads a
+  closure variable or a module global that is not a constant expression
+  (reviewed exceptions are allow-listed with a reason), and checks each
+  kernel's `__closure__` at runtime against a stub `nki`.
+- Tests: `conftest.py` no longer turns the NKI trace cache off. Neuron tests
+  run with it on, as under `import torch_neuronx`, with a fresh
+  `NKI_TRACE_CACHE_URL` directory per session (no stale editable-install
+  traces). `NKI_ENABLE_TRACE_CACHE=0` still turns it off.
+- README: known platform issue note for #1454.
 - **DF-RHF example: J and K from trntensor's fused packed-integral kernels
   (trntensor#60).** `DFJK(fused=None)` (and `run_scf(jk_fused=...)`,
   `bench_scf.py --jk-k auto|fused|unpack`) builds K with
@@ -74,6 +105,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   365 -> 163 ms per iteration). At LNC=1, C40H82 runs in 7.7 s fused; the
   unpack path no longer fits there (12 GB per physical core). Older
   trntensor keeps the unpack path.
+
+### Fixed
+
+- **`TRNSOLVER_JACOBI_ONEZERO` is a kernel argument ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454)).**
+  `jacobi_sweeps_kernel` and `jacobi_block_kernel` read the `_ONEZERO`
+  module global from their body, which the persistent NKI trace cache does
+  not key on, so a process could run a trace made under the other setting.
+  The flag is now their `onezero` argument (a static `int` on the
+  `trnsolver::jacobi_sweeps` / `jacobi_block` ops; `dispatch._launch` takes
+  `static=`). Both settings compute the same result; only the Tensor
+  Engine pass count differs.
 
 ## [0.20.0] — 2026-10-31
 

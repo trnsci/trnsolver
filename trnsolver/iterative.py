@@ -16,7 +16,7 @@ from collections.abc import Callable
 
 import torch
 
-from .factor import _restore, _to_fp32
+from .factor import _mH, _restore, _to_fp32
 
 
 def jacobi_preconditioner(A: torch.Tensor) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -122,7 +122,7 @@ def ssor_preconditioner(
         raise ValueError("ssor_preconditioner: diagonal has near-zero entries")
     # Lower triangular factor: D + ω * L_strictly_lower
     L_factor = omega * torch.tril(A, diagonal=-1) + torch.diag(d)
-    U_factor = L_factor.T  # valid for symmetric A
+    U_factor = _mH(L_factor)  # D + omega L^H: valid for symmetric / Hermitian A
     dscale = omega * (2.0 - omega) * d
 
     def apply(r: torch.Tensor) -> torch.Tensor:
