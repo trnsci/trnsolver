@@ -93,6 +93,7 @@ def _run_mode(system: System, mode: str, args):
         jk_square=args.jk_square,
         jk_fused={"auto": None, "fused": True, "unpack": False}[args.jk_k],
         jk_host_pack={"auto": None, "on": True, "off": False}[args.host_pack],
+        conv=args.conv,
     )
     if mode in ("cpu", "cpu64"):
         _set_backends("pytorch")
@@ -303,6 +304,7 @@ def main() -> None:
     ap.add_argument("--orth", default="symmetric", choices=("symmetric", "canonical", "cholesky"))
     ap.add_argument("--lindep", type=float, default=1e-7)
     ap.add_argument("--max-iter", type=int, default=60)
+    ap.add_argument("--conv", default="auto", choices=("auto", "energy", "density"))
     ap.add_argument("--warmup-iters", type=int, default=3)
     ap.add_argument("--k-cache-gb", type=float, default=4.0)
     ap.add_argument(

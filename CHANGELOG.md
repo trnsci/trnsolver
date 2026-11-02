@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`examples/scf_df_rhf.py`: a noise-aware convergence test for fp32
+  (#15).** `run_scf(conv="auto"|"energy"|"density")`; `"auto"` keeps the
+  energy test in float64 and uses `"density"` otherwise.
+  - `"density"` stops when the commutator rms(FPS − SPF) < `d_tol` and the
+    density change rms(P_k − P_{k−1}) < `p_tol` (fp32 defaults 1e-5 and
+    1e-5). The energy only has to be inside its own rounding noise:
+    |dE| < max(`e_tol`, `e_noise_mult` · σ_E), with σ_E = ε · ½ Σ|P||H + F|
+    computed on the device each iteration, in the same single host copy.
+  - Why: at |E| = 1562 Eh one fp32 ulp is 1.9e-4 Eh, and the energy sum
+    rounds above that, so a fixed energy delta (the old relative 2e-7 test)
+    sat at its noise floor at n_ao 1658.
+  - On the CPU it converges as fast as or faster than the energy test, with
+    the float64 energy at the fp32 orbitals within 1.4e-8 Eh of the fp64
+    run (h2-lattice:16/32, benzene/cc-pVDZ). With ±3e-5 Eh of injected
+    energy jitter the energy test never stops and the density test does
+    (test).
+  - `info["history"]` holds per-iteration `dE`, `err_rms` and `dp_rms`;
+    `info["e_noise"]` the last σ_E. `--conv` on the example and
+    `bench_scf.py`.
+
 - **`examples/scf_df_rhf.py`: `DFJK` packs P and unpacks J on the host above
   1e6 pairs (#87).** At n_ao = 1658 (npair 1.4e6) the two device gathers in
   `DFJK.j` (`index_select` with npair and n² indices) compiled for over
