@@ -521,9 +521,20 @@ def schur(
     Returns:
         Q: Orthogonal matrix (n, n) such that A = Q @ T @ Q.T.
         T: Quasi-upper triangular Schur form (n, n).
+
+    Raises:
+        RuntimeError: If ``A.requires_grad`` with grad mode on. ``schur`` is
+            not differentiable; it used to detach silently, so ``Q`` and
+            ``T`` contributed zero gradient in a larger graph (#76). Pass
+            ``A.detach()`` or call under ``torch.no_grad()`` to opt out.
     """
     if A.shape[0] != A.shape[1]:
         raise ValueError(f"schur: A must be square, got shape {tuple(A.shape)}")
+    if A.requires_grad and torch.is_grad_enabled():
+        raise RuntimeError(
+            "schur: not differentiable; A requires grad. Pass A.detach() or "
+            "call under torch.no_grad() to compute Q and T without a gradient"
+        )
     A, orig = _to_fp32(A)
     # Hessenberg reduction and the Francis iteration are scalar host code
     # (per-element reads for deflation and shifts, small reflector updates).
