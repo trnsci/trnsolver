@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `eigh` sends complex and batched input (as from `eigh_generalized`) to
   aten instead of the real single-matrix NKI Householder path, which raised
   for them under `TRNSOLVER_REQUIRE_NKI=1` on a Neuron host.
+  Every conjugate transpose that reaches a matmul or triangular solve, or is
+  returned (`cholesky(upper=True)`), is materialized with `resolve_conj()`:
+  on a Neuron device matmul ignores the lazy conj bit of a `.mH` view
+  (aws-neuron/aws-neuron-sdk#1455), so `A.mH @ B` computed `A.mT @ B`.
 - **`cg`/`gmres` returned `x0` (or zeros) with residual 0.0 for a zero or
   small-scale right-hand side (#68).** `b = 0` with an `x0` returned `x0`
   in place of the solution 0. Any `‖b‖ < 1e-15` returned without

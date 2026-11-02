@@ -224,7 +224,6 @@ def _decide(what):
     return pytest.mark.xfail(strict=True, reason=f"trnsci/trnsolver#76 needs decision: {what}")
 
 
-X64 = _pending(64, 65, "complex Hermitian / batched input uses .T instead of .mH")
 X66 = _pending(66, 67, "real A with complex B drops B's imaginary part")
 
 KNOWN: dict[str, pytest.MarkDecorator] = {}  # filled in next to each case table
@@ -541,19 +540,7 @@ def _expect_raise_or(fn):
 
 # ---------------------------------------------------------------- axis 1: dtype x op
 
-# Complex Hermitian input on main (trnsolver#64, fix #65).
-for _op in (
-    "cholesky_upper",
-    "solve_spd_vec",
-    "solve_spd_mat",
-    "solve_spd_ir",
-    "inv_spd",
-    "inv_sqrt_spd",
-):
-    for _dt in ("complex64", "complex128"):
-        KNOWN[f"{_op}-{_dt}"] = X64
 for _dt in ("complex64", "complex128"):
-    KNOWN[f"eigh_generalized-{_dt}"] = X64
     KNOWN[f"eigh_jacobi-{_dt}"] = pytest.mark.xfail(
         strict=False,
         raises=NotImplementedError,
@@ -707,12 +694,6 @@ KNOWN["eigh_jacobi-0x0"] = pytest.mark.xfail(
     raises=RuntimeError,
     reason="trnsci/trnsolver#79 (loud): eigh(method='jacobi') cannot reshape a 0x0 input",
 )
-for _s in ("0x0", "0x3", "3x0"):
-    KNOWN[f"pinv-{_s}"] = pytest.mark.xfail(
-        strict=False,
-        raises=IndexError,
-        reason="trnsci/trnsolver#64, fix in #65 (loud): pinv indexes s[0] of an empty spectrum",
-    )
 
 
 def _eigh_n129_mark():
@@ -1074,8 +1055,6 @@ def test_gmres_ir(n, kw):
 
 
 ITER_SOLVERS = ("cg", "cg_jacobiM", "cg_blockjacobiM", "cg_ssorM", "gmres", "gmres_ir")
-KNOWN["cg_ssorM-complex64"] = X64
-KNOWN["cg_ssorM-complex128"] = X64
 
 
 @pytest.mark.parametrize(
@@ -1150,7 +1129,7 @@ def test_cg_mixed_real_complex():
 
 @pytest.mark.parametrize(
     "dt",
-    [P("bfloat16", torch.bfloat16), P("float64", F64), P("complex128", C128, marks=X64)],
+    [P("bfloat16", torch.bfloat16), P("float64", F64), P("complex128", C128)],
 )
 def test_eigh_randomized_dtype(dt):
     n = 64
@@ -1367,18 +1346,6 @@ for _op in OPS:
     BATCH_IDS.append(
         (f"{_op}-batch{N}", _op, (N,))
     )  # batch == n: a .T over all dims keeps the shape
-for _op in (
-    "cholesky_upper",
-    "solve_spd_mat",
-    "solve_spd_ir",
-    "inv_spd",
-    "pinv",
-    "inv_sqrt_spd",
-    "eigh_generalized",
-):
-    for _b in ("2x3", "1", str(N)):
-        KNOWN[f"{_op}-batch{_b}"] = X64
-del KNOWN["pinv-batch1"]  # s[0] of a batch of one is the right cutoff
 KNOWN["solve_spd_vec-batch2x3"] = pytest.mark.xfail(
     strict=False, reason="trnsci/trnsolver#79 (loud): solve_spd rejects a batch of vectors B (*, n)"
 )
@@ -1423,8 +1390,6 @@ BCAST = [
         (torch.zeros(0, N, N, dtype=F64),),
     ),
 ]
-for _i in ("solve_spd-A3d-B2d", "solve_spd-A3d-B1d", "solve_spd_ir-A3d-B3d"):
-    KNOWN[_i] = X64
 KNOWN["solve_spd-A3d-Bbatchvec"] = KNOWN["solve_spd_vec-batch2x3"]
 
 

@@ -202,3 +202,77 @@ def test_eigh_complex_batch_skip_householder_under_require_nki(monkeypatch, dtyp
     w_ref, _ = torch.linalg.eigh(A)
     _close(w, w_ref, dtype)
     _close(V @ torch.diag_embed(w.to(V.dtype)) @ V.mH, A, dtype)
+
+
+# On a Neuron device matmul ignores the lazy conj bit of a ``.mH`` view
+# (aws-neuron/aws-neuron-sdk#1455): ``A.mH @ B`` computes ``A.mT @ B``. CPU
+# matmul honours the bit, so the value tests above cannot see it; instead,
+# check that no conj view reaches a matmul or solve, or is returned.
+
+_LINALG = {
+    torch.matmul,
+    torch.Tensor.__matmul__,
+    torch.Tensor.__rmatmul__,
+    torch.Tensor.matmul,
+    torch.mm,
+    torch.bmm,
+    torch.linalg.solve_triangular,
+    torch.linalg.solve,
+}
+
+
+class _NoConjViews(torch.overrides.TorchFunctionMode):
+    def __init__(self):
+        super().__init__()
+        self.seen = []
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if func in _LINALG:
+            for a in (*args, *kwargs.values()):
+                if isinstance(a, torch.Tensor) and a.is_conj():
+                    self.seen.append(getattr(func, "__name__", str(func)))
+        return func(*args, **kwargs)
+
+
+def test_mH_resolves_conj():
+    from trnsolver.factor import _mH
+
+    A = _rhs(2, N, N, dtype=torch.complex64)
+    assert A.mH.is_conj()  # the lazy view this guards against
+    H = _mH(A)
+    assert not H.is_conj()
+    torch.testing.assert_close(H, A.conj().transpose(-2, -1).contiguous())
+    R = _rhs(N, N, dtype=torch.float32)
+    assert _mH(R).data_ptr() == R.data_ptr()  # real: no copy
+
+
+_CONJ_CASES = {
+    "cholesky_upper": lambda A, B, S, X: trnsolver.cholesky(A, upper=True),
+    "solve_spd": lambda A, B, S, X: trnsolver.solve_spd(A, B),
+    "solve_spd_ir": lambda A, B, S, X: trnsolver.solve_spd(A, B, iterative_refinement=True),
+    "inv_spd": lambda A, B, S, X: trnsolver.inv_spd(A),
+    "inv_sqrt_spd": lambda A, B, S, X: trnsolver.inv_sqrt_spd(A),
+    "pinv": lambda A, B, S, X: trnsolver.pinv(A),
+    "eigh_generalized": lambda A, B, S, X: trnsolver.eigh_generalized(A, S),
+    "eigh_generalized_X": lambda A, B, S, X: trnsolver.eigh_generalized(A, None, X=X),
+    "eigh_randomized": lambda A, B, S, X: trnsolver.eigh_randomized(A, k=2, oversampling=2),
+    "ssor": lambda A, B, S, X: trnsolver.ssor_preconditioner(A)(B),
+}
+
+
+@pytest.mark.parametrize("dtype", CDT)
+@pytest.mark.parametrize("op", sorted(_CONJ_CASES))
+def test_no_conj_view_reaches_matmul(op, dtype):
+    # Inputs are built outside the mode: only the op's own calls are checked
+    # (the orthogonalizer X is built once on the host in float64).
+    A = _hpd(N, dtype)
+    B = _rhs(N, dtype=dtype)
+    S = _hpd(N, dtype, seed=3)
+    X = trnsolver.orthogonalizer(S)[0]
+    mode = _NoConjViews()
+    with mode:
+        out = _CONJ_CASES[op](A, B, S, X)
+    assert mode.seen == [], f"{op}: conj view passed to {mode.seen} (aws-neuron-sdk#1455)"
+    for t in out if isinstance(out, tuple) else (out,):
+        assert not t.is_conj(), f"{op} returned a lazy conj view"

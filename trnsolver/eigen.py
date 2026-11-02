@@ -26,7 +26,7 @@ import os
 
 import torch
 
-from .factor import _cholesky_lower, _restore, _to_fp32
+from .factor import _cholesky_lower, _mH, _restore, _to_fp32
 from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki, _use_simulator
 
 
@@ -145,6 +145,8 @@ def eigh_generalized(
     # and batches take torch.linalg.solve_triangular with conjugate
     # transposes of the last two dims (``.mH``): the reduction is
     # L^{-1} A L^{-H}, and ``.T`` neither conjugated nor kept batch dims.
+    # ``_mH`` resolves the lazy conj bit, which Neuron matmul ignores
+    # (aws-neuron/aws-neuron-sdk#1455).
     use_tb = _tb is not None and A.dim() == 2 and not A.is_complex()
 
     if use_tb:
@@ -154,15 +156,15 @@ def eigh_generalized(
         A_prime = _tb.trsm(1.0, L, L_inv_A.T, side="left", uplo="lower", trans=False).T
     else:
         L_inv_A = torch.linalg.solve_triangular(L, A, upper=False)
-        A_prime = torch.linalg.solve_triangular(L, L_inv_A.mH, upper=False).mH
+        A_prime = _mH(torch.linalg.solve_triangular(L, _mH(L_inv_A), upper=False))
 
-    A_prime = 0.5 * (A_prime + A_prime.mH)
+    A_prime = 0.5 * (A_prime + _mH(A_prime))
     eigenvalues, V_prime = eigh(A_prime, tol)
 
     if use_tb:
         eigenvectors = _tb.trsm(1.0, L, V_prime, side="left", uplo="lower", trans=True)
     else:
-        eigenvectors = torch.linalg.solve_triangular(L.mH, V_prime, upper=True)
+        eigenvectors = torch.linalg.solve_triangular(_mH(L), V_prime, upper=True)
 
     return _restore(eigenvalues, orig), _restore(eigenvectors, orig)
 
@@ -183,8 +185,8 @@ def _eigh_generalized_orth(
     if plain and _tb is not None:
         Ap = _tb.gemm(1.0, X, _tb.gemm(1.0, A, X), transA=True)
     else:
-        Ap = X.mH @ (A @ X)
-    Ap = 0.5 * (Ap + Ap.mH)
+        Ap = _mH(X) @ (A @ X)  # _mH: aws-neuron/aws-neuron-sdk#1455
+    Ap = 0.5 * (Ap + _mH(Ap))
     if plain:
         w, Vp = eigh(Ap, tol)
     else:
@@ -301,9 +303,11 @@ def eigh_randomized(
         AQ = _call_matmul(A, Q)
 
     # Project: B = Q^H A Q  (ℓ × ℓ, always FP32 in both paths). ``.mH``
-    # conjugates complex Hermitian A; for real A it is ``.T``.
-    B = Q.mH @ AQ
-    B = 0.5 * (B + B.mH)  # symmetrize for FP32 safety
+    # conjugates complex Hermitian A; for real A it is ``.T``. ``_mH``
+    # resolves the lazy conj bit, which Neuron matmul ignores
+    # (aws-neuron/aws-neuron-sdk#1455).
+    B = _mH(Q) @ AQ
+    B = 0.5 * (B + _mH(B))  # symmetrize for FP32 safety
 
     # Small eigenproblem: exact LAPACK eigh on (ℓ × ℓ) — always FP32
     eig_vals, V_small = torch.linalg.eigh(B)  # (ℓ,) ascending, (ℓ, ℓ)
