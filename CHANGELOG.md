@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-11-02
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fixes — upgrade recommended.** Complex Hermitian and batched inputs used `.T` instead of `.mH` in `cholesky(upper)`, `solve_spd`, `inv_spd`, `inv_sqrt_spd`, `eigh_generalized`, `pinv` and `ssor` on every backend (#64); a real A with a complex B dropped its imaginary part (#66); `cg`/`gmres` returned `x0` for a zero or tiny b (#68); fp64 Householder `eigh` was wrong on device (#83); device matmuls now resolve lazy conjugates (aws-neuron-sdk#1455). New: `orthogonalizer` for near-singular overlaps (#72) and `occupied_subspace`, a Chebyshev-filtered subspace eigensolver for SCF (#78, #91).
+
 ### Fixed
 
 - **`eigh` on the NKI Householder path: float64 input gave garbage, and n = 1
@@ -56,6 +62,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   result was real. A real A is now promoted to complex when B is complex.
   Real B is unchanged. Affected: 0.7.0–0.20.0. `eigh_generalized(A, None,
   X=X)` (new on main, #72) likewise promotes a real A for a complex X.
+
+
+- **`TRNSOLVER_JACOBI_ONEZERO` is a kernel argument ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454)).**
+  `jacobi_sweeps_kernel` and `jacobi_block_kernel` read the `_ONEZERO`
+  module global from their body, which the persistent NKI trace cache does
+  not key on, so a process could run a trace made under the other setting.
+  The flag is now their `onezero` argument (a static `int` on the
+  `trnsolver::jacobi_sweeps` / `jacobi_block` ops; `dispatch._launch` takes
+  `static=`). Both settings compute the same result; only the Tensor
+  Engine pass count differs.
 
 ### Added
 
@@ -139,17 +155,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   365 -> 163 ms per iteration). At LNC=1, C40H82 runs in 7.7 s fused; the
   unpack path no longer fits there (12 GB per physical core). Older
   trntensor keeps the unpack path.
-
-### Fixed
-
-- **`TRNSOLVER_JACOBI_ONEZERO` is a kernel argument ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454)).**
-  `jacobi_sweeps_kernel` and `jacobi_block_kernel` read the `_ONEZERO`
-  module global from their body, which the persistent NKI trace cache does
-  not key on, so a process could run a trace made under the other setting.
-  The flag is now their `onezero` argument (a static `int` on the
-  `trnsolver::jacobi_sweeps` / `jacobi_block` ops; `dispatch._launch` takes
-  `static=`). Both settings compute the same result; only the Tensor
-  Engine pass count differs.
 
 ## [0.20.0] — 2026-10-31
 
