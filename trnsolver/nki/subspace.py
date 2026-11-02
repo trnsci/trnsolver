@@ -13,7 +13,16 @@ F (n x n, FP32) resident in SBUF and, for a block X (n x kb, kb <= 512):
     X^T X, X^T F X, X^T E, (FX)^T E,      the six kb x kb Gram blocks of
     E^T E, E^T F E                        span[X, E] (Tensor Engine)
 
-and returns them packed as (n + 6 kb + 1, kb): ``[E; six Grams; r]``.
+and returns them packed as (n + 6 kb + 1, kb): ``[E; six Grams; r]``
+(with an (m, 2) ``sched``, the block X first: (2 n + 6 kb + 1, kb)).
+
+``subspace_step_kernel(F, prev, qtab, sched)`` is the same launch for the
+next pass: it first forms the Rayleigh-Ritz update ``X = X0 Q1 + E0 Q2``
+on chip from the previous launch's packed ``[X0; E0; ...]`` output and the
+(2 kb, kb) coefficients Q in ``qtab`` (which also carries the scalar rows,
+so one H2D copy serves the pass), then filters it, emitting ``[X; E; six
+Grams; r]``. Per row tile that is 2 nck Tensor Engine transposes of X0 and
+E0 and one accumulation group of 2 nck matmuls against Q's row chunks.
 
 Layout. ``Fs[p, j, :] = F[j * 128 + p, :]`` (row tile j on the partitions,
 zero-padded to nt * 128 rows and columns), and every block of vectors is
@@ -64,19 +73,25 @@ def layout(n: int, kb: int) -> tuple[int, int]:
     return -(-n // PMAX), -(-kb // PMAX)
 
 
-def sbuf_bytes(n: int, kb: int, m: int = 8) -> int:
-    """Per-partition SBUF bytes of the kernel's resident tiles."""
+def sbuf_bytes(n: int, kb: int, m: int = 8, fold: bool = False) -> int:
+    """Per-partition SBUF bytes of the kernel's resident tiles.
+
+    ``fold``: ``subspace_step_kernel``, which also holds Q's row chunks and
+    one row tile's transposed [X, E] chunks.
+    """
     nt, nck = layout(n, kb)
     words = nt * nt * PMAX  # F
     words += 4 * nt * kb  # X, FX and the two recurrence buffers
     words += nck * nt * PMAX + nck * kb  # X^T tiles and X^T Y
     words += 3 * m + kb + 8 * kb  # table and temporaries
+    if fold:
+        words += 2 * nck * kb + 2 * nck * PMAX  # Q chunks, transposed [X, E] tile
     return 4 * words
 
 
-def kernel_fits(n: int, kb: int) -> bool:
+def kernel_fits(n: int, kb: int, fold: bool = False) -> bool:
     """True iff (n, kb) fits the kernel (kb <= 512, F resident in SBUF)."""
-    return 1 <= kb <= min(n, _KB_MAX) and sbuf_bytes(n, kb) <= _SBUF_BUDGET
+    return 1 <= kb <= min(n, _KB_MAX) and sbuf_bytes(n, kb, fold=fold) <= _SBUF_BUDGET
 
 
 if HAS_NKI:
@@ -84,24 +99,18 @@ if HAS_NKI:
     import nki.isa as nisa
     import nki.language as nl
 
-    @nki.jit
-    def subspace_filter_kernel(F, X, table, sched):
-        """Chebyshev filter + correction + Gram blocks; see the module docstring.
+    def _filter_body(F, X, table, tab_row0, m, kb, fold, emit_x):
+        """The kernel body.
 
-        Args:
-            F     : (n, n) FP32 symmetric.
-            X     : (n, kb) FP32, kb <= 512.
-            table : (128, 3 m + kb) FP32, every row ``[a | b | g | -theta]``.
-            sched : (m, 1) FP32, shape only (the filter degree m >= 1).
-
-        Returns:
-            (n + 6 kb + 1, kb) FP32: ``E`` (n rows), then ``X^T X``,
-            ``X^T F X``, ``X^T E``, ``(F X)^T E``, ``E^T E``, ``E^T F E``
-            (kb rows each), then the residual row ``r``.
+        Without ``fold``, X is the (n, kb) block and ``table`` the
+        (128, 3 m + kb) scalar rows (from row ``tab_row0``). With ``fold``,
+        X is the previous launch's ``[X; E; ...]`` output and ``table``
+        holds the (2 kb, kb) Rayleigh-Ritz coefficients Q in rows 0 .. 2 kb
+        and the scalar rows after them; the block is first updated on chip,
+        ``X <- X Q[:kb] + E Q[kb:]``. The output is ``[E; six Grams; r]``,
+        preceded by the (updated) block X when ``emit_x``.
         """
         n = F.shape[0]
-        kb = X.shape[1]
-        m = sched.shape[0]
         P = PMAX
         nt = (n + P - 1) // P
         npad = nt * P
@@ -111,10 +120,11 @@ if HAS_NKI:
         tw = 3 * m + kb
         chunks = [(c0, min(P, kb - c0)) for c0 in range(0, kb, P)]
 
-        out = nl.ndarray((n + N_GRAMS * kb + 1, kb), dtype=f32, buffer=nl.shared_hbm)
+        r0 = n if emit_x else 0  # first row of E in the output
+        out = nl.ndarray((r0 + n + N_GRAMS * kb + 1, kb), dtype=f32, buffer=nl.shared_hbm)
 
         tab = nl.ndarray((P, tw), dtype=f32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=tab, src=table[0:P, 0:tw])
+        nisa.dma_copy(dst=tab, src=table[tab_row0 : tab_row0 + P, 0:tw])
         ones = nl.ndarray((P, 1), dtype=f32, buffer=nl.sbuf)
         nisa.memset(dst=ones, value=1.0)
 
@@ -134,14 +144,60 @@ if HAS_NKI:
         def block():
             return nl.ndarray((P, nt, kb), dtype=f32, buffer=nl.sbuf)
 
+        def load_block(dst, src, row0):
+            for i in range(nt):
+                if rows_of(i) < P:
+                    nisa.memset(dst=dst[0:P, i, 0:kb], value=0.0)
+                nisa.dma_copy(
+                    dst=dst[0 : rows_of(i), i, 0:kb],
+                    src=src[row0 + i * P : row0 + i * P + rows_of(i), 0:kb],
+                )
+
         Xs = block()
-        for i in range(nt):
-            if rows_of(i) < P:
-                nisa.memset(dst=Xs[0:P, i, 0:kb], value=0.0)
-            nisa.dma_copy(dst=Xs[0 : rows_of(i), i, 0:kb], src=X[i * P : i * P + rows_of(i), 0:kb])
         FXs = block()
         B1 = block()
         B2 = block()
+        if not fold:
+            load_block(Xs, X, 0)
+        else:
+            # X <- X0 Q1 + E0 Q2 (X0 in FXs, E0 in B1 until the filter needs
+            # them). Per row tile: transpose the chunks of X0 and E0 (Tensor
+            # Engine, through PSUM), then one accumulation group of 2 nck
+            # matmuls against Q's row chunks.
+            load_block(FXs, X, 0)
+            load_block(B1, X, n)
+            Qs = nl.ndarray((P, 2 * len(chunks), kb), dtype=f32, buffer=nl.sbuf)
+            for h in range(2):
+                for ci, (c0, cw) in enumerate(chunks):
+                    nisa.dma_copy(
+                        dst=Qs[0:cw, h * len(chunks) + ci, 0:kb],
+                        src=table[h * kb + c0 : h * kb + c0 + cw, 0:kb],
+                    )
+            for i in range(nt):
+                tt = nl.ndarray((P, 2 * len(chunks), P), dtype=f32, buffer=nl.sbuf)
+                for h, src in enumerate((FXs, B1)):
+                    for ci, (c0, cw) in enumerate(chunks):
+                        pt = nl.ndarray((cw, P), dtype=f32, buffer=nl.psum)
+                        nisa.nc_transpose(
+                            dst=pt, data=src[0:P, i, c0 : c0 + cw], engine=nisa.engine.tensor
+                        )
+                        nisa.tensor_copy(dst=tt[0:cw, h * len(chunks) + ci, 0:P], src=pt)
+                ps = nl.zeros((P, kb), dtype=f32, buffer=nl.psum)
+                for h in range(2):
+                    for ci, (_c0, cw) in enumerate(chunks):
+                        q = h * len(chunks) + ci
+                        nisa.nc_matmul(
+                            dst=ps,
+                            stationary=tt[0:cw, q, 0:P],
+                            moving=Qs[0:cw, q, 0:kb],
+                            accumulate=True,
+                        )
+                nisa.tensor_copy(dst=Xs[0:P, i, 0:kb], src=ps)
+        if emit_x:
+            for i in range(nt):
+                nisa.dma_copy(
+                    dst=out[i * P : i * P + rows_of(i), 0:kb], src=Xs[0 : rows_of(i), i, 0:kb]
+                )
 
         def apply_f(src, emit):
             """emit(i, ps) with ps = (F src)[row tile i] in PSUM, for every i."""
@@ -259,7 +315,8 @@ if HAS_NKI:
 
         for i in range(nt):
             nisa.dma_copy(
-                dst=out[i * P : i * P + rows_of(i), 0:kb], src=Eb[0 : rows_of(i), i, 0:kb]
+                dst=out[r0 + i * P : r0 + i * P + rows_of(i), 0:kb],
+                src=Eb[0 : rows_of(i), i, 0:kb],
             )
 
         def store_at(row0):
@@ -272,46 +329,135 @@ if HAS_NKI:
 
         pairs = ((Xs, Xs), (Xs, FXs), (Xs, Eb), (FXs, Eb), (Eb, Eb), (Eb, FE))
         for g_i, (A, Bv) in enumerate(pairs):
-            gram(A, Bv, store_at(n + g_i * kb))
+            gram(A, Bv, store_at(r0 + n + g_i * kb))
 
         rs = nl.ndarray((1, kb), dtype=f32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=rs, src=rn)
-        nisa.dma_copy(dst=out[n + N_GRAMS * kb : n + N_GRAMS * kb + 1, 0:kb], src=rs)
+        row_r = r0 + n + N_GRAMS * kb
+        nisa.dma_copy(dst=out[row_r : row_r + 1, 0:kb], src=rs)
         return out
+
+    @nki.jit
+    def subspace_filter_kernel(F, X, table, sched):
+        """Chebyshev filter + correction + Gram blocks; see the module docstring.
+
+        Args:
+            F     : (n, n) FP32 symmetric.
+            X     : (n, kb) FP32, kb <= 512.
+            table : (128, 3 m + kb) FP32, every row ``[a | b | g | -theta]``.
+            sched : (m, 1) or (m, 2) FP32, shape only: the filter degree
+                    m >= 1, and (m, 2) to emit X ahead of E (the layout
+                    ``subspace_step_kernel`` takes as ``prev``).
+
+        Returns:
+            (n + 6 kb + 1, kb) FP32: ``E`` (n rows), then ``X^T X``,
+            ``X^T F X``, ``X^T E``, ``(F X)^T E``, ``E^T E``, ``E^T F E``
+            (kb rows each), then the residual row ``r``; with an (m, 2)
+            ``sched``, (2 n + 6 kb + 1, kb) with X in the first n rows.
+        """
+        emit_x = sched.shape[1] == 2
+        return _filter_body(F, X, table, 0, sched.shape[0], X.shape[1], False, emit_x)
+
+    @nki.jit
+    def subspace_step_kernel(F, prev, qtab, sched):
+        """The previous pass's block update, then the filter: one launch per pass.
+
+        Args:
+            F     : (n, n) FP32 symmetric.
+            prev  : (2 n + 6 kb + 1, kb) FP32, the previous launch's output
+                    (this kernel's, or ``subspace_filter_kernel``'s with an
+                    (m, 2) ``sched``): rows 0 .. n are X, n .. 2 n are E.
+            qtab  : (2 kb + 128, 3 m + kb) FP32: the Rayleigh-Ritz
+                    coefficients Q (2 kb, kb) in rows 0 .. 2 kb, columns
+                    0 .. kb; then 128 rows ``[a | b | g | -theta]`` for the
+                    updated block.
+            sched : (m, 1) FP32, shape only.
+
+        Returns:
+            (2 n + 6 kb + 1, kb) FP32: the updated block ``X = [X, E] Q``
+            (n rows), then the filter's ``[E; six Grams; r]`` for it.
+        """
+        kb = prev.shape[1]
+        return _filter_body(F, prev, qtab, 2 * kb, sched.shape[0], kb, True, True)
 
 
 @functools.lru_cache(maxsize=32)
-def _sched(m: int, device: str) -> torch.Tensor:
-    return torch.zeros((m, 1), dtype=torch.float32, device=device)
+def _sched(m: int, device: str, cols: int = 1) -> torch.Tensor:
+    return torch.zeros((m, cols), dtype=torch.float32, device=device)
 
 
-def kernel_inputs(F: torch.Tensor, X: torch.Tensor, table: torch.Tensor):
+def _table_rows(table: torch.Tensor) -> torch.Tensor:
+    """(128, w) host FP32: the scalar row repeated on every partition."""
+    return table.to(torch.float32).reshape(1, -1).expand(PMAX, -1)
+
+
+def kernel_inputs(F: torch.Tensor, X: torch.Tensor, table: torch.Tensor, emit_x: bool = False):
     """(F, X, table (128, w), sched) as the kernel takes them, on F's device."""
     kb = X.shape[1]
     m = (table.numel() - kb) // 3
     # Expanded and cast on the host: one small H2D copy, no device ops.
-    tab = table.to(torch.float32).reshape(1, -1).expand(PMAX, -1).contiguous()
-    tab = tab.to(F.device)
+    tab = _table_rows(table).contiguous().to(F.device)
     return (
         F.contiguous(),
         X.to(F.device, torch.float32).contiguous(),
         tab,
-        _sched(m, str(F.device)),
+        _sched(m, str(F.device), 2 if emit_x else 1),
     )
 
 
-def run_filter_kernel(F: torch.Tensor, X: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
-    """One kernel launch (simulator or native device); same output as the reference."""
-    if not HAS_NKI:
-        raise RuntimeError("the subspace filter kernel needs nki")
-    args = kernel_inputs(F, X, table)
+def step_table(Q: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    """(2 kb + 128, 3 m + kb) host FP32 ``qtab`` of :func:`subspace_step_kernel`.
+
+    Q (2 kb, kb) in the first 2 kb rows (columns 0 .. kb, the rest zero),
+    then the 128 scalar rows: one H2D copy carries both.
+    """
+    kb = Q.shape[1]
+    tw = table.numel()
+    qtab = torch.zeros(2 * kb + PMAX, tw, dtype=torch.float32)
+    qtab[: 2 * kb, :kb] = Q.to(torch.float32)
+    qtab[2 * kb :] = _table_rows(table)
+    return qtab
+
+
+def _run(kernel, op_name: str, args, device) -> torch.Tensor:
     if _use_simulator():
         import nki as _nki
 
-        res = _nki.simulate(subspace_filter_kernel)(
-            *(a.detach().cpu().contiguous().numpy() for a in args)
-        )
-        return torch.from_numpy(res).to(F.device)
+        res = _nki.simulate(kernel)(*(a.detach().cpu().contiguous().numpy() for a in args))
+        return torch.from_numpy(res).to(device)
     from .dispatch import _launch
 
-    return _launch(subspace_filter_kernel, "subspace_filter", *args, device=F.device)
+    return _launch(kernel, op_name, *args, device=device)
+
+
+def run_filter_kernel(
+    F: torch.Tensor, X: torch.Tensor, table: torch.Tensor, emit_x: bool = False
+) -> torch.Tensor:
+    """One kernel launch (simulator or native device); same output as the reference.
+
+    ``emit_x``: the (2 n + 6 kb + 1, kb) ``[X; E; Grams; r]`` layout that
+    :func:`run_step_kernel` takes as ``prev``.
+    """
+    if not HAS_NKI:
+        raise RuntimeError("the subspace filter kernel needs nki")
+    args = kernel_inputs(F, X, table, emit_x)
+    return _run(subspace_filter_kernel, "subspace_filter", args, F.device)
+
+
+def run_step_kernel(F: torch.Tensor, prev: torch.Tensor, qtab: torch.Tensor) -> torch.Tensor:
+    """One launch of :func:`subspace_step_kernel`: ``X = [X, E] Q``, then the filter.
+
+    ``prev`` is the previous launch's ``[X; E; ...]`` output on F's device;
+    ``qtab`` the host :func:`step_table`.
+    """
+    if not HAS_NKI:
+        raise RuntimeError("the subspace step kernel needs nki")
+    kb = prev.shape[1]
+    m = (qtab.shape[1] - kb) // 3
+    args = (
+        F.contiguous(),
+        prev.contiguous(),
+        qtab.to(torch.float32).contiguous().to(F.device),
+        _sched(m, str(F.device)),
+    )
+    return _run(subspace_step_kernel, "subspace_step", args, F.device)

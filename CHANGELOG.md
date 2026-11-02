@@ -75,6 +75,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   aten `eigh`. The host Rayleigh-Ritz dominates at n = 970. In DF-RHF it
   did not beat the full `eigh` in time to convergence at any measured
   size (docs/api/eigen.md).
+- **`occupied_subspace`: a cheaper host Rayleigh-Ritz, the block update
+  folded into the next launch, and adaptive passes instead of `refresh`
+  (#85, #86).**
+  - The Rayleigh-Ritz keeps only the lowest kb pairs. A well-conditioned
+    Gram takes one Cholesky and one `eigh`: at n = 970 that is 14 ms per
+    pass, against 16 ms.
+  - Each launch after a call's first applies the previous update
+    X = [X, E] Q on chip (`subspace_step_kernel`). Q arrives in the same
+    copy as the filter scalars. `TRNSOLVER_SUBSPACE_FOLD=0` turns this
+    off.
+  - New defaults: `passes=6`, `rtol=0.05` (stop once the residual has
+    dropped 20x), `tol="auto"` (30 ulp: return a converged block
+    unchanged, so an FP32 energy test can see two equal energies) and
+    `refresh=None`.
+  - Per call (2 passes) on Trn2: 5.6 / 9.3 / 34 ms at n = 250 / 490 /
+    970, against 7.8 / 12 / 40 ms before.
+  - FP32 DF-RHF on Trn2 takes 11 / 14 / 15 / 18 iterations at n_ao =
+    114 / 250 / 490 / 970, against 11 / 14 / 16 / 17 with a full `eigh`.
+    That is 1.10x faster at 490, 3% slower at 970 and 15-21% slower at
+    250 and below.
 - **`orthogonalizer(S, method, lindep)` and `eigh_generalized(F, S, X=X)`:
   a tolerance for near-singular overlaps (#72, for #15).** `"symmetric"`
   (Loewdin S^-1/2, the default), `"canonical"` (keeps the eigenvalues of S

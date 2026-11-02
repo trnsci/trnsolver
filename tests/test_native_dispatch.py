@@ -32,6 +32,7 @@ EXPECTED_OPS = {
     "jacobi_sweeps",
     "jacobi_block",
     "subspace_filter",
+    "subspace_step",
 }
 
 
@@ -463,3 +464,9 @@ class TestLazyRegistration:
         assert out.shape == (n, n) and out.dtype == torch.float32
         out = fake("subspace_filter")(meta(n, n), meta(n, k), meta(128, 3 * 8 + k), meta(8, 1))
         assert out.shape == (n + 6 * k + 1, k) and out.dtype == torch.float32
+        out = fake("subspace_filter")(meta(n, n), meta(n, k), meta(128, 3 * 8 + k), meta(8, 2))
+        assert out.shape == (2 * n + 6 * k + 1, k)
+        out = fake("subspace_step")(
+            meta(n, n), meta(2 * n + 6 * k + 1, k), meta(2 * k + 128, 3 * 8 + k), meta(8, 1)
+        )
+        assert out.shape == (2 * n + 6 * k + 1, k) and out.dtype == torch.float32

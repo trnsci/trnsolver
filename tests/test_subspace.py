@@ -190,7 +190,7 @@ class TestDriver:
         st = trnsolver.occupied_subspace(A0, k).state
         # About 2.7x per degree-8 pass on this spectrum (core at -11, virtuals
         # to +30, HOMO-LUMO gap 0.5); FP32 floors near 1e-6.
-        w, V, st1 = trnsolver.occupied_subspace(A1, k, guess=st, passes=12)
+        w, V, st1 = trnsolver.occupied_subspace(A1, k, guess=st, passes=12, rtol=None, tol=None)
         assert w.dtype == dtype and V.shape == (n, k)
         assert _proj_err(V, A1, k) < tol
         wr = torch.linalg.eigvalsh(A1.double())[:k]
@@ -230,11 +230,49 @@ class TestDriver:
         assert float(st2.residual[:k].max()) < 1e-8 * 30
         assert _proj_err(V, A, k) < 1e-10
 
+    def test_auto_tol_returns_converged_block_unchanged(self):
+        # A converged SCF must get its orbitals back bit for bit: an FP32
+        # energy test needs two identical energies in a row.
+        n, k = 120, 20
+        A0 = _fock_like(n, k, seed=21, dtype=torch.float32)
+        A1 = _perturb(A0, 1e-3)
+        st = trnsolver.occupied_subspace(A0, k).state
+        _, _, st = trnsolver.occupied_subspace(A1, k, guess=st, passes=12, rtol=None)
+        _, V, st2 = trnsolver.occupied_subspace(A1, k, guess=st)
+        assert st2.passes == 1
+        assert torch.equal(V, st.X[:, :k])
+        with pytest.raises(ValueError, match="tol"):
+            trnsolver.occupied_subspace(A1, k, guess=st, tol="bogus")
+
+    def test_rtol_adapts_passes(self, monkeypatch):
+        calls = []
+        real = SS.rayleigh_ritz
+
+        def spy(*a, **kw):
+            calls.append(1)
+            return real(*a, **kw)
+
+        monkeypatch.setattr(SS, "rayleigh_ritz", spy)
+        n, k = 120, 20
+        A0 = _fock_like(n, k, seed=22)
+        st = trnsolver.occupied_subspace(A0, k).state
+        # A large change takes more passes than a small one, which (with
+        # rtol=0.5) stops once the residual has halved: one Rayleigh-Ritz.
+        _, V, s_big = trnsolver.occupied_subspace(_perturb(A0, 3e-2), k, guess=st, passes=4)
+        assert s_big.passes >= 3 and len(calls) in (s_big.passes - 1, s_big.passes)
+        calls.clear()
+        A_small = _perturb(A0, 1e-4)
+        _, V, s_small = trnsolver.occupied_subspace(A_small, k, guess=st, passes=4, rtol=0.5)
+        assert s_small.passes == 2 and len(calls) == 1
+        assert float(s_small.residual[:k].max()) <= 0.5 * float(
+            trnsolver.occupied_subspace(A_small, k, guess=st, passes=1).state.residual[:k].max()
+        )
+
     def test_tensor_guess(self):
         n, k = 80, 10
         A = _fock_like(n, k, seed=9)
         _, U = torch.linalg.eigh(_perturb(A, 5e-2))
-        w, V, st = trnsolver.occupied_subspace(A, k, guess=U[:, :k], passes=8)
+        w, V, st = trnsolver.occupied_subspace(A, k, guess=U[:, :k], passes=8, rtol=None)
         assert _proj_err(V, A, k) < 1e-4  # from about 1e-1
         assert st.X.shape[1] == k + SS.default_buffer(k)
 
@@ -245,7 +283,9 @@ class TestDriver:
         st = trnsolver.occupied_subspace(A, k).state
         top = float(torch.linalg.eigvalsh(A1)[-1])
         for upper in ("cached", top + 1.0):
-            _, V, s2 = trnsolver.occupied_subspace(A1, k, guess=st, passes=4, upper=upper)
+            _, V, s2 = trnsolver.occupied_subspace(
+                A1, k, guess=st, passes=4, upper=upper, rtol=None, tol=None
+            )
             assert _proj_err(V, A1, k) < 1e-7
         assert s2.upper == pytest.approx(top + 1.0)
         with pytest.raises(ValueError, match="upper"):
@@ -321,28 +361,57 @@ class TestSimulator:
         err = float((got - ref).abs().max() / ref.abs().max())
         assert err < 1e-5
 
+    @pytest.mark.parametrize("n,kb,m", [(64, 16, 1), (130, 120, 3), (200, 8, 8), (256, 160, 4)])
+    def test_emit_x_and_step_kernel_match_reference(self, n, kb, m):
+        F, X, table = _case(n, kb, m, seed=n)
+        first = SK.run_filter_kernel(F, X, table, emit_x=True).double()
+        ref = torch.cat([X.double(), SS.filter_reference(F.double(), X.double(), table.double())])
+        assert first.shape == ref.shape
+        assert float((first - ref).abs().max() / ref.abs().max()) < 1e-5
+        g = torch.Generator().manual_seed(n + 1)
+        Q = torch.randn(2 * kb, kb, generator=g, dtype=torch.float64) / math.sqrt(2 * kb)
+        _, _, table2 = _case(n, kb, m, seed=n + 2)
+        ref2 = SS.step_reference(F.double(), first, Q, table2.double())
+        got = SK.run_step_kernel(F, first.float(), SK.step_table(Q, table2)).double()
+        assert got.shape == ref2.shape == (2 * n + 6 * kb + 1, kb)
+        assert float((got - ref2).abs().max() / ref2.abs().max()) < 1e-5
+
     def test_driver_uses_kernel(self, monkeypatch):
         calls = []
-        real = SK.run_filter_kernel
+        real, real_step = SK.run_filter_kernel, SK.run_step_kernel
 
         def spy(*a):
             calls.append(a[1].shape)
             return real(*a)
 
+        def spy_step(*a):
+            calls.append(("step", a[1].shape))
+            return real_step(*a)
+
         monkeypatch.setattr(SK, "run_filter_kernel", spy)
+        monkeypatch.setattr(SK, "run_step_kernel", spy_step)
         n, k = 150, 12
+        kb = k + SS.default_buffer(k)
         A0 = _fock_like(n, k, seed=14, dtype=torch.float32)
         A1 = _perturb(A0, 1e-2)
         st = trnsolver.occupied_subspace(A0, k).state
         w, V, _ = trnsolver.occupied_subspace(A1, k, guess=st, passes=4)
-        assert len(calls) == 4 and calls[0] == (n, k + SS.default_buffer(k))
+        # One plain launch, then three that apply the previous update on chip.
+        assert calls == [(n, kb)] + [("step", (2 * n + 6 * kb + 1, kb))] * 3
+        monkeypatch.setenv("TRNSOLVER_SUBSPACE_FOLD", "0")
+        w2, V2, _ = trnsolver.occupied_subspace(A1, k, guess=st, passes=4)
+        assert calls[4:] == [(n, kb)] * 4
+        torch.testing.assert_close(w, w2, rtol=0, atol=1e-5)
+        assert _proj_err(V, A1, k) < 1.5 * _proj_err(V2, A1, k) + 1e-6
+        calls.clear()
+        monkeypatch.delenv("TRNSOLVER_SUBSPACE_FOLD")
         # Same iteration on the PyTorch reference filter.
         trnsolver.set_backend("pytorch")
         try:
             w_ref, V_ref, _ = trnsolver.occupied_subspace(A1, k, guess=st, passes=4)
         finally:
             trnsolver.set_backend("auto")
-        assert len(calls) == 4
+        assert len(calls) == 0
         torch.testing.assert_close(w, w_ref, rtol=0, atol=1e-4)
         assert _proj_err(V, A1, k) < 1.5 * _proj_err(V_ref, A1, k) + 1e-5
 
@@ -369,6 +438,37 @@ def test_mlir_verifies(n, kb, m, lnc):
         lnc=lnc,
         frontend=FrontendKind.TRACER,
     ).verify()
+
+
+@pytest.mark.nki_simulator
+@pytest.mark.parametrize("n,kb,m", [(64, 16, 1), (250, 56, 8), (490, 94, 8), (970, 186, 8)])
+@pytest.mark.parametrize("lnc", [1, 2])
+@pytest.mark.parametrize("kernel", ["emit_x", "step"])
+def test_mlir_verifies_fold(n, kb, m, lnc, kernel):
+    if not HAS_NKI:
+        pytest.skip("nki not importable on this host")
+    try:
+        from nki.compiler.frontend import FrontendKind, source_to_mlir
+    except ImportError:
+        pytest.skip("nki.compiler.frontend.source_to_mlir not available in this nki")
+    assert SK.kernel_fits(n, kb, fold=True)
+    if kernel == "emit_x":
+        args = (
+            SK.subspace_filter_kernel,
+            np.zeros((n, n), np.float32),
+            np.zeros((n, kb), np.float32),
+            np.zeros((128, 3 * m + kb), np.float32),
+            np.zeros((m, 2), np.float32),
+        )
+    else:
+        args = (
+            SK.subspace_step_kernel,
+            np.zeros((n, n), np.float32),
+            np.zeros((2 * n + 6 * kb + 1, kb), np.float32),
+            np.zeros((2 * kb + 128, 3 * m + kb), np.float32),
+            np.zeros((m, 1), np.float32),
+        )
+    source_to_mlir(*args, target="trn2", lnc=lnc, frontend=FrontendKind.TRACER).verify()
 
 
 # ----------------------------------------------------------------------
@@ -402,6 +502,21 @@ class TestNeuron:
         got = SK.run_filter_kernel(F.to("neuron"), X.to("neuron"), table).cpu().double()
         err = float((got - ref).abs().max() / ref.abs().max())
         assert err < 1e-4
+
+    @pytest.mark.parametrize("n,kb,m", [(64, 16, 1), (250, 56, 8), (970, 186, 8)])
+    def test_step_kernel_matches_reference(self, n, kb, m):
+        F, X, table = _case(n, kb, m, seed=n)
+        Fd = F.to("neuron")
+        first = SK.run_filter_kernel(Fd, X.to("neuron"), table, emit_x=True)
+        ref = torch.cat([X.double(), SS.filter_reference(F.double(), X.double(), table.double())])
+        got1 = first.cpu().double()
+        assert float((got1 - ref).abs().max() / ref.abs().max()) < 1e-4
+        g = torch.Generator().manual_seed(n + 1)
+        Q = torch.randn(2 * kb, kb, generator=g, dtype=torch.float64) / math.sqrt(2 * kb)
+        _, _, table2 = _case(n, kb, m, seed=n + 2)
+        ref2 = SS.step_reference(F.double(), got1, Q, table2.double())
+        got = SK.run_step_kernel(Fd, first, SK.step_table(Q, table2)).cpu().double()
+        assert float((got - ref2).abs().max() / ref2.abs().max()) < 1e-4
 
     @pytest.mark.parametrize("n,k", [(250, 41), (490, 81)])
     def test_occupied_subspace_on_device(self, n, k):
