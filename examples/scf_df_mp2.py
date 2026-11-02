@@ -263,7 +263,8 @@ def pyscf_df_mp2_reference(name: str, basis: str = "cc-pvdz", auxbasis: str | No
         mf = pscf.addons.remove_linear_dep_(mf)
     e_hf = float(mf.kernel())
     pt = mp.dfmp2.DFMP2(mf)
-    e_corr = float(pt.kernel()[0])
+    # with_t2=False: the amplitudes need not fit in memory at ladder sizes.
+    e_corr = float(pt.kernel(with_t2=False)[0])
     return e_hf, e_corr
 
 
