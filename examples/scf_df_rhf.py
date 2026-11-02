@@ -800,6 +800,10 @@ def run_scf(
     e_tol: float | None = None,
     e_rtol: float | None = None,
     d_tol: float | None = None,
+    conv: str = "auto",
+    p_tol: float | None = None,
+    e_noise_mult: float = 8.0,
+    d_noise_mult: float = 2.0,
     stage_sync: bool = True,
     k_cache_gb: float = 4.0,
     k_block: int | None = None,
@@ -828,12 +832,37 @@ def run_scf(
     warm-started from the previous iteration's block (the first iteration
     is one full eigh; ``subspace_opts`` are passed through, and ``eps`` holds
     the nocc occupied orbital energies).
-    Convergence needs
-    |dE| < e_tol + e_rtol |E| and rms(FPS - SPF) < d_tol. The defaults
-    depend on dtype: float32 cannot resolve |dE| below a few ulp of |E|
-    (about 1e-4 Hartree at |E| = 1500), so its energy test is relative, and
-    its commutator test is 1e-5 (at 1e-4, n_ao = 970 stopped with orbitals
-    whose float64 energy was 1.2e-4 Eh high).
+    Convergence (``conv``; ``"auto"`` is ``"energy"`` in float64 and
+    ``"density"`` otherwise):
+
+    Both norms are taken in the orthonormal basis of the kept subspace
+    (X^T (FPS - SPF) X and X^T S (P_k - P_{k-1}) S X): with near-linear
+    dependencies dropped, the AO-basis commutator keeps a floor no orbital
+    update can remove.
+
+    - ``"energy"``: |dE| < e_tol + e_rtol |E| and rms(FPS - SPF) < d_tol.
+    - ``"density"`` (noise-aware): rms(FPS - SPF) < d_tol and rms(P_k -
+      P_{k-1}) < p_tol, with the energy only required to be still within
+      its own rounding noise, |dE| < max(e_tol, e_noise_mult · σ_E), where
+      σ_E = ε · ½ Σ |P| |H + F| bounds the rounding of the energy sum in
+      the working dtype (ε its machine epsilon; ``info["e_noise"]``). In
+      float32 a fixed energy delta sits at its noise floor: |E| = 1562 Eh
+      is 1.9e-4 Eh per ulp, and the sum over n² terms rounds well above
+      that, so dE alone either stops early or never stops (#15, n_ao 1658).
+      The commutator and the density change are the quantities DIIS drives
+      to zero and do not grow with the size of E. The commutator test is
+      noise-aware too: rms < max(d_tol, d_noise_mult · σ_d), σ_d = ε max|F|
+      max|X| (``info["d_noise"]``), because with near-linear dependencies
+      kept close to the threshold X amplifies F's rounding (fp32 floor
+      1.3e-4 at alkane12 / aug-cc-pVDZ, canonical 1e-6; the float64 energy
+      at those orbitals is 4e-5 Eh above the fp64 run's, the fp32
+      conditioning limit window 3 also met at n_ao 1658).
+
+    The defaults depend on dtype: float64 e_tol 1e-10, d_tol 1e-7, p_tol
+    1e-7; float32 e_tol 1e-6, e_rtol 2e-7 (``"energy"`` only), d_tol 1e-5
+    (at 1e-4, n_ao = 970 stopped with orbitals whose float64 energy was
+    1.2e-4 Eh high) and p_tol 1e-5. Per-iteration ``err_rms``, ``dp_rms``
+    and ``dE`` are in ``info["history"]``.
     ``stage_sync`` synchronises the device around every stage so the stage
     times add up; turn it off to time the loop as an application would.
     ``jk_devices`` splits the J/K build over several NeuronCores,
@@ -854,6 +883,12 @@ def run_scf(
     e_tol = e_tol if e_tol is not None else (1e-10 if fp64 else 1e-6)
     e_rtol = e_rtol if e_rtol is not None else (0.0 if fp64 else 2e-7)
     d_tol = d_tol if d_tol is not None else (1e-7 if fp64 else 1e-5)
+    p_tol = p_tol if p_tol is not None else (1e-7 if fp64 else 1e-5)
+    if conv == "auto":
+        conv = "energy" if fp64 else "density"
+    if conv not in ("energy", "density"):
+        raise ValueError(f"conv must be 'auto', 'energy' or 'density'; got {conv!r}")
+    eps_mach = torch.finfo(dtype).eps
     n, nocc = system.nao, system.nocc
     setup = {}
 
@@ -866,6 +901,16 @@ def run_scf(
     H = system.H.to(dtype).to(device)
     S = system.S.to(dtype).to(device)
     X = X64.to(dtype).to(device)
+    # Convergence is measured in the orthonormal basis of the kept subspace:
+    # the commutator as X^T (FPS - SPF) X, the density change as X^T S dP S X
+    # (the change of the occupied projector there). In the AO basis the
+    # commutator keeps components along S's dropped near-null directions, which
+    # no orbital update can remove (rms 4.7e-7 at a converged float64
+    # alkane12 / aug-cc-pVDZ, canonical 1e-6), and dP is amplified by X's
+    # 1 / sqrt(s_min) (fp32 noise ~4e-5 there).
+    XS = (X64.T @ system.S).to(dtype).to(device)
+    m = X.shape[1]
+    x_max = float(X64.abs().max())
     jk = DFJK(
         system.B,
         n,
@@ -906,6 +951,10 @@ def run_scf(
     energies: list[float] = []
     stage_ms: list[dict[str, float]] = []
     converged = False
+    history: dict[str, list[float]] = {"dE": [], "err_rms": [], "dp_rms": []}
+    e_noise = float("nan")
+    d_noise = float("nan")
+    P_prev = None
     t_loop = time.perf_counter()
     it = 0
     for it in range(1, max_iter + 1):
@@ -919,33 +968,72 @@ def run_scf(
         tm.stop()
 
         tm.start("energy")
-        e_dev = 0.5 * (P * (H + F)).sum()
+        HF = H + F
+        e_dev = 0.5 * (P * HF).sum()
+        # Noise-aware test: the energy sum's rounding bound and the density change.
+        e_abs = 0.5 * (P.abs() * HF.abs()).sum() if conv == "density" else e_dev
+        f_max = F.abs().max()
+        if P_prev is not None:
+            dD = trnblas.gemm(1.0, trnblas.gemm(1.0, XS, P - P_prev), XS, transB=True)
+            dp2 = (dD * dD).sum()
+        else:
+            dp2 = e_dev.new_full((), -1.0)
+        del HF
         tm.stop()
 
         tm.start("diis")
         FPS = trnblas.gemm(1.0, F, trnblas.gemm(1.0, P, S))
         err = FPS - FPS.T
-        if mixer is not None:
-            row = mixer.push(F, err)
-            norm2 = row[mixer._slot]
-        else:
-            row = (err * err).sum().reshape(1)
-            norm2 = row[0]
-        # One device-to-host copy per iteration: energy, |e|^2 and the DIIS row.
-        host = torch.cat([e_dev.reshape(1), norm2.reshape(1), row]).double().cpu()
+        err_o = trnblas.gemm(1.0, X, trnblas.gemm(1.0, err, X), transA=True)
+        norm2 = (err_o * err_o).sum()
+        row = mixer.push(F, err) if mixer is not None else norm2.reshape(1)
+        # One device-to-host copy per iteration: energy, |e|^2, the energy's
+        # rounding bound, |dP|^2 and the DIIS row.
+        host = torch.cat(
+            [
+                e_dev.reshape(1),
+                norm2.reshape(1),
+                e_abs.reshape(1),
+                dp2.reshape(1),
+                f_max.reshape(1),
+                row,
+            ]
+        )
+        host = host.double().cpu()
         e = float(host[0]) + system.e_nuc
-        err_rms = math.sqrt(max(float(host[1]), 0.0) / (n * n))
+        err_rms = math.sqrt(max(float(host[1]), 0.0) / (m * m))
+        dp_rms = math.sqrt(float(host[3]) / (m * m)) if float(host[3]) >= 0 else float("inf")
         F_use = F
         if mixer is not None:
-            F_ex = mixer.extrapolate(host[2:])
+            F_ex = mixer.extrapolate(host[5:])
             F_use = F if F_ex is None else F_ex
         tm.stop()
 
         dE = abs(e - energies[-1]) if energies else float("inf")
         energies.append(e)
+        history["dE"].append(dE)
+        history["err_rms"].append(err_rms)
+        history["dp_rms"].append(dp_rms)
+        if conv == "density":
+            e_noise = eps_mach * float(host[2])
+            # Rounding floor of the orthonormal-basis commutator: F's rounding
+            # (eps |F|) carried through X (max |X| ~ 1 / sqrt(s_min)). Measured
+            # floor 1.3e-4 against this 1.1e-4 at alkane12 / aug-cc-pVDZ,
+            # canonical 1e-6, fp32; 2.2e-6 against 1.3e-5 at alkane6 / cc-pVDZ.
+            d_noise = eps_mach * float(host[4]) * x_max
+            done = (
+                err_rms < max(d_tol, d_noise_mult * d_noise)
+                and dp_rms < p_tol
+                and dE < max(e_tol, e_noise_mult * e_noise)
+            )
+        else:
+            done = dE < e_tol + e_rtol * abs(e) and err_rms < d_tol
         if verbose:
-            print(f"  it {it:3d}  E = {e:.10f}  dE = {dE:.2e}  rms(err) = {err_rms:.2e}")
-        if dE < e_tol + e_rtol * abs(e) and err_rms < d_tol:
+            print(
+                f"  it {it:3d}  E = {e:.10f}  dE = {dE:.2e}  rms(err) = {err_rms:.2e}"
+                f"  rms(dP) = {dp_rms:.2e}"
+            )
+        if done:
             converged = True
             stage_ms.append(tm.t)
             break
@@ -969,6 +1057,7 @@ def run_scf(
         tm.stop()
 
         tm.start("density")
+        P_prev = P
         P = trnblas.syrk(2.0, C_occ)
         tm.stop()
         stage_ms.append(tm.t)
@@ -992,6 +1081,10 @@ def run_scf(
         info={
             "k_block": jk.k_block,
             "host_pack": jk.host_pack,
+            "conv": conv,
+            "e_noise": e_noise,
+            "d_noise": d_noise,
+            "history": history,
             "naux": system.naux,
             "nao": n,
             "nocc": nocc,
@@ -1069,6 +1162,13 @@ def main():
     ap.add_argument("--lindep", type=float, default=1e-7)
     ap.add_argument("--no-diis", action="store_true")
     ap.add_argument("--max-iter", type=int, default=60)
+    ap.add_argument(
+        "--conv",
+        default="auto",
+        choices=("auto", "energy", "density"),
+        help="convergence test: energy delta + commutator, or the noise-aware "
+        "commutator + density change (auto: energy in float64, density otherwise)",
+    )
     args = ap.parse_args()
 
     if args.device.startswith("neuron"):
@@ -1088,6 +1188,7 @@ def main():
         lindep=args.lindep,
         diis=not args.no_diis,
         max_iter=args.max_iter,
+        conv=args.conv,
         verbose=True,
     )
     print(

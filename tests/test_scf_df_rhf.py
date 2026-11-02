@@ -351,3 +351,67 @@ def test_host_pack_default_threshold(monkeypatch):
     base = scf.run_scf(system, dtype=torch.float64)
     assert res.info["host_pack"] and not base.info["host_pack"]
     assert res.energy == pytest.approx(base.energy, abs=1e-12)
+
+
+def test_noise_aware_convergence_fp32():
+    system = scf.h2_lattice(16)
+    ref = scf.run_scf(system, dtype=torch.float64)
+    assert ref.info["conv"] == "energy"  # auto: float64 keeps the energy test
+    res = scf.run_scf(system, dtype=torch.float32)
+    assert res.converged and res.info["conv"] == "density"
+    h = res.info["history"]
+    assert len(h["err_rms"]) == len(h["dp_rms"]) == len(h["dE"]) == res.iterations
+    assert h["err_rms"][-1] < 1e-5 and h["dp_rms"][-1] < 1e-5
+    assert h["dp_rms"][0] == float("inf")  # no previous density at iteration 1
+    # sigma_E: positive, and a few ulp of |E| or more.
+    assert res.info["e_noise"] > torch.finfo(torch.float32).eps * abs(res.energy)
+    assert abs(scf.energy_at_orbitals(system, res.C_occ) - ref.energy) < 1e-7
+
+
+class _JitteryEnergy(scf.System):
+    """A system whose reported energy jitters by +-3e-5 Eh every iteration,
+    standing in for fp32 rounding noise in E at large |E|."""
+
+    def __init__(self, base):
+        super().__init__(base.name, base.H, base.S, base.B, base.nocc, base.e_nuc)
+        self._e0, self._k = base.e_nuc, 0
+
+    @property
+    def e_nuc(self):
+        self._k += 1
+        return self._e0 + (3e-5 if self._k % 2 else -3e-5)
+
+    @e_nuc.setter
+    def e_nuc(self, v):
+        self._e0 = v
+
+
+def test_energy_delta_test_stalls_at_noise_floor_density_test_does_not():
+    system = _JitteryEnergy(scf.h2_lattice(16))
+    energy = scf.run_scf(system, dtype=torch.float32, conv="energy", e_rtol=0.0, max_iter=40)
+    density = scf.run_scf(system, dtype=torch.float32, conv="density", max_iter=40)
+    assert not energy.converged and energy.iterations == 40
+    assert density.converged and density.iterations < 40
+    # The density test stopped with the commutator and density change converged.
+    h = density.info["history"]
+    assert h["err_rms"][-1] < 1e-5 and h["dp_rms"][-1] < 1e-5
+
+
+def test_conv_validation():
+    with pytest.raises(ValueError, match="conv"):
+        scf.run_scf(scf.h2_lattice(1), conv="bogus")
+
+
+def test_truncated_basis_converges_in_orthonormal_measure():
+    """With functions dropped by the orthogonalizer, the commutator and the
+    density change are measured in the kept orthonormal basis, where both can
+    reach zero (in the AO basis the commutator keeps a floor along the
+    dropped directions)."""
+    pytest.importorskip("pyscf")
+    system = scf.pyscf_system("alkane3", "aug-cc-pvdz", "aug-cc-pvdz-jkfit", reference=False)
+    r64 = scf.run_scf(system, dtype=torch.float64, orth="canonical", lindep=1e-3)
+    assert r64.info["rank"] < system.nao and r64.converged
+    assert r64.info["history"]["err_rms"][-1] < 1e-7
+    r32 = scf.run_scf(system, dtype=torch.float32, orth="canonical", lindep=1e-3)
+    assert r32.converged and r32.info["d_noise"] > 0
+    assert abs(scf.energy_at_orbitals(system, r32.C_occ) - r64.energy) < 1e-5
