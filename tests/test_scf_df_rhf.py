@@ -131,8 +131,8 @@ def test_subspace_solver_matches_eigh(dtype):
     assert sub.iterations <= base.iterations + slack
     info = sub.info["subspace"]
     assert info[0] == (0, 0)  # the cold start
-    assert all(p in (0, 2) for _, p in info)  # refreshed (0) or two passes
-    assert sum(p == 2 for _, p in info) >= len(info) // 2  # mostly on the filter
+    # Adaptive passes (rtol / tol), and no full-eigh refresh after the cold start.
+    assert all(1 <= p <= 4 for _, p in info[1:])
     tol = 1e-8 if dtype == torch.float64 else 1e-4
     torch.testing.assert_close(sub.eps, base.eps[: system.nocc], rtol=0, atol=tol)
 

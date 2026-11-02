@@ -107,7 +107,9 @@ def jacobi_block(
 @nki_op(
     "trnsolver::subspace_filter",
     mutates_args={},
-    fake_fn=lambda F, X, table, sched: F.new_empty((F.shape[0] + 6 * X.shape[1] + 1, X.shape[1])),
+    fake_fn=lambda F, X, table, sched: F.new_empty(
+        ((F.shape[0] if sched.shape[1] == 2 else 0) + F.shape[0] + 6 * X.shape[1] + 1, X.shape[1])
+    ),
 )
 def subspace_filter(
     F: torch.Tensor, X: torch.Tensor, table: torch.Tensor, sched: torch.Tensor
@@ -115,6 +117,21 @@ def subspace_filter(
     from . import subspace as _s
 
     return _s.subspace_filter_kernel(F, X, table, sched)
+
+
+@nki_op(
+    "trnsolver::subspace_step",
+    mutates_args={},
+    fake_fn=lambda F, prev, qtab, sched: F.new_empty(
+        (2 * F.shape[0] + 6 * prev.shape[1] + 1, prev.shape[1])
+    ),
+)
+def subspace_step(
+    F: torch.Tensor, prev: torch.Tensor, qtab: torch.Tensor, sched: torch.Tensor
+) -> torch.Tensor:
+    from . import subspace as _s
+
+    return _s.subspace_step_kernel(F, prev, qtab, sched)
 
 
 # Keyed by the short op name used in `dispatch._launch`.
@@ -127,4 +144,5 @@ OPS = {
     "jacobi_sweeps": jacobi_sweeps,
     "jacobi_block": jacobi_block,
     "subspace_filter": subspace_filter,
+    "subspace_step": subspace_step,
 }
