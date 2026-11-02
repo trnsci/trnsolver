@@ -158,36 +158,36 @@ class StoreWriter:
         self.np_dtype = torch.empty((), dtype=dtype).numpy().dtype
         w = chunk_width(self.npair, naux, self.np_dtype.itemsize, chunk_bytes)
         self.widths = [min(w, naux - q0) for q0 in range(0, naux, w)]
+        # Each chunk file gets its .npy header now; rows are then written
+        # with positioned writes (not a writable memmap), so dirty pages
+        # belong to the page cache, not to this process's footprint.
         self.files = []
         q0 = 0
         for i, wi in enumerate(self.widths):
-            self.files.append(
-                (
-                    q0,
-                    np.lib.format.open_memmap(
-                        os.path.join(path, f"B_{i:05d}.npy"),
-                        mode="w+",
-                        dtype=self.np_dtype,
-                        shape=(self.npair, wi),
-                    ),
-                )
+            fn = os.path.join(path, f"B_{i:05d}.npy")
+            mm = np.lib.format.open_memmap(
+                fn, mode="w+", dtype=self.np_dtype, shape=(self.npair, wi)
             )
+            offset = mm.offset
+            del mm
+            self.files.append((q0, wi, offset, open(fn, "r+b")))  # noqa: SIM115 (closed in close())
             q0 += wi
         self.rows_written = 0
 
     def write_rows(self, p0: int, rows) -> None:
         """Packed rows ``[p0, p0 + len(rows))`` of B, shape (nrow, naux)."""
         rows = np.asarray(rows)
-        p1 = p0 + rows.shape[0]
-        for q0, mm in self.files:
-            mm[p0:p1] = rows[:, q0 : q0 + mm.shape[1]]
+        isz = self.np_dtype.itemsize
+        for q0, wi, offset, fh in self.files:
+            blk = np.ascontiguousarray(rows[:, q0 : q0 + wi], dtype=self.np_dtype)
+            os.pwrite(fh.fileno(), blk.data, offset + p0 * wi * isz)
         self.rows_written += rows.shape[0]
 
     def close(self, system_fields: dict, extra_meta: dict | None = None) -> DFStore:
         if self.rows_written != self.npair:
             raise RuntimeError(f"wrote {self.rows_written} of {self.npair} packed rows")
-        for _, mm in self.files:
-            mm.flush()
+        for *_, fh in self.files:
+            fh.close()
         self.files = []
         torch.save(system_fields, os.path.join(self.path, "system.pt"))
         meta = {
