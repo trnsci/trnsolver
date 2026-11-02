@@ -154,6 +154,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`df_store` row blocks no longer overflow on int32 `ao_loc` (trnsci/trnsci#115).**
+  PySCF's `ao_loc` is int32, so the block-size test `3 · rows · naux · 8` wrapped
+  past 2³¹ once one shell pushed a block from under `block_bytes` to over 2 GiB.
+  That happens at cc-pVTZ, n_ao ≈ 2500. The test then passed when it should have
+  stopped. At alkane43 / cc-pVTZ (n_ao 2522) the largest row block came out at 13.0 GB
+  of float64 int3c2e, about 39 GB with its solve copies, against the 1 GiB budget,
+  and the box build was among the processes OOM-killed. With Python ints the sizes give 495 blocks of
+  ≤ 0.61 GB (previously 344).
+
 - **`cg` dropped the imaginary part of complex input (#100).** Its inner
   products were `float(u.dot(v))`: unconjugated, and cast to real, so a
   complex Hermitian positive definite system iterated on the wrong
