@@ -192,8 +192,8 @@ class TestHouseholderPathShapesAndDtype:
 
     def test_float64_input_keeps_dtype(self, monkeypatch):
         def fp32_kernel(A, tol=1e-10):
-            w, V = torch.linalg.eigh(A.float())
-            return w, V
+            assert A.dtype != torch.float64, "float64 reached the fp32 kernels"
+            return torch.linalg.eigh(A)
 
         monkeypatch.setattr(eigen, "_use_nki", lambda: True)
         monkeypatch.setattr(eigen, "_REQUIRE_NKI", True)

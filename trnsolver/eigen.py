@@ -87,9 +87,11 @@ def eigh(
         w, V = _aten_eigh_on_device(A)
     elif _use_nki():
         try:
-            w, V = _householder_qr_eigh(A, tol)
-            # The kernels compute in fp32; keep the caller's dtype (float64
-            # input came back float32).
+            # The kernels compute in fp32. A float64 A reached them as is and
+            # came back as garbage (n=2: rel err ~1e17) or raised a dtype
+            # mismatch (#83): run in fp32 and return the caller's dtype.
+            Ak = A.float() if A.dtype == torch.float64 else A
+            w, V = _householder_qr_eigh(Ak, tol)
             w, V = w.to(A.dtype), V.to(A.dtype)
         except Exception:
             if _REQUIRE_NKI:
