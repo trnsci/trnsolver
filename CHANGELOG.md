@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`eigh` on the NKI Householder path: float64 input gave garbage, and n = 1
+  returned `(1, 1)` eigenvalues** (silent, #83). The path runs under
+  `TRNSOLVER_REQUIRE_NKI=1` or on a non-native NKI device. float64 matrices
+  reached the fp32 kernels as is. On Trn2, n = 2 came back float32 with
+  rel err ~1e17 and n = 12 raised a dtype mismatch. They now run in fp32 and
+  return float64. n = 1 returned `(1, 1)` eigenvalues (0.4.0 through 0.20.0)
+  and now returns `(1,)`. `eigh_generalized` inherited both. Found by the
+  round-3 device harness on Trn2 (trnsci/trnsci#35).
 - **float64, integer and bool operands reached the FP32 NKI kernels (#83,
   trnsci/trnsci#35).** One dtype table (`KERNEL_DTYPES` in
   `trnsolver/nki/dispatch.py`) now lists what each kernel takes, and
@@ -19,12 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the XLA lineage, the simulator, or with `TRNSOLVER_EIGH_NKI_MIN_N`
     lowered): float64 gave garbage (Trn2, n = 2: rel err ~1e17) or a dtype
     mismatch, and came back float32. It now takes torch eigh at full
-    precision; under `TRNSOLVER_REQUIRE_NKI=1` it runs the kernels in FP32
-    and returns float64 (as in #84). Integer and bool input takes torch
-    (which raises, as the pytorch backend does), or raises
-    `NotImplementedError` under `TRNSOLVER_REQUIRE_NKI=1`. n = 1 returned
-    `(1, 1)` eigenvalues (0.4.0 through 0.20.0) and now returns `(1,)`.
-    `eigh_generalized` inherited all of these.
+    precision instead of the FP32 cast of the entry above; under
+    `TRNSOLVER_REQUIRE_NKI=1` it keeps that cast (runs the kernels in FP32
+    and returns float64). Integer and bool input takes torch (which raises,
+    as the pytorch backend does), or raises `NotImplementedError` under
+    `TRNSOLVER_REQUIRE_NKI=1`. `eigh_generalized` inherits both.
   - `eigh_randomized`: float64 reached the FP32 matmul kernel (a compile
     error on Trn2). It now uses `torch.matmul` at full precision, or raises
     `NotImplementedError` under `TRNSOLVER_REQUIRE_NKI=1`.
