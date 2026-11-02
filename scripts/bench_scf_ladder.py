@@ -178,27 +178,18 @@ def _set_backends(name: str) -> None:
 
 
 def _pyscf_reference(row: dict, lindep: float, orth: str) -> dict:
-    """PySCF DF-RHF + DF-MP2 on the same jkfit basis; for diffuse bases the
-    same relative linear-dependency threshold as the SCF's orthogonalizer."""
-    from pyscf import mp
-    from pyscf import scf as pscf
+    """PySCF DF-RHF + DF-MP2 on the same jkfit basis; for diffuse bases with the
+    same relative linear-dependency threshold as the SCF's orthogonalizer
+    (``scf_df_mp2.pyscf_df_mp2_reference``), so both work in the same kept basis."""
+    import scf_df_mp2 as mp2
 
     t0 = time.perf_counter()
-    mol = scf.pyscf_mol(f"{row['family']}{row['k']}", row["basis"])
-    mf = pscf.RHF(mol).density_fit(auxbasis=f"{row['basis']}-jkfit")
-    mf.conv_tol = 1e-10
-    if orth == "canonical":
-        s_max = float(torch.linalg.eigvalsh(torch.from_numpy(mol.intor("int1e_ovlp"))).max())
-        mf = pscf.addons.remove_linear_dep_(mf, threshold=lindep * s_max)
-    e_hf = float(mf.kernel())
-    t1 = time.perf_counter()
-    e_corr = float(mp.dfmp2.DFMP2(mf).kernel(with_t2=False)[0])
-    return {
-        "ref_e_hf": e_hf,
-        "ref_e_corr": e_corr,
-        "ref_scf_s": t1 - t0,
-        "ref_mp2_s": time.perf_counter() - t1,
-    }
+    e_hf, e_corr = mp2.pyscf_df_mp2_reference(
+        f"{row['family']}{row['k']}",
+        row["basis"],
+        lindep=lindep if orth == "canonical" else None,
+    )
+    return {"ref_e_hf": e_hf, "ref_e_corr": e_corr, "ref_s": time.perf_counter() - t0}
 
 
 def _build_child(spec, store_dir, dtype_name, conn):
@@ -318,7 +309,8 @@ def run_one(row: dict, args) -> dict:
 
 def print_results(rows: list[dict]) -> None:
     print(
-        "\n| system | basis | n_ao / naux / nocc | build s (peak RSS GB) | solver (rank) | "
+        "\n| system | basis | n_ao / naux / nocc | build s (peak RSS GB; from the store's "
+        "meta when reused) | solver (rank) | "
         "SCF iters | SCF s | E_HF(C) | E_MP2 | ΔE_HF vs PySCF | ΔE_MP2 vs PySCF |"
     )
     print("|---|---|---|---|---|---|---|---|---|---|---|")
@@ -328,7 +320,8 @@ def print_results(rows: list[dict]) -> None:
         conv = "" if r["converged"] else " (not conv.)"
         print(
             f"| {r['family']}{r['k']} | {r['basis']} | {r['nao']} / {r['naux']} / {r['nocc']} | "
-            f"{r['build_s']:.0f} ({r['build'].get('peak_rss_bytes', 0) / 1e9:.1f}) | "
+            f"{r['build'].get('build_s', r['build_s']):.0f} "
+            f"({r['build'].get('peak_rss_bytes', 0) / 1e9:.1f}) | "
             f"{r['solver']} ({r['rank']}) | {r['iters']}{conv} | {r['scf_s']:.1f} | "
             f"{r['e_hf']:.6f} | {r['e_corr']:.6f} | {dhf} | {dmp} |"
         )
