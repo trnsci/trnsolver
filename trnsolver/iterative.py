@@ -17,6 +17,7 @@ from collections.abc import Callable
 import torch
 
 from .factor import _mH, _restore, _to_fp32
+from .nki.dispatch import _fp64_host_guard
 
 
 def jacobi_preconditioner(A: torch.Tensor) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -165,6 +166,7 @@ class _ImplicitSolve(torch.autograd.Function):
         return gA, lam, None
 
 
+@_fp64_host_guard("cg")
 @torch.compiler.disable
 def cg(
     A: torch.Tensor | Callable,
@@ -281,6 +283,7 @@ def _cg_impl(A, b, x0, tol, maxiter, M, orig=None):
     return _restore(x, orig), maxiter, torch.linalg.norm(r).item() / b_norm
 
 
+@_fp64_host_guard("gmres")
 @torch.compiler.disable
 def gmres(
     A: torch.Tensor | Callable,
@@ -405,6 +408,7 @@ def _gmres_impl(A, b, x0, tol, maxiter, restart, orig=None):
     return _restore(x, orig), total_iters, torch.linalg.norm(r).item() / b_norm
 
 
+@_fp64_host_guard("gmres_ir")
 @torch.compiler.disable
 def gmres_ir(
     A: torch.Tensor,

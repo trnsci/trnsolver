@@ -28,8 +28,10 @@ import torch
 
 from .factor import _cholesky_lower, _complex_if, _mH, _restore, _to_fp32
 from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki, _use_simulator
+from .nki.dispatch import _fp64_host_guard
 
 
+@_fp64_host_guard("eigh")
 def eigh(
     A: torch.Tensor,
     tol: float = 1e-10,
@@ -98,6 +100,7 @@ def eigh(
     return _restore(w, orig), _restore(V, orig)
 
 
+@_fp64_host_guard("eigh_generalized")
 def eigh_generalized(
     A: torch.Tensor,
     B: torch.Tensor | None,
@@ -199,6 +202,7 @@ def _eigh_generalized_orth(
     return _restore(w, orig), _restore(V, orig)
 
 
+@_fp64_host_guard("eigh_randomized")
 def eigh_randomized(
     A: torch.Tensor,
     k: int,

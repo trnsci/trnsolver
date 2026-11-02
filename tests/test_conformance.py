@@ -25,9 +25,11 @@ The same cases run on a Trainium box (manual path, no hardware CI)::
 
 Off the pytorch backend the tolerances relax to the FP32 kernel level and
 the fp64 gradchecks are skipped on a non-CPU device. float64 and complex128
-follow the suite float64 policy (trnsolver#89): under ``--backend auto`` with
-host inputs they compute in torch at float64 and keep the float64 tolerance;
-only ``--backend nki`` (FP32 kernels) and device inputs relax them. Under
+follow the suite float64 policy (trnsolver#89): under ``--backend auto`` they
+compute in torch at float64 and keep the float64 tolerance, device inputs
+included (device-resident float64 is computed on the host). Only
+``--backend nki`` (FP32 kernels) and device inputs with
+``TRNSOLVER_FP64_ON_DEVICE=1`` (device aten, fp32 precision) relax them. Under
 ``TRNSOLVER_REQUIRE_NKI=1`` a float64 input to a kernel path raises
 ``NotImplementedError`` by design, and such cases are skipped.
 """
@@ -91,9 +93,15 @@ def _dn(dt):
 
 def _fp64_full_precision(dt) -> bool:
     """float64 / complex128 computed at float64: the pytorch backend, or auto
-    with host inputs (float64 routes to torch, trnsolver#89). Explicit nki
-    runs it through the FP32 kernels; device aten computes it at fp32."""
-    return dt in (F64, C128) and (BACKEND == "pytorch" or (BACKEND == "auto" and DEV.type == "cpu"))
+    (float64 routes to torch, trnsolver#89; device-resident float64 is
+    computed on the host). Explicit nki runs it through the FP32 kernels, and
+    ``TRNSOLVER_FP64_ON_DEVICE=1`` keeps device aten, which computes it at fp32."""
+    if dt not in (F64, C128):
+        return False
+    if BACKEND == "pytorch":
+        return True
+    on_device = os.environ.get("TRNSOLVER_FP64_ON_DEVICE", "").lower() in ("1", "true", "yes")
+    return BACKEND == "auto" and (DEV.type == "cpu" or not on_device)
 
 
 def tol_for(dt, scale=1.0):

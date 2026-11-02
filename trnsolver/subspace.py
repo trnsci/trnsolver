@@ -51,11 +51,12 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 import torch
 
 from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki, _use_simulator
+from .nki.dispatch import _fp64_host_guard
 
 # Filter degrees the driver picks from: one compiled kernel per (n, kb, m).
 DEGREES = (2, 4, 6, 8, 12, 16, 24, 32, 48, 64)
@@ -81,6 +82,10 @@ class SubspaceState:
     and ``residual`` holds ``|F x_j - theta_j x_j|`` of the block that entered
     its last pass (before that pass; None after a cold start).
     """
+
+    # Stay on the host when a result is moved to F's device (the float64
+    # host path for device-resident F, `nki.dispatch._fp64_host_guard`).
+    _HOST_FIELDS: ClassVar[tuple[str, ...]] = ("theta", "residual")
 
     X: torch.Tensor
     theta: torch.Tensor
@@ -452,6 +457,7 @@ def _rr_block(F: torch.Tensor, X: torch.Tensor, kb: int):
     return _complete(X @ _to(Q, X.device, X.dtype), theta, kb, seed=kb)
 
 
+@_fp64_host_guard("occupied_subspace")
 @torch.compiler.disable
 def occupied_subspace(
     F: torch.Tensor,

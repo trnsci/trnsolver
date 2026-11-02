@@ -28,10 +28,25 @@ the Householder path and `eigh_generalized` through it, `eigh_randomized`,
 
 | mode | float64 input |
 |------|---------------|
-| backend `"auto"` | computes in torch (aten on the input's device, or host LAPACK) at float64 accuracy; no kernel runs |
+| backend `"auto"` | computes in torch at float64 accuracy; no kernel runs. Host input runs host torch (LAPACK); input on the `neuron` device is computed on the host (see below) |
 | backend `"nki"` | cast to FP32 for the kernels, result returned as float64; one `UserWarning` per op (on its first call) says precision is reduced to fp32 |
 | `TRNSOLVER_REQUIRE_NKI=1` | raises `NotImplementedError` (either backend; takes precedence over the cast) |
 
+- **float64 on the `neuron` device.** Device aten computes float64 at fp32
+  precision (measured on Trn2), so under backend `"auto"` every public op
+  (`eigh`, `eigh_generalized`, `eigh_randomized`, `occupied_subspace`, the
+  factorizations, solves, inverses and `cg` / `gmres` / `gmres_ir`) copies a
+  float64 or complex128 operand that is on the `neuron` device to the host,
+  computes there at float64, and returns the result on the original device,
+  still float64 / complex128 (the warm-start `SubspaceState.theta` and
+  `residual` stay on the host, as always). One `UserWarning` per op, on its
+  first such call: "float64 on the neuron device is computed on the host for
+  float64 accuracy (device arithmetic is fp32); pass float32 to stay on
+  device". A matvec or preconditioner callable passed to `cg` / `gmres`
+  still receives device tensors. To keep device aten (fp32 precision, no
+  host round trip), pass float32, or set `TRNSOLVER_FP64_ON_DEVICE=1`.
+  Backends `"nki"` and `"pytorch"` and `TRNSOLVER_REQUIRE_NKI=1` are not
+  affected.
 - **Result dtype** always matches what the pytorch backend returns for the
   same inputs: float32, float64, bfloat16 and float16 (computed in FP32 and
   cast back), and mixed-dtype operands (`torch.promote_types` rules, e.g.
@@ -39,7 +54,8 @@ the Householder path and `eigh_generalized` through it, `eigh_randomized`,
 - Integer and bool input takes torch, which raises as the pytorch backend
   does (`NotImplementedError` under `TRNSOLVER_REQUIRE_NKI=1`).
 - trnsolver has no complex kernels: complex64 / complex128 input takes aten
-  or torch on every backend.
+  or torch on every backend (complex128 on the `neuron` device under `"auto"`
+  is computed on the host, as above).
 - Paths where FP32 input does not run a kernel either (the `eigh` aten
   cutover below `TRNSOLVER_EIGH_NKI_MIN_N`, Jacobi on the XLA lineage) run
   torch for float64 too.
@@ -51,6 +67,7 @@ The same rule holds across the trnsci suite (trnsci/trnsolver#89).
 | Variable | Effect |
 |----------|--------|
 | `TRNSOLVER_REQUIRE_NKI=1` | Kernel-path failures re-raise instead of silently falling back to PyTorch, and inputs no kernel takes (float64, integer, bool) raise `NotImplementedError` (see [Precision and dtypes](#precision-and-dtypes)). Used by the validation suite to catch silent kernel breakage. |
+| `TRNSOLVER_FP64_ON_DEVICE=1` | Under backend `"auto"`, float64 / complex128 operands on the `neuron` device stay there and compute with device aten at fp32 precision, instead of on the host at float64 (see [Precision and dtypes](#precision-and-dtypes)). For callers who prefer speed. Read at import. |
 | `TRNSOLVER_EIGH_NKI_MIN_N=<n>` | On the native `neuron` device (and for host tensors on a TorchNeuron host), `eigh` uses `torch.linalg.eigh` for matrices with fewer than `n` rows and the NKI path otherwise. The NKI path is single-tile (n ≤ 128) and falls back to `torch.linalg.eigh` above that. Default 512; `0` always uses NKI. Ignored when `TRNSOLVER_REQUIRE_NKI=1`. (#42) |
 | `TRNSOLVER_EIGH_METHOD=auto\|jacobi` | `eigh` method when `method=` is not passed. `jacobi` selects the batched Jacobi solver (#48). Default `auto`. |
 | `TRNSOLVER_JACOBI_GROUP=<g>` | Jacobi kernel: tiles per launch (rounded down to a power of two). Default 128 (n ≤ 32: scalar kernel; 33 ≤ n ≤ 128: block kernel), split across the two physical cores of a logical NeuronCore. |

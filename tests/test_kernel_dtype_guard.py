@@ -24,6 +24,13 @@ backend ``auto`` float64 computes in torch at float64 accuracy with no
 launch; under backend ``nki`` the FP32 kernels run with FP32 operands, the
 result is float64 and one UserWarning is emitted per op; under
 ``TRNSOLVER_REQUIRE_NKI=1`` it raises NotImplementedError.
+
+float64 already on the ``neuron`` device (trnsolver#89 amendment): under
+backend ``auto`` every public op copies it to the host, computes there at
+float64 accuracy and returns the result on the original device (one
+UserWarning per op); ``TRNSOLVER_FP64_ON_DEVICE=1`` keeps the device path.
+Here the stand-in device is CPU, so the host and return transfers are spied
+on rather than observed as device changes.
 """
 
 import sys
@@ -41,6 +48,12 @@ import trnsolver.subspace as tsub
 from trnsolver.nki import dispatch
 from trnsolver.nki import jacobi as nj
 from trnsolver.nki import subspace as ns
+
+# The stand-in neuron device is CPU, so float64 calls under backend "auto"
+# take the host path and warn; only the tests below that check it look.
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:.*float64 on the neuron device is computed on the host:UserWarning"
+)
 
 F32 = (torch.float32,)
 # The test's own copy of the contract (the library's table must equal it).
@@ -186,6 +199,8 @@ def _install(monkeypatch, path, backend, require):
         monkeypatch.setattr(mod, "_REQUIRE_NKI", require)
     monkeypatch.setattr(dispatch, "_backend", backend)
     monkeypatch.setattr(dispatch, "_WARNED_FP32", set())
+    monkeypatch.setattr(dispatch, "_fp64_host_warned", set())
+    monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", False)
     monkeypatch.setattr(dispatch, "_native_ops", None)
     monkeypatch.setattr(dispatch, "_USE_SIMULATOR", path == "sim")
     # The "neuron" device is CPU here, so host inputs stand in for device ones.
@@ -604,3 +619,211 @@ def test_float64_require_nki_raises(monkeypatch, backend, path, name, env, fn, o
     with pytest.raises(NotImplementedError, match="TRNSOLVER_REQUIRE_NKI"):
         _run(monkeypatch, env, fn, torch.float64)
     assert not rec.launches
+
+
+# ── float64 on the neuron device: the host path (trnsolver#89 amendment) ─────
+#
+# The stand-in neuron device is CPU (`_install`), so every input below is
+# "device-resident". `_fp64_to_host` / `_fp64_to_device` are spied on: the
+# host path must copy each neuron-resident operand to the host and bring
+# each result back to the operands' device.
+
+FP64_DTYPES = [torch.float64, torch.complex128]
+HOST_MSG = "float64 on the neuron device is computed on the host for float64 accuracy"
+
+
+class Transfers:
+    def __init__(self, monkeypatch):
+        self.to_host, self.to_device, self.active = [], [], []
+        real_h, real_d = dispatch._fp64_to_host, dispatch._fp64_to_device
+
+        def to_host(t):
+            self.to_host.append(t)
+            return real_h(t)
+
+        def to_device(t, device):
+            self.to_device.append((t, device))
+            return real_d(t, device)
+
+        monkeypatch.setattr(dispatch, "_fp64_to_host", to_host)
+        monkeypatch.setattr(dispatch, "_fp64_to_device", to_device)
+        # Device aten on the host path would be a bug: every torch.linalg
+        # call made inside a public op must run with the host flag set.
+        real_eigh = torch.linalg.eigh
+
+        def eigh(*a, **k):
+            self.active.append(getattr(dispatch._fp64_host_active, "on", False))
+            return real_eigh(*a, **k)
+
+        monkeypatch.setattr(torch.linalg, "eigh", eigh)
+
+
+def _host_warnings(caught):
+    return [w for w in caught if HOST_MSG in str(w.message)]
+
+
+def _tensors_of(out):
+    if isinstance(out, torch.Tensor):
+        return [out]
+    if isinstance(out, (tuple, list)):
+        return [t for o in out for t in _tensors_of(o)]
+    return []
+
+
+def _assert_matches(out, ref, name):
+    got, want = _tensors_of(out), _tensors_of(ref)
+    assert len(got) == len(want), name
+    for g, w in zip(got, want, strict=True):
+        assert g.dtype == w.dtype and g.shape == w.shape, name
+        if g.is_floating_point() or g.is_complex():
+            torch.testing.assert_close(g, w, rtol=1e-12, atol=1e-12, msg=name)
+        else:
+            assert torch.equal(g, w), name
+
+
+def _api_ids():
+    return [name for name, _, _ in APIS]
+
+
+@pytest.mark.parametrize("dt", FP64_DTYPES, ids=["float64", "complex128"])
+@pytest.mark.parametrize("name,env,fn", APIS, ids=_api_ids())
+def test_fp64_on_device_auto_computes_on_host(monkeypatch, name, env, fn, dt):
+    """auto + float64 / complex128 on the neuron device: host path, result on
+    the device, float64 dtype, matching a CPU float64 reference."""
+    ref, ref_err = _pytorch_reference(monkeypatch, env, fn, dt)
+    if ref_err is not None:
+        pytest.skip(f"the pytorch backend raises for {name} {dt}: {ref_err}")
+    if name == "occupied_subspace" and dt.is_complex:
+        pytest.skip("occupied_subspace is real: it casts other F to float32 (no float64 left)")
+    with monkeypatch.context() as m:
+        m.setattr(dispatch, "_backend", "pytorch")
+        for k, v in env.items():
+            m.setenv(k, v)
+        ref = fn(dt)
+    rec, _ = _install(monkeypatch, "native", "auto", False)
+    tr = Transfers(monkeypatch)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out = _run(monkeypatch, env, fn, dt)
+    assert not rec.launches, f"{name}: device-resident {dt} launched {rec.launches}"
+    assert tr.to_host, f"{name}: no operand was copied to the host"
+    assert all(a for a in tr.active), f"{name}: torch.linalg.eigh ran outside the host path"
+    moved = {id(t) for t, _ in tr.to_device}
+    for t in _tensors_of(out):
+        assert t.device.type == dispatch._NEURON_DEVICE
+    assert {d for _, d in tr.to_device} <= {torch.device("cpu")}
+    assert moved, f"{name}: no result was returned to the device"
+    assert len(_host_warnings(caught)) >= 1
+    _assert_matches(out, ref, name)
+
+
+def test_fp64_on_device_returns_results_to_the_operand_device(monkeypatch):
+    """Each result tensor goes back to the operands' device; the subspace
+    state's host fields (theta, residual) stay on the host."""
+    _install(monkeypatch, "native", "auto", False)
+    tr = Transfers(monkeypatch)
+    F = _sym(12, torch.float64)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        res = _occupied(F)
+    moved = [t for t, _ in tr.to_device]
+    assert any(t is res.state.X or t.data_ptr() == res.state.X.data_ptr() for t in moved)
+    assert all(t is not res.state.theta for t in moved)
+    assert res.state.theta.dtype == torch.float64
+    assert res.eigenvalues.dtype == res.eigenvectors.dtype == torch.float64
+
+
+def test_fp64_on_device_warns_once_per_op(monkeypatch):
+    _install(monkeypatch, "native", "auto", False)
+    A, b = _spd(6, torch.float64), torch.ones(6, dtype=torch.float64)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for _ in range(3):
+            trnsolver.eigh(A)
+            trnsolver.cholesky(A)
+            trnsolver.cg(A, b, maxiter=20)
+            trnsolver.eigh_generalized(A, A)  # nests eigh / cholesky: no extra warning
+    msgs = sorted(str(w.message).split(":")[0] for w in _host_warnings(caught))
+    assert msgs == [
+        "trnsolver cg",
+        "trnsolver cholesky",
+        "trnsolver eigh",
+        "trnsolver eigh_generalized",
+    ]
+
+
+def test_fp64_on_device_callable_operands(monkeypatch):
+    """A matvec / preconditioner callable keeps getting device tensors."""
+    _install(monkeypatch, "native", "auto", False)
+    A, b = _spd(6, torch.float64), torch.ones(6, dtype=torch.float64)
+    seen = []
+
+    def matvec(x):
+        seen.append(x.device.type)
+        return A @ x
+
+    M = trnsolver.jacobi_preconditioner(A)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        x, _, _ = trnsolver.cg(matvec, b, tol=1e-14, maxiter=100, M=M)
+    assert seen and set(seen) == {dispatch._NEURON_DEVICE}
+    torch.testing.assert_close(x, torch.linalg.solve(A, b), rtol=1e-10, atol=1e-10)
+
+
+def test_fp64_on_device_override_keeps_device_path(monkeypatch):
+    """TRNSOLVER_FP64_ON_DEVICE=1: no host copy, no host-path warning."""
+    _install(monkeypatch, "native", "auto", False)
+    monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", True)
+    tr = Transfers(monkeypatch)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for _, env, fn in APIS:
+            _call(monkeypatch, env, fn, torch.float64)
+    assert not tr.to_host and not tr.to_device
+    assert not _host_warnings(caught)
+
+
+def test_fp64_on_device_override_reads_env(monkeypatch):
+    import importlib
+
+    monkeypatch.setenv("TRNSOLVER_FP64_ON_DEVICE", "1")
+    fresh = importlib.util.module_from_spec(importlib.util.find_spec("trnsolver.nki.dispatch"))
+    fresh.__spec__.loader.exec_module(fresh)
+    assert fresh._FP64_ON_DEVICE is True
+
+
+@pytest.mark.parametrize("backend", ["nki", "pytorch"])
+def test_fp64_on_device_other_backends_unchanged(monkeypatch, backend):
+    """Only backend auto takes the host path (nki: fp32 cast; pytorch: torch)."""
+    _install(monkeypatch, "native", backend, False)
+    tr = Transfers(monkeypatch)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for _, env, fn in APIS:
+            _call(monkeypatch, env, fn, torch.float64)
+    assert not tr.to_host and not _host_warnings(caught)
+
+
+@pytest.mark.parametrize("path,name,env,fn,ops,what", FP64_CASES)
+def test_fp64_on_device_require_nki_still_raises(monkeypatch, path, name, env, fn, ops, what):
+    _install(monkeypatch, path, "auto", True)
+    tr = Transfers(monkeypatch)
+    with pytest.raises(NotImplementedError, match="TRNSOLVER_REQUIRE_NKI"):
+        _run(monkeypatch, env, fn, torch.float64)
+    assert not tr.to_host
+
+
+def test_fp64_host_resident_unchanged(monkeypatch):
+    """float64 already on the host: no transfer and no warning (host torch)."""
+    _install(monkeypatch, "native", "auto", False)
+    monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "neuron")  # CPU is the host again
+    tr = Transfers(monkeypatch)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for name, env, fn in APIS:
+            got, err = _call(monkeypatch, env, fn, torch.float64)
+            ref, ref_err = _pytorch_reference(monkeypatch, env, fn, torch.float64)
+            assert (err is None) == (ref_err is None), name
+            assert got == ref, name
+    assert not tr.to_host and not tr.to_device
+    assert not _host_warnings(caught)

@@ -41,6 +41,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     inputs, for float32, float64, bfloat16, float16 and mixed-dtype operands
     (e.g. `eigh_generalized` with a float64 B), including after the FP32
     kernels.
+  - **float64 on the `neuron` device is computed on the host under `auto`.**
+    Device aten computes float64 at fp32 precision (measured on Trn2), so
+    "torch at float64 accuracy" did not hold for device-resident input.
+    Every public op now copies a float64 / complex128 operand on the
+    `neuron` device to the host, computes there and returns the result on
+    the original device in float64 / complex128, with one `UserWarning` per
+    op ("float64 on the neuron device is computed on the host for float64
+    accuracy (device arithmetic is fp32); pass float32 to stay on device").
+    **`TRNSOLVER_FP64_ON_DEVICE=1` keeps device aten (fp32 precision)** for
+    callers who prefer speed. Host-resident float64, backends `nki` /
+    `pytorch` and `TRNSOLVER_REQUIRE_NKI=1` are unchanged. One decorator
+    (`nki.dispatch._fp64_host_guard`) holds the rule.
   The library has no complex kernels; complex input keeps its aten / torch
   routes (#65). Paths where an FP32 input would not run a kernel either (the
   aten cutover, the XLA lineage for Jacobi) are unchanged.
@@ -58,9 +70,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   raises `NotImplementedError` under `TRNSOLVER_REQUIRE_NKI=1`. float16 and
   bfloat16 are cast to FP32 (lossless) and restored. Affected: every release
   with the kernels.
-
-### Fixed
-
 - **`cg` gave a wrong gradient with respect to `A`; `schur` detached
   silently; `gmres` backward raised (#76).** `cg` read its step sizes as
   Python floats, so autograd differentiated a fixed polynomial in `A`

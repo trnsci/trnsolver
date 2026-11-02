@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import torch
 
+from .nki.dispatch import _fp64_host_guard
+
 # BF16 and FP16 are not supported by torch.linalg on CPU. Functions in this
 # module accept these dtypes by silently upcasting to FP32 for computation,
 # then restoring the original dtype on output. FP32/FP64 inputs are passed
@@ -227,6 +229,7 @@ def _householder_qr(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return Q, R
 
 
+@_fp64_host_guard("cholesky")
 def cholesky(A: torch.Tensor, upper: bool = False) -> torch.Tensor:
     """Cholesky factorization: A = L @ L^T (or A = U^T @ U if upper=True).
 
@@ -246,6 +249,7 @@ def cholesky(A: torch.Tensor, upper: bool = False) -> torch.Tensor:
     return _restore(L, orig)
 
 
+@_fp64_host_guard("lu")
 def lu(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """LU factorization with partial pivoting: A = P @ L @ U
 
@@ -265,6 +269,7 @@ def lu(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return _restore(P, orig), _restore(L, orig), _restore(U, orig)
 
 
+@_fp64_host_guard("qr")
 def qr(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """QR factorization: A = Q @ R
 
@@ -286,6 +291,7 @@ def qr(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return _restore(Q, orig), _restore(R, orig)
 
 
+@_fp64_host_guard("svd")
 def svd(
     A: torch.Tensor,
     full_matrices: bool = False,
@@ -547,6 +553,7 @@ def schur(
     return _restore(Q.to(device), orig), _restore(T.to(device), orig)
 
 
+@_fp64_host_guard("solve")
 def solve(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """Solve A @ X = B for X.
 
@@ -562,6 +569,7 @@ def solve(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return _restore(X, orig)
 
 
+@_fp64_host_guard("solve_spd")
 def solve_spd(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -610,6 +618,7 @@ def solve_spd(
     return _restore(X, orig)
 
 
+@_fp64_host_guard("inv_spd")
 def inv_spd(A: torch.Tensor) -> torch.Tensor:
     """Inverse of symmetric positive definite matrix via Cholesky.
 
@@ -621,6 +630,7 @@ def inv_spd(A: torch.Tensor) -> torch.Tensor:
     return _restore(result, orig)
 
 
+@_fp64_host_guard("pinv")
 def pinv(A: torch.Tensor, rcond: float | None = None) -> torch.Tensor:
     """Moore-Penrose pseudoinverse via truncated SVD.
 
@@ -650,6 +660,7 @@ def pinv(A: torch.Tensor, rcond: float | None = None) -> torch.Tensor:
     return _restore(result, orig)
 
 
+@_fp64_host_guard("inv_sqrt_spd")
 def inv_sqrt_spd(A: torch.Tensor) -> torch.Tensor:
     """A^{-1/2} for symmetric positive definite A.
 
@@ -669,6 +680,7 @@ def inv_sqrt_spd(A: torch.Tensor) -> torch.Tensor:
     return _restore(result, orig)
 
 
+@_fp64_host_guard("inv_sqrt_spd_ns")
 def inv_sqrt_spd_ns(
     A: torch.Tensor,
     *,

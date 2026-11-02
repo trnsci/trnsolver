@@ -80,6 +80,8 @@ for the architecture decision and #36 for the matmul resolution.
 
 from __future__ import annotations
 
+import dataclasses
+import functools
 import importlib.util
 import os
 import threading
@@ -410,6 +412,149 @@ def _kernel_operands(
             return None
         out.append(t if dt == t.dtype else t.to(dt))
     return out
+
+
+# ── float64 on the neuron device: computed on the host ───────────────────────
+#
+# Under backend "auto" float64 computes in torch. For a tensor already on the
+# ``neuron`` device, torch is device aten, and device aten computes float64
+# at fp32 precision (measured on Trn2), so "auto gives float64 accuracy"
+# would not hold for device-resident data. Every public op is therefore
+# wrapped in `_fp64_host_guard`: a float64 / complex128 operand on the neuron
+# device is copied to the host, the op runs there (the host torch route) and
+# the result comes back on the original device, still float64. One
+# UserWarning per op says so. ``TRNSOLVER_FP64_ON_DEVICE=1`` keeps device
+# aten (fp32 precision) for callers who prefer speed. Host-resident float64
+# is unchanged. Backends "nki" (fp32 cast) and "pytorch", and
+# ``TRNSOLVER_REQUIRE_NKI=1`` (raises), are unchanged too.
+_FP64_ON_DEVICE = os.environ.get("TRNSOLVER_FP64_ON_DEVICE", "").lower() in ("1", "true", "yes")
+_FP64_HOST_DTYPES = (torch.float64, torch.complex128)
+_HOST = torch.device("cpu")
+_fp64_host_warned: set[str] = set()
+_fp64_host_active = threading.local()
+
+
+def _on_neuron_device(t) -> bool:
+    """True iff ``t`` is a tensor on the ``neuron`` device."""
+    return isinstance(t, torch.Tensor) and t.device.type == _NEURON_DEVICE
+
+
+def _walk(obj, fn):
+    """``obj`` with ``fn`` applied to every tensor in tuples, named tuples,
+    lists, dicts and dataclasses (a dataclass's ``_HOST_FIELDS`` are left as
+    they are)."""
+    if isinstance(obj, torch.Tensor):
+        return fn(obj)
+    if isinstance(obj, tuple):
+        items = [_walk(o, fn) for o in obj]
+        return type(obj)(*items) if hasattr(obj, "_fields") else tuple(items)
+    if isinstance(obj, list):
+        return [_walk(o, fn) for o in obj]
+    if isinstance(obj, dict):
+        return {k: _walk(v, fn) for k, v in obj.items()}
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        keep = getattr(obj, "_HOST_FIELDS", ())
+        return dataclasses.replace(
+            obj,
+            **{
+                f.name: _walk(getattr(obj, f.name), fn)
+                for f in dataclasses.fields(obj)
+                if f.init and f.name not in keep
+            },
+        )
+    return obj
+
+
+def _tensors(obj) -> list[torch.Tensor]:
+    found: list[torch.Tensor] = []
+    _walk(obj, lambda t: found.append(t) or t)
+    return found
+
+
+def _fp64_to_host(t: torch.Tensor) -> torch.Tensor:
+    """A neuron-resident operand copied to the host (differentiable)."""
+    return t.to(_HOST) if _on_neuron_device(t) else t
+
+
+def _fp64_to_device(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """A host result moved back to the operands' device (differentiable)."""
+    return t.to(device) if t.device == _HOST else t
+
+
+def _warn_fp64_host_once(what: str) -> None:
+    """One UserWarning per op: device-resident float64 computed on the host."""
+    if what in _fp64_host_warned:
+        return
+    _fp64_host_warned.add(what)
+    warnings.warn(
+        f"trnsolver {what}: float64 on the neuron device is computed on the host for "
+        "float64 accuracy (device arithmetic is fp32); pass float32 to stay on device, "
+        "or set TRNSOLVER_FP64_ON_DEVICE=1 to keep device aten at fp32 precision.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
+def _fp64_host_device(args, kwargs) -> torch.device | None:
+    """The neuron device to return the result to if this call computes on the
+    host (backend "auto", a float64 / complex128 operand on the neuron device,
+    no REQUIRE_NKI / FP64_ON_DEVICE, not already inside the host path)."""
+    if _backend != "auto" or _REQUIRE_NKI or _FP64_ON_DEVICE:
+        return None
+    if torch.compiler.is_compiling():  # traced graphs keep their devices
+        return None
+    if getattr(_fp64_host_active, "on", False):  # a nested public op
+        return None
+    dev = [t for t in _tensors((args, kwargs)) if _on_neuron_device(t)]
+    if not any(t.dtype in _FP64_HOST_DTYPES for t in dev):
+        return None
+    return dev[0].device
+
+
+def _host_callable(f, device: torch.device):
+    """``f`` (a matvec or preconditioner written for device tensors) called
+    from the host path: it gets device tensors and hands host tensors back."""
+
+    def g(*a):
+        out = f(*(_walk(x, lambda t: t.to(device)) for x in a))
+        return _walk(out, lambda t: t.to(_HOST))
+
+    return g
+
+
+def _fp64_host_guard(what: str):
+    """Decorator for every public op: device-resident float64 computes on the host.
+
+    See the section comment above. The result (tensors in tuples, named
+    tuples and dataclasses) comes back on the operands' neuron device with
+    the dtype the op returns on the host.
+    """
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            device = _fp64_host_device(args, kwargs)
+            if device is None:
+                return fn(*args, **kwargs)
+            _warn_fp64_host_once(what)
+
+            def to_host(a):
+                if callable(a) and not isinstance(a, (torch.Tensor, type)):
+                    return _host_callable(a, device)
+                return _walk(a, _fp64_to_host)
+
+            h_args = [to_host(a) for a in args]
+            h_kwargs = {k: to_host(v) for k, v in kwargs.items()}
+            _fp64_host_active.on = True
+            try:
+                out = fn(*h_args, **h_kwargs)
+            finally:
+                _fp64_host_active.on = False
+            return _walk(out, lambda t: _fp64_to_device(t, device))
+
+        return wrapper
+
+    return deco
 
 
 def _simulate(
