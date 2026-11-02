@@ -163,6 +163,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (accumulated in complex128 / float64) and promotes a real `b` to complex
   for a complex `A`. Real input is unchanged. Affected: every release
   through 0.21.0.
+- **`eigh(method="jacobi")` raised on complex and 0×0 input; `solve_spd`
+  raised on a batch of vector right-hand sides (#79).** Jacobi is real-only:
+  complex Hermitian input (`NotImplementedError: "ge_cpu"`) now takes the
+  default `eigh` path, as `torch.linalg.eigh` does. An n = 0 input (any
+  batch) returns empty `w`, `V` instead of failing to reshape. `solve_spd`
+  now reads B (*, n) with `B.shape == A.shape[:-1]` as a batch of vectors,
+  following `torch.linalg.solve`, where it raised before. The one shape that
+  already worked, last batch dim of A equal to n, keeps its old (*, n, k)
+  reading. Affected: `eigh(method="jacobi")` 0.17.0 through 0.21.0;
+  `solve_spd` every release through 0.21.0.
 - **`cg` gave a wrong gradient with respect to `A`; `schur` detached
   silently; `gmres` backward raised (#76).** `cg` read its step sizes as
   Python floats, so autograd differentiated a fixed polynomial in `A`
