@@ -400,3 +400,18 @@ def test_energy_delta_test_stalls_at_noise_floor_density_test_does_not():
 def test_conv_validation():
     with pytest.raises(ValueError, match="conv"):
         scf.run_scf(scf.h2_lattice(1), conv="bogus")
+
+
+def test_truncated_basis_converges_in_orthonormal_measure():
+    """With functions dropped by the orthogonalizer, the commutator and the
+    density change are measured in the kept orthonormal basis, where both can
+    reach zero (in the AO basis the commutator keeps a floor along the
+    dropped directions)."""
+    pytest.importorskip("pyscf")
+    system = scf.pyscf_system("alkane3", "aug-cc-pvdz", "aug-cc-pvdz-jkfit", reference=False)
+    r64 = scf.run_scf(system, dtype=torch.float64, orth="canonical", lindep=1e-3)
+    assert r64.info["rank"] < system.nao and r64.converged
+    assert r64.info["history"]["err_rms"][-1] < 1e-7
+    r32 = scf.run_scf(system, dtype=torch.float32, orth="canonical", lindep=1e-3)
+    assert r32.converged and r32.info["d_noise"] > 0
+    assert abs(scf.energy_at_orbitals(system, r32.C_occ) - r64.energy) < 1e-5
