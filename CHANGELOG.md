@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`examples/scf_df_mp2.py`: DF-MP2 on top of the converged DF-RHF (#15).**
+  - `canonical_orbitals` builds one Fock matrix at the SCF's occupied orbitals
+    (streamed J/K, float64 on the host by default) and diagonalises it in the
+    orthogonalizer's basis.
+  - `df_mp2` forms `B_ia^P` aux chunk by aux chunk with
+    `trntensor.AuxStream.ao_to_mo`, into host memory or a `.npy` memmap
+    (`bia_path`). The energy comes from `trntensor.mp2_energy` when `B_ia`
+    fits one device, else from `trntensor.mp2_energy_blocked` over occupied
+    blocks, with pairs dealt over `devices`.
+  - `run_mp2` chains them and returns E_HF (float64 at the SCF orbitals),
+    E_corr, E_total and stage times. `frozen` freezes the lowest occupied
+    orbitals.
+  - It uses the SCF's jkfit basis, the same one PySCF's `mp.dfmp2.DFMP2`
+    uses on a density-fitted mean field.
+  - Against PySCF: water/cc-pVDZ fp64 is within 1.1e-9 Eh of E_MP2. A fp32
+    SCF with a fp32 transform and energy is within 2.7e-7 Eh at C4H10
+    (`tests/test_scf_df_mp2.py`).
+  - A fp32 canonical Fock costs 4e-6 Eh there, which is why the float64
+    host Fock is the default (`--fock-on-device` to override).
+
 - **`examples/scf_df_rhf.py`: J/K streamed over aux chunks (#15).**
   `DFJK(stream=True)` (and `run_scf(jk_stream=..., jk_resident_gb=...,
   jk_prefetch=...)`) hands B to `trntensor.AuxStream` (trntensor#102).
