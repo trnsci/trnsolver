@@ -406,13 +406,17 @@ def test_require_nki_float64_eigh_runs_fp32_kernels_and_returns_float64(monkeypa
     assert not rec.violations
 
 
-def test_float64_eigh_without_require_is_full_precision_torch(monkeypatch):
-    rec, _ = _install(monkeypatch, "xla", "nki", False)
+@pytest.mark.parametrize("path", ["native", "xla", "sim"])
+def test_float64_eigh_without_require_runs_fp32_kernels(monkeypatch, path):
+    """#84 as merged: float64 runs the FP32 kernels and returns float64 (#89)."""
+    monkeypatch.setenv("TRNSOLVER_EIGH_NKI_MIN_N", "0")
+    rec, _ = _install(monkeypatch, path, "nki", False)
     A = _sym(6, torch.float64)
     w, V = trnsolver.eigh(A)
-    assert w.dtype == torch.float64
-    torch.testing.assert_close(w, torch.linalg.eigvalsh(A), atol=1e-12, rtol=1e-12)
-    assert not rec.launches
+    assert w.dtype == V.dtype == torch.float64
+    torch.testing.assert_close(w, torch.linalg.eigvalsh(A), atol=1e-4, rtol=1e-4)
+    assert {op for _, op, _ in rec.launches} >= {"matvec", "rank2_update"}
+    assert not rec.violations
 
 
 @pytest.mark.parametrize("dt", [torch.int32, torch.bool])

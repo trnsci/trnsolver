@@ -566,15 +566,14 @@ def _householder_operand(A: torch.Tensor) -> torch.Tensor | None:
 
     The kernels compute in FP32. A float64 A reached them as is and came
     back as garbage (Trn2, n=2: rel err ~1e17) or raised a dtype mismatch
-    (#83); integer and bool A reached them too. Without
-    ``TRNSOLVER_REQUIRE_NKI`` these take torch eigh, which is the pytorch
-    backend's result (float64 at full precision; integer and bool raise as
-    there). Under it, float64 runs in FP32 and comes back float64 (#84), and
-    the other dtypes raise NotImplementedError.
+    (#83): it runs in FP32 and comes back float64 (#84). Integer and bool A
+    take torch eigh, which raises as the pytorch backend does, or raise
+    NotImplementedError under ``TRNSOLVER_REQUIRE_NKI``. Whether float64
+    should take torch eigh at full precision instead is #89.
     """
     from .nki.dispatch import _kernel_operands
 
-    ops = _kernel_operands(A, ops=_HOUSEHOLDER_OPS, what="eigh", cast_fp64=_REQUIRE_NKI)
+    ops = _kernel_operands(A, ops=_HOUSEHOLDER_OPS, what="eigh", cast_fp64=True)
     return None if ops is None else ops[0]
 
 

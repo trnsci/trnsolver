@@ -26,12 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `eigh` on the NKI Householder path (under `TRNSOLVER_REQUIRE_NKI=1`, on
     the XLA lineage, the simulator, or with `TRNSOLVER_EIGH_NKI_MIN_N`
     lowered): float64 gave garbage (Trn2, n = 2: rel err ~1e17) or a dtype
-    mismatch, and came back float32. It now takes torch eigh at full
-    precision instead of the FP32 cast of the entry above; under
-    `TRNSOLVER_REQUIRE_NKI=1` it keeps that cast (runs the kernels in FP32
-    and returns float64). Integer and bool input takes torch (which raises,
-    as the pytorch backend does), or raises `NotImplementedError` under
-    `TRNSOLVER_REQUIRE_NKI=1`. `eigh_generalized` inherits both.
+    mismatch, and came back float32. It runs in FP32 and returns float64,
+    as in the entry above (#84), now through the shared guard. Integer and
+    bool input takes torch (which raises, as the pytorch backend does), or
+    raises `NotImplementedError` under `TRNSOLVER_REQUIRE_NKI=1`.
+    `eigh_generalized` inherits both.
   - `eigh_randomized`: float64 reached the FP32 matmul kernel (a compile
     error on Trn2). It now uses `torch.matmul` at full precision, or raises
     `NotImplementedError` under `TRNSOLVER_REQUIRE_NKI=1`.
