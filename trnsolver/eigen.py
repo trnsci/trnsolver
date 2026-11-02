@@ -85,9 +85,10 @@ def eigh(
     A, orig = _to_fp32(A)
     if _use_nki() and (_eigh_aten_cutover(A) or not _householder_fits(A)):
         w, V = _aten_eigh_on_device(A)
-    elif _use_nki():
+    elif _use_nki() and (Ak := _householder_operand(A)) is not None:
         try:
-            w, V = _householder_qr_eigh(A, tol)
+            w, V = _householder_qr_eigh(Ak, tol)
+            w, V = w.to(A.dtype), V.to(A.dtype)
         except Exception:
             if _REQUIRE_NKI:
                 raise
@@ -408,8 +409,12 @@ def _jacobi_auto(A: torch.Tensor) -> bool:
 
 def _jacobi_device_ok(n: int, dtype: torch.dtype) -> bool:
     """True iff the FP32 Jacobi NKI kernel can run: simulator, or the native path."""
-    if not (_use_nki() and HAS_NKI and 1 <= n <= 128 and dtype == torch.float32):
+    from .nki.dispatch import kernel_takes
+
+    if not (_use_nki() and HAS_NKI and 1 <= n <= 128):
         return False
+    if not kernel_takes(dtype, "jacobi_sweeps", "jacobi_block"):
+        return False  # float64 & co take the torch Jacobi, at full precision
     if _use_simulator():
         return True
     from .nki.dispatch import _get_dispatch_path
@@ -553,6 +558,26 @@ def _jacobi_eigh(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return _restore(w, orig), _restore(V, orig)
 
 
+_HOUSEHOLDER_OPS = ("matvec", "rank2_update", "matmul", "apply_reflectors")
+
+
+def _householder_operand(A: torch.Tensor) -> torch.Tensor | None:
+    """A as the FP32 Householder kernels take it, or None: run torch eigh.
+
+    The kernels compute in FP32. A float64 A reached them as is and came
+    back as garbage (Trn2, n=2: rel err ~1e17) or raised a dtype mismatch
+    (#83); integer and bool A reached them too. Without
+    ``TRNSOLVER_REQUIRE_NKI`` these take torch eigh, which is the pytorch
+    backend's result (float64 at full precision; integer and bool raise as
+    there). Under it, float64 runs in FP32 and comes back float64 (#84), and
+    the other dtypes raise NotImplementedError.
+    """
+    from .nki.dispatch import _kernel_operands
+
+    ops = _kernel_operands(A, ops=_HOUSEHOLDER_OPS, what="eigh", cast_fp64=_REQUIRE_NKI)
+    return None if ops is None else ops[0]
+
+
 def _torch_eigh(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """PyTorch backend path — delegates to torch.linalg.eigh (LAPACK)."""
     return torch.linalg.eigh(A)
@@ -654,13 +679,10 @@ def _call_matvec(A, v):
     No sync on the XLA path: the tridiagonalization driver syncs once per
     step. The result is on A's device.
     """
-    from .nki.dispatch import _launch, matvec_kernel
+    from .nki.dispatch import _launch, _simulate, matvec_kernel
 
     if _use_simulator():
-        import nki
-
-        w = nki.simulate(matvec_kernel)(A.detach().cpu().numpy(), v.detach().cpu().numpy())
-        return torch.from_numpy(w).to(A.device)
+        return _simulate(matvec_kernel, "matvec", A, v)
     return _launch(matvec_kernel, "matvec", A, v, sync=False)
 
 
@@ -670,15 +692,10 @@ def _call_rank2_update(A, u, v):
     No sync on the XLA path (see :func:`_call_matvec`). The result is on A's
     device.
     """
-    from .nki.dispatch import _launch, rank2_update_kernel
+    from .nki.dispatch import _launch, _simulate, rank2_update_kernel
 
     if _use_simulator():
-        import nki
-
-        out = nki.simulate(rank2_update_kernel)(
-            A.detach().cpu().numpy(), u.detach().cpu().numpy(), v.detach().cpu().numpy()
-        )
-        return torch.from_numpy(out).to(A.device)
+        return _simulate(rank2_update_kernel, "rank2_update", A, u, v)
     return _launch(rank2_update_kernel, "rank2_update", A, u, v, sync=False)
 
 
@@ -705,20 +722,27 @@ def _call_matmul(A, V):
     # The kernels are real; complex operands always take torch.matmul.
     if not _use_nki() or A.is_complex() or V.is_complex() or A.shape[0] > 128 or V.shape[1] > 128:
         return torch.matmul(A, V)
+    from .nki.dispatch import _kernel_operands
+
+    # FP32 only: float64 (eigh_randomized) reached the kernel as is and was
+    # garbage or a compile error on the device. It takes torch.matmul, at
+    # full precision (NotImplementedError under TRNSOLVER_REQUIRE_NKI).
+    ops = _kernel_operands(A, V, ops=("matmul",), what="eigh_randomized")
+    if ops is None:
+        return torch.matmul(A, V)
+    out_dtype = torch.promote_types(A.dtype, V.dtype)
+    A, V = ops
 
     orig_device = A.device
 
     if _use_simulator():
-        import nki
+        from .nki.dispatch import _simulate, matmul_kernel_sim
 
-        from .nki.dispatch import matmul_kernel_sim
-
-        C = nki.simulate(matmul_kernel_sim)(A.detach().cpu().numpy(), V.detach().cpu().numpy())
-        return torch.from_numpy(C).to(orig_device)
+        return _simulate(matmul_kernel_sim, "matmul", A, V).to(out_dtype)
 
     from .nki.dispatch import _launch, matmul_kernel
 
-    return _launch(matmul_kernel, "matmul", A, V, device=orig_device)
+    return _launch(matmul_kernel, "matmul", A, V, device=orig_device).to(out_dtype)
 
 
 def _call_matmul_fp32out(A: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
@@ -742,17 +766,14 @@ def _call_matmul_fp32out(A: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
 
     orig_device = A.device
 
-    if _use_simulator():
-        import nki
+    if A.is_complex() or V.is_complex():
+        return torch.matmul(A, V)
 
-        from .nki.dispatch import matmul_kernel_fp32out_sim
+    if _use_simulator():
+        from .nki.dispatch import _simulate, matmul_kernel_fp32out_sim
 
         # Upcast to FP32 for numpy: the simulator can't represent BF16 arrays.
-        C = nki.simulate(matmul_kernel_fp32out_sim)(
-            A.float().detach().cpu().numpy(),
-            V.float().detach().cpu().numpy(),
-        )
-        return torch.from_numpy(C).to(orig_device)
+        return _simulate(matmul_kernel_fp32out_sim, "matmul_fp32out", A.float(), V.float())
 
     from .nki.dispatch import _launch, matmul_kernel_fp32out
 
@@ -793,14 +814,10 @@ def _call_apply_reflectors(V_refs: torch.Tensor, Q: torch.Tensor) -> torch.Tenso
     orig_device = Q.device
 
     if _use_simulator():
-        import nki
+        from .nki.dispatch import _simulate, apply_reflectors_kernel_sim
 
-        from .nki.dispatch import apply_reflectors_kernel_sim
-
-        Q_T_out = nki.simulate(apply_reflectors_kernel_sim)(
-            V_refs.detach().cpu().numpy(), Q.detach().cpu().numpy()
-        )
-        return torch.from_numpy(Q_T_out).T.contiguous().to(orig_device)
+        Q_T_out = _simulate(apply_reflectors_kernel_sim, "apply_reflectors", V_refs, Q)
+        return Q_T_out.T.contiguous().to(orig_device)
 
     from .nki.dispatch import _launch, apply_reflectors_kernel
 
@@ -1103,7 +1120,8 @@ def _householder_qr_eigh(
     """
     n = A.shape[0]
     if n == 1:
-        return A[0].clone().unsqueeze(0), torch.eye(1, dtype=A.dtype, device=A.device)
+        # (1,) eigenvalues: `A[0].unsqueeze(0)` gave a (1, 1) tensor.
+        return A.reshape(1).clone(), torch.eye(1, dtype=A.dtype, device=A.device)
 
     diag, subdiag, V_refs = _householder_tridiag(A)
 

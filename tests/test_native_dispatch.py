@@ -255,12 +255,12 @@ class TestLaunchRouting:
             seen["args"] = (a, b)
             return a + b
 
-        monkeypatch.setattr(dispatch, "_native_ops", {"fake": op})
+        monkeypatch.setattr(dispatch, "_native_ops", {"matvec": op})
 
         def no_kernel(*t):
             raise AssertionError("raw kernel must not be called on the native path")
 
-        out = dispatch._launch(no_kernel, "fake", torch.ones(2, 1), torch.ones(2, 1))
+        out = dispatch._launch(no_kernel, "matvec", torch.ones(2, 1), torch.ones(2, 1))
         assert torch.equal(out, torch.full((2, 1), 2.0))
         assert out.device.type == "cpu"
         assert "args" in seen
@@ -285,11 +285,11 @@ class TestLaunchRouting:
             raise AssertionError("native ops must not load on the XLA path")
 
         monkeypatch.setattr(dispatch, "_get_native_ops", no_ops)
-        out = dispatch._launch(lambda x: x * 3, "unused", torch.ones(4, 1))
+        out = dispatch._launch(lambda x: x * 3, "matvec", torch.ones(4, 1))
         assert torch.equal(out, torch.full((4, 1), 3.0))
         assert syncs == [1]
 
-        out = dispatch._launch(lambda x: x * 2, "unused", torch.ones(4, 1), sync=False)
+        out = dispatch._launch(lambda x: x * 2, "matvec", torch.ones(4, 1), sync=False)
         assert torch.equal(out, torch.full((4, 1), 2.0))
         assert syncs == [1]
 
@@ -302,7 +302,7 @@ class TestLaunchRouting:
         monkeypatch.setattr(dispatch, "_dispatch_path", "cpu")
         monkeypatch.setitem(sys.modules, "torch_xla", None)
         with pytest.raises(ImportError):
-            dispatch._launch(lambda x: x, "unused", torch.ones(1, 1))
+            dispatch._launch(lambda x: x, "matvec", torch.ones(1, 1))
         with pytest.raises(ImportError):
             dispatch._work_device()
 

@@ -306,12 +306,9 @@ def run_filter_kernel(F: torch.Tensor, X: torch.Tensor, table: torch.Tensor) -> 
         raise RuntimeError("the subspace filter kernel needs nki")
     args = kernel_inputs(F, X, table)
     if _use_simulator():
-        import nki as _nki
+        from .dispatch import _simulate
 
-        res = _nki.simulate(subspace_filter_kernel)(
-            *(a.detach().cpu().contiguous().numpy() for a in args)
-        )
-        return torch.from_numpy(res).to(F.device)
+        return _simulate(subspace_filter_kernel, "subspace_filter", *args, device=F.device)
     from .dispatch import _launch
 
     return _launch(subspace_filter_kernel, "subspace_filter", *args, device=F.device)

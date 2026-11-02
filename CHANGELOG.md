@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **float64, integer and bool operands reached the FP32 NKI kernels (#83,
+  trnsci/trnsci#35).** One dtype table (`KERNEL_DTYPES` in
+  `trnsolver/nki/dispatch.py`) now lists what each kernel takes, and
+  `_launch` (native and XLA) and the new `_simulate` (simulator) raise
+  `TypeError` for anything else, so no kernel is reached with another dtype.
+  The wrappers route first with one guard, `_kernel_operands`:
+  - `eigh` on the NKI Householder path (under `TRNSOLVER_REQUIRE_NKI=1`, on
+    the XLA lineage, the simulator, or with `TRNSOLVER_EIGH_NKI_MIN_N`
+    lowered): float64 gave garbage (Trn2, n = 2: rel err ~1e17) or a dtype
+    mismatch, and came back float32. It now takes torch eigh at full
+    precision; under `TRNSOLVER_REQUIRE_NKI=1` it runs the kernels in FP32
+    and returns float64 (as in #84). Integer and bool input takes torch
+    (which raises, as the pytorch backend does), or raises
+    `NotImplementedError` under `TRNSOLVER_REQUIRE_NKI=1`. n = 1 returned
+    `(1, 1)` eigenvalues (0.4.0 through 0.20.0) and now returns `(1,)`.
+    `eigh_generalized` inherited all of these.
+  - `eigh_randomized`: float64 reached the FP32 matmul kernel (a compile
+    error on Trn2). It now uses `torch.matmul` at full precision, or raises
+    `NotImplementedError` under `TRNSOLVER_REQUIRE_NKI=1`.
+  - The Jacobi `eigh` and `occupied_subspace` kernels already took FP32
+    only; they now read the same table. Affected: every release with the
+    kernels.
 - **Complex Hermitian and batched input gave wrong results with no error (#64).**
   `cholesky(upper=True)`, `solve_spd` (including `iterative_refinement=True`),
   `inv_spd`, `inv_sqrt_spd`, `eigh_generalized`, `eigh_randomized`, `pinv`

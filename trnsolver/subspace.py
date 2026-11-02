@@ -242,7 +242,10 @@ def rayleigh_ritz(
 
 def _subspace_device_ok(F: torch.Tensor, kb: int) -> bool:
     """True iff the filter runs as the NKI kernel for F and a kb-column block."""
-    if F.dtype != torch.float32 or not (_use_nki() and HAS_NKI):
+    from .nki.dispatch import kernel_takes
+
+    # FP32 only: float64 F takes filter_reference, at full precision.
+    if not kernel_takes(F.dtype, "subspace_filter") or not (_use_nki() and HAS_NKI):
         return False
     if os.environ.get("TRNSOLVER_SUBSPACE_KERNEL", "1").strip() == "0":
         return False
@@ -252,7 +255,9 @@ def _subspace_device_ok(F: torch.Tensor, kb: int) -> bool:
         return False
     if _use_simulator():
         return True
-    if F.device.type != "neuron":
+    from .nki.dispatch import _NEURON_DEVICE
+
+    if F.device.type != _NEURON_DEVICE:
         return False
     from .nki.dispatch import _get_dispatch_path
 

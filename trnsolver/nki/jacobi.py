@@ -687,17 +687,19 @@ def _run_kernel(
 ) -> torch.Tensor:
     """One launch (``sweeps`` sweeps) on a group: simulator or device. Z, V: (G, P, ne)."""
     if _use_simulator():
-        import nki as _nki
+        from .dispatch import _simulate
 
         consts, sched = _consts_on(n, chains, torch.device("cpu"), sweeps)
-        res = _nki.simulate(jacobi_sweeps_kernel)(
-            Z.detach().cpu().contiguous().numpy(),
-            V.detach().cpu().contiguous().numpy(),
-            consts.numpy(),
-            sched.numpy(),
-            int(_ONEZERO),
+        return _simulate(
+            jacobi_sweeps_kernel,
+            "jacobi_sweeps",
+            Z,
+            V,
+            consts,
+            sched,
+            device=Z.device,
+            static=(int(_ONEZERO),),
         )
-        return torch.from_numpy(res).to(Z.device)
     from .dispatch import _launch
 
     consts, sched = _consts_on(n, chains, Z.device, sweeps)
@@ -727,17 +729,19 @@ def _block_consts_on(n: int, chains: int, device: torch.device):
 def _run_block_kernel(Z: torch.Tensor, V: torch.Tensor, n: int, chains: int) -> torch.Tensor:
     """One block-sweep launch on a group: simulator or device. Z, V: (G, P, ne)."""
     if _use_simulator():
-        import nki as _nki
+        from .dispatch import _simulate
 
         consts, sched = _block_consts_on(n, chains, torch.device("cpu"))
-        res = _nki.simulate(jacobi_block_kernel)(
-            Z.detach().cpu().contiguous().numpy(),
-            V.detach().cpu().contiguous().numpy(),
-            consts.numpy(),
-            sched.numpy(),
-            int(_ONEZERO),
+        return _simulate(
+            jacobi_block_kernel,
+            "jacobi_block",
+            Z,
+            V,
+            consts,
+            sched,
+            device=Z.device,
+            static=(int(_ONEZERO),),
         )
-        return torch.from_numpy(res).to(Z.device)
     from .dispatch import _launch
 
     consts, sched = _block_consts_on(n, chains, Z.device)

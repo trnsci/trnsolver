@@ -278,6 +278,114 @@ def _step_sync() -> None:
     torch_xla.sync()
 
 
+# ── Kernel dtype guard ───────────────────────────────────────────────────────
+#
+# Operand dtypes each kernel takes, keyed by the op name `_launch` uses (and
+# `_native.OPS`). Every kernel computes in FP32 (or, for matmul_fp32out, BF16
+# in with FP32 accumulation). float64, integer, bool and complex operands used
+# to reach them as is and came back as garbage, non-finite, the wrong dtype or
+# a compile error (#83; trnsci/trnsci#35). `_launch` and `_simulate` enforce
+# this table on every launch, so no kernel is reached with another dtype even
+# if a wrapper forgets `_kernel_operands`.
+_F32 = (torch.float32,)
+KERNEL_DTYPES: dict[str, tuple[torch.dtype, ...]] = {
+    "matvec": _F32,
+    "rank2_update": _F32,
+    "matmul": _F32,
+    "matmul_fp32out": (torch.bfloat16,),
+    "apply_reflectors": _F32,
+    "jacobi_sweeps": _F32,
+    "jacobi_block": _F32,
+    "subspace_filter": _F32,
+}
+# The simulator takes numpy arrays, and BF16 has no numpy dtype: the
+# matmul_fp32out simulator variant gets FP32.
+SIM_KERNEL_DTYPES: dict[str, tuple[torch.dtype, ...]] = {
+    **KERNEL_DTYPES,
+    "matmul_fp32out": _F32,
+}
+
+
+def _dtype_names(dtypes) -> str:
+    return "/".join(str(d).removeprefix("torch.") for d in dtypes)
+
+
+def _check_kernel_dtypes(op_name: str, tensors, table=None) -> None:
+    """Raise TypeError unless every tensor operand has a dtype `op_name` takes."""
+    table = KERNEL_DTYPES if table is None else table
+    allowed = table.get(op_name)
+    if allowed is None:
+        raise TypeError(f"trnsolver::{op_name}: no entry in the kernel dtype table")
+    got = [t.dtype for t in tensors if isinstance(t, torch.Tensor)]
+    if any(d not in allowed for d in got):
+        raise TypeError(
+            f"trnsolver::{op_name} takes {_dtype_names(allowed)} operands, got "
+            f"{_dtype_names(got)}. This is a trnsolver bug: the caller must cast "
+            "or route to torch first."
+        )
+
+
+def kernel_takes(dtype: torch.dtype, *ops: str) -> bool:
+    """True iff every kernel in ``ops`` takes ``dtype`` operands."""
+    return all(dtype in KERNEL_DTYPES[op] for op in ops)
+
+
+def _kernel_operands(
+    *tensors: torch.Tensor, ops: tuple[str, ...], what: str, cast_fp64: bool = False
+) -> list[torch.Tensor] | None:
+    """The operands to hand the kernels ``ops``, or None: compute in torch.
+
+    - every dtype taken by all of ``ops``: the tensors, unchanged;
+    - float16 / bfloat16 for an FP32 kernel: cast to float32 (lossless);
+    - float64 with ``cast_fp64``: cast to float32 (precision is fp32);
+    - anything else (float64, integer, bool, complex): None, so the caller
+      runs torch and returns what the pytorch backend returns. Under
+      ``TRNSOLVER_REQUIRE_NKI=1`` this raises NotImplementedError instead,
+      as trnblas does (trnblas#69).
+
+    The caller casts the kernel result back to the caller's dtype.
+    """
+    out = []
+    for t in tensors:
+        if kernel_takes(t.dtype, *ops):
+            out.append(t)
+        elif kernel_takes(torch.float32, *ops) and (
+            t.dtype in (torch.float16, torch.bfloat16) or (cast_fp64 and t.dtype == torch.float64)
+        ):
+            out.append(t.float())
+        else:
+            if _REQUIRE_NKI:
+                dts = _dtype_names(sorted({str(x.dtype) for x in tensors}))
+                allowed = _dtype_names(KERNEL_DTYPES[ops[0]])
+                raise NotImplementedError(
+                    f"trnsolver {what}: the NKI kernels take {allowed}, got {dts}. "
+                    "Unset TRNSOLVER_REQUIRE_NKI to compute in torch."
+                )
+            return None
+    return out
+
+
+def _simulate(
+    kernel,
+    op_name: str,
+    *tensors: torch.Tensor,
+    device: torch.device | None = None,
+    static: tuple = (),
+) -> torch.Tensor:
+    """Run one kernel under ``nki.simulate`` on host numpy copies.
+
+    The simulator twin of `_launch`: the same dtype table is enforced
+    (`SIM_KERNEL_DTYPES`). The result is returned on ``device`` (default: the
+    first input's device).
+    """
+    _check_kernel_dtypes(op_name, tensors, SIM_KERNEL_DTYPES)
+    out_device = tensors[0].device if device is None else device
+    import nki as _nki
+
+    res = _nki.simulate(kernel)(*(t.detach().cpu().contiguous().numpy() for t in tensors), *static)
+    return torch.from_numpy(res).to(out_device)
+
+
 def _launch(
     kernel,
     op_name: str,
@@ -296,7 +404,11 @@ def _launch(
     ``nki_op`` arguments on the native path). A value that specialises a
     kernel must arrive this way, not through a global or closure, so the NKI
     trace cache keys on it (aws-neuron/aws-neuron-sdk#1454).
+
+    Every tensor operand must have a dtype in ``KERNEL_DTYPES[op_name]``
+    (TypeError otherwise), on both paths.
     """
+    _check_kernel_dtypes(op_name, tensors)
     out_device = tensors[0].device if device is None else device
     if _get_dispatch_path() == "native":
         op = _get_native_ops()[op_name]
