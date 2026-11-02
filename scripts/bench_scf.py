@@ -81,6 +81,8 @@ def _run_mode(system: System, mode: str, args):
     library first-call costs); its time is reported as ``cold``."""
     kw = dict(
         solver=args.solver,
+        orth=args.orth,
+        lindep=args.lindep,
         k_cache_gb=args.k_cache_gb,
         jk_square=args.jk_square,
         jk_fused={"auto": None, "fused": True, "unpack": False}[args.jk_k],
@@ -281,6 +283,8 @@ def main() -> None:
     ap.add_argument("--systems", default="h2-lattice:16")
     ap.add_argument("--modes", default="cpu,cpu64")
     ap.add_argument("--solver", default="orth", choices=("orth", "generalized", "purify"))
+    ap.add_argument("--orth", default="symmetric", choices=("symmetric", "canonical", "cholesky"))
+    ap.add_argument("--lindep", type=float, default=1e-7)
     ap.add_argument("--max-iter", type=int, default=60)
     ap.add_argument("--warmup-iters", type=int, default=3)
     ap.add_argument("--k-cache-gb", type=float, default=4.0)
