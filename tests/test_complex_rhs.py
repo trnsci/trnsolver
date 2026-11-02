@@ -59,6 +59,17 @@ def test_eigh_generalized_real_a_complex_b():
     torch.testing.assert_close(w, torch.linalg.eigvalsh(Li @ Ac @ Li.mH))
 
 
+def test_eigh_generalized_real_a_complex_orthogonalizer():
+    # The X path (#72) cast a complex X to A's real dtype the same way.
+    A = _spd(N, torch.float64, seed=1) - 2.5 * torch.eye(N, dtype=torch.float64)
+    Z = _crand(N, N, dtype=torch.complex128, seed=4)
+    B = Z @ Z.mH / N + 2 * torch.eye(N, dtype=torch.complex128)
+    X = trnsolver.orthogonalizer(B)[0]
+    w, V = trnsolver.eigh_generalized(A, None, X=X)
+    assert V.is_complex()
+    torch.testing.assert_close(w, trnsolver.eigh_generalized(A, B)[0])
+
+
 def test_real_rhs_unchanged():
     A = _spd(N, torch.float32)
     B = torch.randn(N, 2, dtype=torch.float64)

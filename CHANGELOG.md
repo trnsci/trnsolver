@@ -46,7 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#66).** `solve`, `solve_spd` and `eigh_generalized` cast B to A's dtype,
   so a complex B lost its imaginary part with only a UserWarning, and the
   result was real. A real A is now promoted to complex when B is complex.
-  Real B is unchanged. Affected: 0.7.0–0.20.0.
+  Real B is unchanged. Affected: 0.7.0–0.20.0. `eigh_generalized(A, None,
+  X=X)` (new on main, #72) likewise promotes a real A for a complex X.
 
 ### Added
 

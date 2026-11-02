@@ -173,7 +173,10 @@ def _eigh_generalized_orth(
     A: torch.Tensor, X: torch.Tensor, tol: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """eigh_generalized with a precomputed orthogonalizer X (#72)."""
-    A, orig = _to_fp32(A)
+    # A complex X (from a complex Hermitian B) promotes a real A, as a
+    # complex B does on the Cholesky path (#66); X.to(A.dtype) dropped its
+    # imaginary part.
+    A, orig = _to_fp32(_complex_if(A, X))
     X = X.to(device=A.device, dtype=A.dtype)
     if X.shape[-2] != A.shape[-1]:
         raise ValueError(f"X has {X.shape[-2]} rows, A is {A.shape[-1]} x {A.shape[-1]}")
