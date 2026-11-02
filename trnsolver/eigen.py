@@ -26,7 +26,7 @@ import os
 
 import torch
 
-from .factor import _cholesky_lower, _restore, _to_fp32
+from .factor import _cholesky_lower, _mH, _restore, _to_fp32
 from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki, _use_simulator
 
 
@@ -83,7 +83,7 @@ def eigh(
     if resolved == "jacobi" or (resolved == "auto" and _jacobi_auto(A)):
         return _jacobi_eigh(A)
     A, orig = _to_fp32(A)
-    if _use_nki() and _eigh_aten_cutover(A):
+    if _use_nki() and (_eigh_aten_cutover(A) or not _householder_fits(A)):
         w, V = _aten_eigh_on_device(A)
     elif _use_nki():
         try:
@@ -112,9 +112,11 @@ def eigh_generalized(
     """Generalized symmetric eigenvalue problem: A @ x = λ B @ x
 
     Without ``X``, reduces to standard form via Cholesky of B:
-        B = L @ L^T
-        (L^{-1} A L^{-T}) y = λ y
-        x = L^{-T} y
+        B = L @ L^H
+        (L^{-1} A L^{-H}) y = λ y
+        x = L^{-H} y
+
+    Real symmetric or complex Hermitian; leading batch dims are allowed.
 
     The triangular solves use trnblas.trsm (NKI-accelerated blocked path)
     when trnblas is installed; they fall back to torch.linalg.solve_triangular
@@ -144,22 +146,30 @@ def eigh_generalized(
 
     L = _cholesky_lower(B)
 
-    if _tb is not None:
+    # trnblas.trsm takes one real (n, n) matrix. Complex (Hermitian) input
+    # and batches take torch.linalg.solve_triangular with conjugate
+    # transposes of the last two dims (``.mH``): the reduction is
+    # L^{-1} A L^{-H}, and ``.T`` neither conjugated nor kept batch dims.
+    # ``_mH`` resolves the lazy conj bit, which Neuron matmul ignores
+    # (aws-neuron/aws-neuron-sdk#1455).
+    use_tb = _tb is not None and A.dim() == 2 and not A.is_complex()
+
+    if use_tb:
         # NKI path: trnblas.trsm dispatches to the blocked NKI GEMM path on
         # Trainium; falls back to torch.linalg.solve_triangular on CPU.
         L_inv_A = _tb.trsm(1.0, L, A, side="left", uplo="lower", trans=False)
         A_prime = _tb.trsm(1.0, L, L_inv_A.T, side="left", uplo="lower", trans=False).T
     else:
         L_inv_A = torch.linalg.solve_triangular(L, A, upper=False)
-        A_prime = torch.linalg.solve_triangular(L, L_inv_A.T, upper=False).T
+        A_prime = _mH(torch.linalg.solve_triangular(L, _mH(L_inv_A), upper=False))
 
-    A_prime = 0.5 * (A_prime + A_prime.T)
+    A_prime = 0.5 * (A_prime + _mH(A_prime))
     eigenvalues, V_prime = eigh(A_prime, tol)
 
-    if _tb is not None:
+    if use_tb:
         eigenvectors = _tb.trsm(1.0, L, V_prime, side="left", uplo="lower", trans=True)
     else:
-        eigenvectors = torch.linalg.solve_triangular(L.T, V_prime, upper=True)
+        eigenvectors = torch.linalg.solve_triangular(_mH(L), V_prime, upper=True)
 
     return _restore(eigenvalues, orig), _restore(eigenvectors, orig)
 
@@ -180,8 +190,8 @@ def _eigh_generalized_orth(
     if plain and _tb is not None:
         Ap = _tb.gemm(1.0, X, _tb.gemm(1.0, A, X), transA=True)
     else:
-        Ap = X.mH @ (A @ X)
-    Ap = 0.5 * (Ap + Ap.mH)
+        Ap = _mH(X) @ (A @ X)  # _mH: aws-neuron/aws-neuron-sdk#1455
+    Ap = 0.5 * (Ap + _mH(Ap))
     if plain:
         w, Vp = eigh(Ap, tol)
     else:
@@ -297,9 +307,12 @@ def eigh_randomized(
         Q, _ = torch.linalg.qr(Y, mode="reduced")
         AQ = _call_matmul(A, Q)
 
-    # Project: B = Q^T A Q  (ℓ × ℓ, always FP32 in both paths)
-    B = Q.T @ AQ
-    B = 0.5 * (B + B.T)  # symmetrize for FP32 safety
+    # Project: B = Q^H A Q  (ℓ × ℓ, always FP32 in both paths). ``.mH``
+    # conjugates complex Hermitian A; for real A it is ``.T``. ``_mH``
+    # resolves the lazy conj bit, which Neuron matmul ignores
+    # (aws-neuron/aws-neuron-sdk#1455).
+    B = _mH(Q) @ AQ
+    B = 0.5 * (B + _mH(B))  # symmetrize for FP32 safety
 
     # Small eigenproblem: exact LAPACK eigh on (ℓ × ℓ) — always FP32
     eig_vals, V_small = torch.linalg.eigh(B)  # (ℓ,) ascending, (ℓ, ℓ)
@@ -587,6 +600,17 @@ def _eigh_aten_cutover(A: torch.Tensor) -> bool:
     return A.shape[-1] < _eigh_nki_min_n()
 
 
+def _householder_fits(A: torch.Tensor) -> bool:
+    """True iff the NKI Householder path can take A: one real (n, n) matrix.
+
+    Its kernels are real and single-matrix, so complex Hermitian input and
+    batches (both reachable through ``eigh_generalized``) take aten eigh,
+    also under ``TRNSOLVER_REQUIRE_NKI=1``, where they used to raise
+    (``torch.sign`` of a complex entry; the square-matrix assert on a batch).
+    """
+    return A.dim() == 2 and not A.is_complex()
+
+
 def _host_input_on_native_path(A: torch.Tensor) -> bool:
     """True iff A is a host tensor and the NKI kernels would run on TorchNeuron.
 
@@ -680,7 +704,8 @@ def _call_matmul(A, V):
     callers such as eigh_randomized that call it unconditionally — on non-Neuron
     hardware the NKI guard ensures torch.matmul is used transparently.
     """
-    if not _use_nki() or A.shape[0] > 128 or V.shape[1] > 128:
+    # The kernels are real; complex operands always take torch.matmul.
+    if not _use_nki() or A.is_complex() or V.is_complex() or A.shape[0] > 128 or V.shape[1] > 128:
         return torch.matmul(A, V)
 
     orig_device = A.device

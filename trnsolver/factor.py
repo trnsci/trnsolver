@@ -38,6 +38,19 @@ def _restore(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return x.to(dtype) if dtype in _LOW_PRECISION else x
 
 
+def _mH(x: torch.Tensor) -> torch.Tensor:
+    """Conjugate transpose of the last two dims, with the conjugation applied.
+
+    ``x.mH`` of a complex tensor is a lazy view: it sets the conj bit and
+    leaves the data unconjugated. On a Neuron device matmul ignores that bit
+    (aws-neuron/aws-neuron-sdk#1455), so ``A.mH @ B`` computes ``A.mT @ B``.
+    ``resolve_conj()`` materializes the conjugate; for real input it is a
+    no-op. Use this for every ``.mH`` that reaches a device matmul or solve,
+    or is returned to the caller.
+    """
+    return x.mH.resolve_conj()
+
+
 # ----------------------------------------------------------------------
 # torch.compile support (#41)
 # ----------------------------------------------------------------------
@@ -214,7 +227,9 @@ def cholesky(A: torch.Tensor, upper: bool = False) -> torch.Tensor:
     A, orig = _to_fp32(A)
     L = _cholesky_lower(A)
     if upper:
-        return _restore(L.T, orig)
+        # U = L^H, per matrix: ``.mH`` conjugates complex (Hermitian) input
+        # and keeps leading batch dims, where ``.T`` reversed every dim.
+        return _restore(_mH(L), orig)
     return _restore(L, orig)
 
 
@@ -549,9 +564,11 @@ def solve_spd(
     L = cholesky(A)
     squeeze = B.dim() == 1
     if squeeze:
-        B = B.unsqueeze(1)
+        B = B.unsqueeze(-1)
+    # A = L L^H: back substitution with L^H (``.mH``: conjugate for complex,
+    # last two dims only for a batch).
     Y = _solve_triangular(L, B, upper=False)
-    X = _solve_triangular(L.T, Y, upper=True)
+    X = _solve_triangular(_mH(L), Y, upper=True)
     if iterative_refinement:
         # Compute residual in FP64 to capture the low-order bits that the
         # FP32 Cholesky solve missed. The correction dX is solved in FP32
@@ -559,12 +576,13 @@ def solve_spd(
         # iterative refinement: the FP64 residual is O(eps64 * cond(A))
         # rather than O(eps32 * cond(A)), giving a reliable improvement
         # for cond(A) up to ~1/eps32 ≈ 1e7.
-        R = (B.double() - A.double() @ X.double()).to(A.dtype)
+        wide = torch.complex128 if A.is_complex() else torch.float64
+        R = (B.to(wide) - A.to(wide) @ X.to(wide)).to(A.dtype)
         dY = _solve_triangular(L, R, upper=False)
-        dX = _solve_triangular(L.T, dY, upper=True)
+        dX = _solve_triangular(_mH(L), dY, upper=True)
         X = X + dX
     if squeeze:
-        X = X.squeeze(1)
+        X = X.squeeze(-1)
     return _restore(X, orig)
 
 
@@ -574,7 +592,7 @@ def inv_spd(A: torch.Tensor) -> torch.Tensor:
     Used for J^{-1} in density fitting (though J^{-1/2} via solve is preferred).
     """
     A, orig = _to_fp32(A)
-    n = A.shape[0]
+    n = A.shape[-1]
     result = solve_spd(A, torch.eye(n, dtype=A.dtype, device=A.device))
     return _restore(result, orig)
 
@@ -598,10 +616,13 @@ def pinv(A: torch.Tensor, rcond: float | None = None) -> torch.Tensor:
     A, orig = _to_fp32(A)
     U, s, Vh = torch.linalg.svd(A, full_matrices=False)
     if rcond is None:
-        rcond = torch.finfo(s.dtype).eps * max(A.shape)
-    mask = s > rcond * s[0]
+        rcond = torch.finfo(s.dtype).eps * max(A.shape[-2:])
+    # Cutoff per matrix: s is sorted descending, so s[..., :1] is each
+    # matrix's largest singular value (s[0] was the first matrix's whole row
+    # for a batch, and raised for an empty matrix).
+    mask = s > rcond * s[..., :1]
     s_inv = torch.where(mask, 1.0 / s, torch.zeros_like(s))
-    result = (Vh.mH * s_inv) @ U.mH
+    result = (_mH(Vh) * s_inv.unsqueeze(-2)) @ _mH(U)
     return _restore(result, orig)
 
 
@@ -617,7 +638,10 @@ def inv_sqrt_spd(A: torch.Tensor) -> torch.Tensor:
     # Clamp small eigenvalues for numerical stability
     eigenvalues = torch.clamp(eigenvalues, min=1e-12)
     inv_sqrt_eig = 1.0 / torch.sqrt(eigenvalues)
-    result = V @ torch.diag(inv_sqrt_eig) @ V.T
+    # Per matrix V diag(w^-1/2) V^H: ``diag_embed``/``.mH`` keep batch dims
+    # (``torch.diag`` of a batch of eigenvalue rows took their diagonal) and
+    # conjugate complex V.
+    result = V @ torch.diag_embed(inv_sqrt_eig.to(V.dtype)) @ _mH(V)
     return _restore(result, orig)
 
 
