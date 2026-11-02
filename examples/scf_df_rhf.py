@@ -776,6 +776,7 @@ def run_scf(
     jk_devices=None,
     jk_square: bool = False,
     jk_fused: bool | None = None,
+    subspace_opts: dict | None = None,
     verbose: bool = False,
 ) -> SCFResult:
     """Run DF-RHF to convergence; every tensor op runs on ``device`` in ``dtype``.
@@ -791,7 +792,11 @@ def run_scf(
     ``trnsolver.eigh_generalized(F, S)`` every iteration (a Cholesky of S, which
     fails when S is numerically singular); ``"purify"`` replaces
     the per-iteration eigh by :func:`purify_occupied` on X^T F X (GEMMs only;
-    the guess and one final solve still use eigh, so ``eps`` is reported).
+    the guess and one final solve still use eigh, so ``eps`` is reported);
+    ``"subspace"`` replaces it by ``trnsolver.occupied_subspace`` on X^T F X,
+    warm-started from the previous iteration's block (the first iteration
+    is one full eigh; ``subspace_opts`` are passed through, and ``eps`` holds
+    the nocc occupied orbital energies).
     Convergence needs
     |dE| < e_tol + e_rtol |E| and rms(FPS - SPF) < d_tol. The defaults
     depend on dtype: float32 cannot resolve |dE| below a few ulp of |E|
@@ -858,6 +863,8 @@ def run_scf(
         # (X^T S is X's left inverse on the kept subspace).
         Q_occ = trnblas.gemm(1.0, X, trnblas.gemm(1.0, S, C_occ), transA=True)
     purify_steps = []
+    sub_state = None
+    sub_info = []
     sync()
     setup["guess"] = 1e3 * (time.perf_counter() - t0)
 
@@ -915,6 +922,13 @@ def run_scf(
             Q_occ, k = purify_occupied(0.5 * (Fp + Fp.T), nocc, Q_occ)
             purify_steps.append(k)
             C_occ = trnblas.gemm(1.0, X, Q_occ)
+        elif solver == "subspace":
+            Fp = trnblas.gemm(1.0, X, trnblas.gemm(1.0, F_use, X), transA=True)
+            eps, Q_occ, sub_state = trnsolver.occupied_subspace(
+                0.5 * (Fp + Fp.T), nocc, guess=sub_state, **(subspace_opts or {})
+            )
+            sub_info.append((sub_state.degree, sub_state.passes))
+            C_occ = trnblas.gemm(1.0, X, Q_occ.contiguous())
         else:
             eps, C = solve(F_use)
             C_occ = C[:, :nocc].contiguous()
@@ -948,6 +962,7 @@ def run_scf(
             "nocc": nocc,
             "rank": n if solver == "generalized" else orth_res.rank,
             "purify_steps": purify_steps,
+            "subspace": sub_info,
         },
     )
 
@@ -1012,7 +1027,9 @@ def main():
     ap.add_argument("--system", default="h2-lattice:4")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dtype", default="float32", choices=("float32", "float64"))
-    ap.add_argument("--solver", default="orth", choices=("orth", "generalized", "purify"))
+    ap.add_argument(
+        "--solver", default="orth", choices=("orth", "generalized", "purify", "subspace")
+    )
     ap.add_argument("--orth", default="symmetric", choices=("symmetric", "canonical", "cholesky"))
     ap.add_argument("--lindep", type=float, default=1e-7)
     ap.add_argument("--no-diis", action="store_true")

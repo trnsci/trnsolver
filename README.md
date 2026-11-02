@@ -155,7 +155,7 @@ python scripts/bench_scf.py --systems pyscf:alkane20 --modes cpu,neuron,neuron-n
 
 | Category | Shipped (v0.20.0) | Deferred |
 |----------|-------------------|----------|
-| Eigensolvers | `eigh`, `eigh_generalized`, `eigh_randomized` | — |
+| Eigensolvers | `eigh`, `eigh_generalized`, `eigh_randomized`, `occupied_subspace` | — |
 | Orthogonalizers | `orthogonalizer` (symmetric, canonical, pivoted Cholesky) | — |
 | Factorizations | `cholesky`, `lu`, `qr`, `svd`, `pinv`, `schur` | — |
 | Direct solvers | `solve`, `solve_spd`, `inv_spd`, `inv_sqrt_spd`, `inv_sqrt_spd_ns` | — |
@@ -191,6 +191,7 @@ python scripts/bench_scf.py --systems pyscf:alkane20 --modes cpu,neuron,neuron-n
 | Eigen | `eigh_generalized` | Generalized: `Ax = λBx` via Cholesky reduction, or via a precomputed `X=` |
 | Eigen | `orthogonalizer` | X with XᵀSX = I on S's kept subspace: Löwdin, canonical or pivoted Cholesky, dropping near-linear dependencies |
 | Eigen | `eigh_randomized` | Randomized: k dominant eigenpairs, O(n²k), sRR |
+| Eigen | `occupied_subspace` | Lowest k eigenpairs for SCF: warm-started Chebyshev-filtered subspace iteration, one NKI launch per pass (F resident in SBUF) |
 | Factor | `cholesky` | `A = LL^T` |
 | Factor | `lu` | `A = PLU` |
 | Factor | `qr` | `A = QR` |
