@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`scripts/bench_scf_ladder.py`: a DF-RHF + DF-MP2 size ladder (#15).**
+  - **Systems.** Linear alkanes C_k H_{2k+2} and k-water clusters, both
+    synthetic geometries, in cc-pVDZ, aug-cc-pVDZ and cc-pVTZ with
+    -jkfit. k is picked for each basis to land nearest 500, 1000, 1658
+    (C40H82 / aug-cc-pVDZ), 2500 and 3500 AOs, which gives 30 systems.
+  - **`--dry-run`** computes no integrals. Per system it gives:
+    - sizes, the fp32 B, PySCF's in-core build memory and B_ia;
+    - logical cores and chips needed to hold B resident (20 GB per 24 GiB
+      core);
+    - the window plan: trn2.3xlarge resident, trn2.3xlarge streaming from
+      host RAM or NVMe, or trn2.48xlarge resident on N chips;
+    - rough per-iteration and MP2 times, scaled from the window-3
+      measurements.
+  - **Otherwise** each system up to `--max-nao` runs end to end:
+    - the out-of-core build (time, peak RSS);
+    - the fp32 SCF (noise-aware convergence; `--solver auto` picks
+      `subspace` with `refresh=None` above 1200 AOs, as window 3 found);
+    - the float64 E_HF at the SCF orbitals and DF-MP2;
+    - PySCF DF-RHF + DF-MP2 on the same jkfit basis, with a matched
+      linear-dependency threshold, up to `--ref-max-nao`.
+  - Output is a `RESULT` JSON line per system and a markdown table.
+    `--out` saves the rows.
+
 - **`examples/scf_df_mp2.py`: DF-MP2 on top of the converged DF-RHF (#15).**
   - `canonical_orbitals` builds one Fock matrix at the SCF's occupied orbitals
     (streamed J/K, float64 on the host by default) and diagonalises it in the

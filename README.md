@@ -118,6 +118,7 @@ python examples/scf_df_rhf.py --system h2-lattice:16
 python scripts/bench_scf.py --systems h2-lattice:16 --modes cpu,cpu64
 python scripts/bench_scf.py --systems pyscf:alkane20 --modes cpu,neuron,neuron-nosync   # on Trn2
 python examples/scf_df_mp2.py --system pyscf:water --reference   # DF-MP2 on the converged SCF
+python scripts/bench_scf_ladder.py --dry-run   # 500-3500 AO ladder: memory, cores / chips, window plan
 ```
 
 ## Status
