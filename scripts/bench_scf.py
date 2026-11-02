@@ -92,6 +92,7 @@ def _run_mode(system: System, mode: str, args):
         k_cache_gb=args.k_cache_gb,
         jk_square=args.jk_square,
         jk_fused={"auto": None, "fused": True, "unpack": False}[args.jk_k],
+        jk_host_pack={"auto": None, "on": True, "off": False}[args.host_pack],
     )
     if mode in ("cpu", "cpu64"):
         _set_backends("pytorch")
@@ -315,6 +316,12 @@ def main() -> None:
         choices=("auto", "fused", "unpack"),
         help="K build: trntensor.df_exchange from packed rows (fused), the unpack + einsum "
         "+ syrk blocks (unpack), or fused on a device when available (auto)",
+    )
+    ap.add_argument(
+        "--host-pack",
+        default="auto",
+        choices=("auto", "on", "off"),
+        help="pack P / unpack J on the host (auto: off the CPU above 1e6 pairs, #87)",
     )
     ap.add_argument("--cache-dir", default=None, help="cache built systems as .pt files")
     ap.add_argument(

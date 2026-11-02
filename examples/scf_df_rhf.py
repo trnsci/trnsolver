@@ -57,6 +57,13 @@ import torch
 
 STAGES = ("jk", "fock", "diis", "eigh", "density", "energy")
 
+# Above this many packed pairs, DFJK packs P and unpacks J on the host
+# (trnsolver#87). On a NeuronCore each is one gather with npair / n^2
+# indices; at n_ao = 1658 (npair 1.4e6) their compiles ran for over 40 min
+# each, while the host path is an 11 MB copy each way (a few ms, against a
+# 330 ms J/K stage).
+HOST_PACK_NPAIR = 1_000_000
+
 
 # ---------------------------------------------------------------------------
 # Systems
@@ -421,6 +428,10 @@ class DFJK:
     cores run concurrently. One Python thread issues it all: at n_ao = 970
     the J/K stage went 213 -> 139 ms on 1 -> 4 logical cores with resident
     squares (Trn2, #15).
+
+    ``host_pack`` packs P (n^2 -> npair) and unpacks J (npair -> n^2) on
+    the host instead of with device gathers. The default (``None``) does so
+    off the CPU when npair exceeds :data:`HOST_PACK_NPAIR` (#87).
     """
 
     def __init__(
@@ -434,6 +445,7 @@ class DFJK:
         devices=None,
         square: bool = False,
         fused: bool | None = None,
+        host_pack: bool | None = None,
     ):
         import trntensor
 
@@ -453,9 +465,14 @@ class DFJK:
         w = torch.full((npair,), 2.0, dtype=dtype)
         r = torch.tril_indices(n, n)
         w[r[0] == r[1]] = 1.0
-        self.tril = tril.to(self.device)
-        self.pair_w = w.to(self.device)
-        self.sym = _sym_to_packed_index(n).to(self.device)
+        if host_pack is None:
+            host_pack = self.device.type != "cpu" and npair > HOST_PACK_NPAIR
+        self.host_pack = bool(host_pack)
+        # The gather indices live where the gathers run.
+        idx_dev = torch.device("cpu") if self.host_pack else self.device
+        self.tril = tril.to(idx_dev)
+        self.pair_w = w.to(idx_dev)
+        self.sym = _sym_to_packed_index(n).to(idx_dev)
         full_bytes = n * n * naux * torch.finfo(dtype).bits // 8
         if k_block is None and self.fused:
             # No square is ever built: one block per device. Without
@@ -496,12 +513,27 @@ class DFJK:
         h = x.cpu()
         return {d: (x if d == x.device else h.to(d)) for d in self.devices}
 
-    def _gather(self, parts: dict) -> torch.Tensor:
-        """Sum of per-device partial results, on the primary device."""
+    def _gather(self, parts: dict, host: bool = False) -> torch.Tensor:
+        """Sum of per-device partial results, on the primary device (or the host)."""
+        dest = torch.device("cpu") if host else self.device
         if len(parts) == 1:
-            return next(iter(parts.values()))
-        host = [t.cpu() for t in parts.values()]
-        return torch.stack(host).sum(0).to(self.device)
+            return next(iter(parts.values())).to(dest)
+        vals = [t.cpu() for t in parts.values()]
+        return torch.stack(vals).sum(0).to(dest)
+
+    def _pack_p(self, P: torch.Tensor) -> dict:
+        """Weighted packed density on every device (packed on the host with ``host_pack``)."""
+        if self.host_pack:
+            p = P.cpu().reshape(-1).index_select(0, self.tril) * self.pair_w
+            return {d: p.to(d) for d in self.devices}
+        return self._scatter(P.reshape(-1).index_select(0, self.tril) * self.pair_w)
+
+    def _unpack_j(self, parts: dict) -> torch.Tensor:
+        """Symmetric J from per-device packed partials (unpacked on the host with ``host_pack``)."""
+        if self.host_pack:
+            jp = self._gather(parts, host=True)
+            return jp.index_select(0, self.sym).reshape(self.n, self.n).to(self.device)
+        return self._gather(parts).index_select(0, self.sym).reshape(self.n, self.n)
 
     def j(self, P: torch.Tensor) -> torch.Tensor:
         import trnblas
@@ -516,21 +548,19 @@ class DFJK:
                 jb = trnblas.gemv(1.0, Bm, d)
                 parts[B3.device] = jb if B3.device not in parts else parts[B3.device] + jb
             return self._gather(parts).reshape(self.n, self.n)
-        p = P.reshape(-1).index_select(0, self.tril) * self.pair_w
-        ps = self._scatter(p)
+        ps = self._pack_p(P)
         parts = {}
         if self.fused and hasattr(trntensor, "df_coulomb"):
             # trntensor#60: d and J each stream a block once (packed in, packed out).
             for Bb in self.blocks:
                 jb = trntensor.df_coulomb(Bb, ps[Bb.device])
                 parts[Bb.device] = jb if Bb.device not in parts else parts[Bb.device] + jb
-            return self._gather(parts).index_select(0, self.sym).reshape(self.n, self.n)
+            return self._unpack_j(parts)
         for Bb in self.blocks:
             d = trnblas.gemv(1.0, Bb, ps[Bb.device], trans=True)  # (nq,)
             jb = trnblas.gemv(1.0, Bb, d)  # (npair,)
             parts[Bb.device] = jb if Bb.device not in parts else parts[Bb.device] + jb
-        jp = self._gather(parts)
-        return jp.index_select(0, self.sym).reshape(self.n, self.n)
+        return self._unpack_j(parts)
 
     def k(self, C_occ: torch.Tensor) -> torch.Tensor:
         """K for P = 2 C_occ C_occ^T: K = 2 sum_{iQ} Y_{m,iQ} Y_{n,iQ}."""
@@ -776,6 +806,7 @@ def run_scf(
     jk_devices=None,
     jk_square: bool = False,
     jk_fused: bool | None = None,
+    jk_host_pack: bool | None = None,
     subspace_opts: dict | None = None,
     verbose: bool = False,
 ) -> SCFResult:
@@ -808,7 +839,9 @@ def run_scf(
     ``jk_devices`` splits the J/K build over several NeuronCores,
     ``jk_square`` keeps the unpacked integrals resident and ``jk_fused``
     picks the fused packed-integral K (:class:`DFJK`; default: on a neuron
-    device when trntensor has ``df_exchange``); everything else stays on
+    device when trntensor has ``df_exchange``) and ``jk_host_pack`` packs
+    P / unpacks J on the host (default: off the CPU above
+    :data:`HOST_PACK_NPAIR` pairs, #87); everything else stays on
     ``device``.
     """
     import trnblas
@@ -843,6 +876,7 @@ def run_scf(
         devices=jk_devices,
         square=jk_square,
         fused=jk_fused,
+        host_pack=jk_host_pack,
     )
     sync()
     setup["upload"] = 1e3 * (time.perf_counter() - t0)
@@ -957,6 +991,7 @@ def run_scf(
         eps=eps.detach().to("cpu", torch.float64),
         info={
             "k_block": jk.k_block,
+            "host_pack": jk.host_pack,
             "naux": system.naux,
             "nao": n,
             "nocc": nocc,

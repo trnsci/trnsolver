@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`examples/scf_df_rhf.py`: `DFJK` packs P and unpacks J on the host above
+  1e6 pairs (#87).** At n_ao = 1658 (npair 1.4e6) the two device gathers in
+  `DFJK.j` (`index_select` with npair and n² indices) compiled for over
+  40 min each, so window 3 patched them out in the driver. Now
+  `DFJK(host_pack=None)` (and `run_scf(jk_host_pack=...)`,
+  `bench_scf.py --host-pack auto|on|off`) does that by default off the CPU
+  when npair > `HOST_PACK_NPAIR` = 1e6: an 11 MB copy each way per iteration
+  at that size. The J values are bit-identical to the device-gather path
+  (CPU test).
+
 ### Fixed
 
 - **`cg` gave a wrong gradient with respect to `A`; `schur` detached

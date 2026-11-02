@@ -319,3 +319,35 @@ def test_make_system_basis_suffix(monkeypatch):
     monkeypatch.setattr(scf, "pyscf_system", fake)
     scf.make_system("pyscf:benzene@aug-cc-pvdz")
     assert seen == {"name": "benzene", "basis": "aug-cc-pvdz", "auxbasis": "aug-cc-pvdz-jkfit"}
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("devices", [None, ["cpu", "cpu"]])
+def test_host_pack_matches_device_pack(fused, devices):
+    """#87: packing P and unpacking J on the host gives the device-gather J."""
+    trntensor = pytest.importorskip("trntensor")
+    if fused and not hasattr(trntensor, "df_coulomb"):
+        pytest.skip("trntensor without df_coulomb")
+    system = scf.h2_lattice(2)
+    n = system.nao
+    g = torch.Generator().manual_seed(6)
+    C = torch.randn(n, system.nocc, generator=g, dtype=torch.float64)
+    P = 2 * C @ C.T
+    kw = dict(k_cache_bytes=0, k_block=7, fused=fused, devices=devices)
+    dev = scf.DFJK(system.B, n, host_pack=False, **kw)
+    host = scf.DFJK(system.B, n, host_pack=True, **kw)
+    assert host.host_pack and not dev.host_pack and host.tril.device.type == "cpu"
+    torch.testing.assert_close(host.j(P), dev.j(P), rtol=0, atol=0)
+    # Default: on the CPU the gathers stay where they are.
+    assert not scf.DFJK(system.B, n).host_pack
+
+
+def test_host_pack_default_threshold(monkeypatch):
+    system = scf.h2_lattice(2)
+    monkeypatch.setattr(scf, "HOST_PACK_NPAIR", 10)
+    # Still off on the CPU: there is no device gather to avoid.
+    assert not scf.DFJK(system.B, system.nao).host_pack
+    res = scf.run_scf(system, dtype=torch.float64, jk_host_pack=True)
+    base = scf.run_scf(system, dtype=torch.float64)
+    assert res.info["host_pack"] and not base.info["host_pack"]
+    assert res.energy == pytest.approx(base.energy, abs=1e-12)
