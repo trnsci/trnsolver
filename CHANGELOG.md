@@ -154,6 +154,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cg` dropped the imaginary part of complex input (#100).** Its inner
+  products were `float(u.dot(v))`: unconjugated, and cast to real, so a
+  complex Hermitian positive definite system iterated on the wrong
+  quantities and returned a wrong `x` (or ran to `maxiter`) with only a
+  UserWarning. A complex `A` with a real `b` also lost `A`'s imaginary
+  part. `cg` now uses conjugated inner products `r^H z`, `p^H A p`
+  (accumulated in complex128 / float64) and promotes a real `b` to complex
+  for a complex `A`. Real input is unchanged. Affected: every release
+  through 0.21.0.
 - **`eigh(method="jacobi")` raised on complex and 0×0 input; `solve_spd`
   raised on a batch of vector right-hand sides (#79).** Jacobi is real-only:
   complex Hermitian input (`NotImplementedError: "ge_cpu"`) now takes the
