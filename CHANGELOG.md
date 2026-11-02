@@ -58,6 +58,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     run (h2-lattice:16/32, benzene/cc-pVDZ). With ±3e-5 Eh of injected
     energy jitter the energy test never stops and the density test does
     (test).
+  - Both norms are taken in the orthonormal basis of the kept subspace,
+    `Xᵀ(FPS − SPF)X` and `XᵀS dP S X`. In the AO basis, with functions dropped
+    by the orthogonalizer, the commutator keeps a floor along the dropped
+    directions: 4.7e-7 at a converged float64 C12H26 / aug-cc-pVDZ
+    (canonical 1e-6), which never passed the float64 1e-7 test and ran to
+    `max_iter`. In fp32, X's 1/sqrt(s_min) amplified the AO dP noise to
+    4e-5. Now that system converges in 33 iterations in float64.
+  - The commutator threshold is noise-aware too:
+    max(`d_tol`, `d_noise_mult` · σ_d) with σ_d = ε max|F| max|X|. The fp32
+    floor there is 1.3e-4 against σ_d = 1.2e-4, and the float64 energy at
+    those orbitals is 4e-5 Eh above fp64. That is the fp32 conditioning
+    limit window 3 met at n_ao 1658.
   - `info["history"]` holds per-iteration `dE`, `err_rms` and `dp_rms`;
     `info["e_noise"]` the last σ_E. `--conv` on the example and
     `bench_scf.py`.
