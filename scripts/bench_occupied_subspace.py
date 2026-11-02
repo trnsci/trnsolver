@@ -15,7 +15,10 @@ d_t = d_0 * shrink^t, then times, warm, median of ``--reps``:
     kernel     one subspace_filter_kernel launch alone (degree --degree)
 
 and the breakdown of one pass: kernel, D2H of the Gram blocks, the float64
-host Rayleigh-Ritz, and the block update on device. Accuracy columns are
+host Rayleigh-Ritz (``rr_full_ms``: all 2 kb pairs by eigendecompositions;
+``rr_ms``: the lowest kb, as the driver does), and the block update on
+device (which the driver folds into the next launch except after the last
+pass; ``TRNSOLVER_SUBSPACE_FOLD=0`` turns that off). Accuracy columns are
 against float64 eigh of F_t: ``proj`` = |V V^T - U_k U_k^T|_2 (occupied
 projector), ``eig`` = max |w - w_ref| / |w_ref|_max, ``orth`` =
 |V^T V - I|_max.
@@ -106,7 +109,15 @@ def bench_one(n, k, args, passes, dev, sync, SK):
         states = [st]
         for t in range(1, len(Fd)):
             res = trnsolver.occupied_subspace(
-                Fd[t], k, guess=st, passes=p, degree=args.degree, refresh=None
+                Fd[t],
+                k,
+                guess=st,
+                passes=p,
+                degree=args.degree,
+                refresh=None,
+                tol=None,
+                rtol=None,
+                **args.opts,
             )
             st = res.state
             states.append(st)
@@ -115,7 +126,15 @@ def bench_one(n, k, args, passes, dev, sync, SK):
 
         def call(prev=prev, p=p):
             out = trnsolver.occupied_subspace(
-                Fd[-1], k, guess=prev, passes=p, degree=args.degree, refresh=None
+                Fd[-1],
+                k,
+                guess=prev,
+                passes=p,
+                degree=args.degree,
+                refresh=None,
+                tol=None,
+                rtol=None,
+                **args.opts,
             )
             return out.eigenvectors
 
@@ -133,8 +152,11 @@ def bench_one(n, k, args, passes, dev, sync, SK):
         r["d2h_ms"] = median_ms(lambda: out[n:].to("cpu", torch.float64), args.reps, sync)
         small = out[n:].to("cpu", torch.float64)
         G, H, _ = SS.unpack_grams(small, kb)
-        r["rr_ms"] = median_ms(lambda: SS.rayleigh_ritz(G, H, kb=kb), args.reps, lambda: None)
-        _, Q = SS.rayleigh_ritz(G, H, kb=kb)
+        r["rr_full_ms"] = median_ms(lambda: SS.rayleigh_ritz(G, H, kb=kb), args.reps, lambda: None)
+        r["rr_ms"] = median_ms(
+            lambda: SS.rayleigh_ritz(G, H, kb=kb, nwant=kb), args.reps, lambda: None
+        )
+        _, Q = SS.rayleigh_ritz(G, H, kb=kb, nwant=kb)
         Qd = Q[:, :kb].to(dev, torch.float32)
         r["update_ms"] = median_ms(lambda: X @ Qd[:kb] + out[:n] @ Qd[kb:], args.reps, sync)
         r["gershgorin_ms"] = median_ms(lambda: SS._gershgorin_upper(Fd[-1]), args.reps, sync)
@@ -153,7 +175,13 @@ def main() -> None:
     ap.add_argument("--shrink", type=float, default=0.6)
     ap.add_argument("--device", default="neuron")
     ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument(
+        "--opts",
+        default="{}",
+        help="JSON keyword arguments for occupied_subspace, e.g. '{\"lock\": null}'",
+    )
     args = ap.parse_args()
+    args.opts = json.loads(args.opts)
     if args.threads:
         torch.set_num_threads(args.threads)
 
@@ -184,7 +212,7 @@ def main() -> None:
     cols = ["n", "k", "kb", "host_ms", "aten_ms"]
     for p in passes:
         cols += [f"sub{p}_ms", f"sub{p}_proj"]
-    cols += ["kernel_ms", "d2h_ms", "rr_ms", "update_ms", "gershgorin_ms"]
+    cols += ["kernel_ms", "d2h_ms", "rr_full_ms", "rr_ms", "update_ms", "gershgorin_ms"]
     print("\n| " + " | ".join(cols) + " |")
     print("|" + "---|" * len(cols))
     for r in rows:

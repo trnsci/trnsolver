@@ -78,26 +78,45 @@ C20H42/aug-cc-pVDZ (n = 838, smallest eigenvalue 4.1e-7) is milder. At lindep 1e
 
 Householder tridiagonalization is n − 2 dependent BLAS-2 steps and leaves the Tensor Engine idle (#48). A parallel-ordered Jacobi step rotates n/2 disjoint pairs at once, so a batch of matrices advances in lockstep with no long dependency chain. In the kernel the Tensor Engine applies the step's partner permutation (an exact matmul shared by every tile) and the Vector Engine applies the rotations. For measurements see #48; the fair CPU baseline splits the batch across the same threads, which is 1.6–5.8× faster than one batched `torch.linalg.eigh` call (#54, v0.19.0).
 
-## `occupied_subspace(F, k, *, guess=None, buffer=None, passes=2, tol=None, degree=None, upper="gershgorin", refresh=3e-2)`
+## `occupied_subspace(F, k, *, guess=None, buffer=None, passes=4, tol="auto", rtol=0.1, degree=None, upper="gershgorin", refresh=None)`
 
 Lowest `k` eigenpairs of a symmetric `F` for SCF, where `F` changes little between calls. Returns `(eigenvalues (k,), eigenvectors (n, k), state)`; pass `state` as `guess` on the next call.
 
 - `guess=None` is a cold start: one full float64 host `eigh`, returned exactly.
 - With a warm start, each pass runs a degree-8 scaled Chebyshev filter `Y = p(F) X` on a block of `kb = k + buffer` vectors (`buffer` defaults to about 15%, at least 8), splits off the correction `E = Y - X XᵀY`, and does a float64 Rayleigh-Ritz on `span[X, E]` on the host.
-- For FP32 `F` on the native `neuron` device, one pass is one NKI launch (`trnsolver/nki/subspace.py`, n·kb ≤ about 1024 × 512). `F` stays resident in SBUF, the filter is Tensor Engine GEMMs, and only the six kb × kb Gram blocks reach the host. Elsewhere the same arithmetic runs as PyTorch (`subspace.filter_reference`).
-- `refresh`: when the first pass finds the block far from `F` (relative residual above `refresh`, as in the first SCF iterations), the call returns a full `eigh` instead.
-- `tol`: stop early once the wanted residuals are below `tol` relative to the spectral scale.
+- The Rayleigh-Ritz keeps only the lowest `kb` of the `2 kb` Ritz pairs. When the unit-diagonal Gram of `[X, E]` is well conditioned (its smallest eigenvalue, bounded below by `1 / ‖L⁻¹‖²_F`, is above the drop threshold), one Cholesky reduces the pencil to a standard problem, which needs one `eigh` instead of two eigendecompositions. Otherwise it takes the rank-revealing path, which drops dependent correction columns.
+- For FP32 `F` on the native `neuron` device, one pass is one NKI launch (`trnsolver/nki/subspace.py`, n·kb ≤ about 1024 × 512). `F` stays resident in SBUF, the filter is Tensor Engine GEMMs, and only the six kb × kb Gram blocks reach the host.
+  - Each launch after a call's first one starts by applying the previous pass's block update, `X ← [X, E] Q`, on chip (`subspace_step_kernel`). `Q` arrives in the same host-to-device copy as the filter's scalars.
+  - Only the last pass's update runs as device ops. `TRNSOLVER_SUBSPACE_FOLD=0` turns the folding off.
+  - Elsewhere the same arithmetic runs as PyTorch (`subspace.filter_reference`, `subspace.step_reference`).
+- The number of passes adapts to how far `F` moved:
+  - `rtol`: stop once the wanted residuals of the block entering a pass have dropped to `rtol` times those the call started with. Early SCF iterations take up to `passes` passes, and late ones take one Rayleigh-Ritz.
+  - `tol`: stop once they are below `tol` relative to the spectral scale. `"auto"` is 30 units of `F`'s rounding (3.6e-6 for FP32), the residual's noise floor. A converged SCF then gets the same orbitals back, so an FP32 energy test can see two identical energies in a row.
+  - `refresh` (default off): return a full `eigh` when the first residual is above `refresh`.
 - `upper`: the spectral upper bound for the filter: Gershgorin (default), `"cached"`, or a number.
 
 The correction form matters in FP32. The filter grows core levels far below the HOMO much faster than the HOMO itself, and a Rayleigh-Ritz on `YᵀY` loses the HOMO. Degrees above about 12 lose accuracy even in the correction form, so the default is 8.
 
 `examples/scf_df_rhf.py --solver subspace` uses it on `XᵀFX`.
 
-Measured on Trn2 (one logical NeuronCore, host pinned to 2 CPUs; #78):
+Measured on Trn2 (one logical NeuronCore, host pinned to 2 CPUs, `GOMP_SPINCOUNT=10000`; #78, #85, #86):
 
-- **Per call, default 2 passes, n = 250 / 490 / 970:** 13 / 16 / 44 ms, against 3.8 / 12.6 / 68 ms for aten `eigh` on the device tensor. With one pass it is 4.5 / 7.9 / 21 ms.
-- **Where the time goes:** the kernel takes 0.5–0.7 ms per pass. The float64 host Rayleigh-Ritz takes 1.2 / 3.5 / 16 ms per pass, and the rest is the per-pass host round trip.
-- **Host threads:** when the host threads share CPUs with the Neuron runtime, libgomp's default spin-wait after each host LAPACK call delays the next device operations by up to about 4 ms. `GOMP_SPINCOUNT=10000` removes that delay without slowing LAPACK: the per-call times become 7.8 / 12 / 40 ms. `OMP_WAIT_POLICY=PASSIVE` also removes it, but slows LAPACK.
-- **DF-RHF time to convergence:** the full `eigh` was faster at every size measured (n_ao = 114–970).
-  - At n_ao = 970 the default `refresh` turned 14 of 18 solves into full `eigh`s.
-  - With `refresh=None` the eigh stage drops from 74 to 44 ms, but the SCF needs 26 iterations instead of 17.
+- **Per call, fixed passes, n = 250 / 490 / 970** (`scripts/bench_occupied_subspace.py`, `tol=None, rtol=None`):
+  - 2 passes: 5.6 / 9.3 / 34 ms, against 3.8 / 11.4 / 67 ms for aten `eigh` on the device tensor (7.8 / 12 / 40 ms before #86);
+  - 1 pass: 3.6 / 5.4 / 18 ms.
+- **Where the time goes:** the kernel takes 0.4–0.7 ms per pass. The host Rayleigh-Ritz takes 0.9 / 2.9 / 14 ms per pass, against 1.2 / 3.6 / 16 ms for the two-eigendecomposition path. At n = 970 it is one float64 `eigh` of the 372-wide reduced matrix. SciPy's subset driver (`syevr`) was 3.5× slower than the full MKL `eigh` on these threads, so it is not used.
+- **Accuracy is unchanged:** after 2 passes the projector error is 1.4e-5 / 2.5e-5 / 6.0e-5, eigenvalues are within 1.2e-7 relative, and orthogonality is within 2.5e-7.
+- **Host threads:** when the host threads share CPUs with the Neuron runtime, libgomp's default spin-wait after each host LAPACK call delays the next device operations by up to about 4 ms. `GOMP_SPINCOUNT=10000` removes that delay without slowing LAPACK. `OMP_WAIT_POLICY=PASSIVE` also removes it, but slows LAPACK.
+- **DF-RHF time to convergence** (`bench_scf.py`, `neuron-nosync`, with the defaults above):
+
+  | system | n_ao | full `eigh`: iterations, ms | `occupied_subspace`: iterations, ms |
+  |---|---|---|---|
+  | benzene | 114 | 11, 106 | 11, 128 |
+  | C10H22 | 250 | 14, 191 | 14, 220 |
+  | C20H42 | 490 | 16, 573 | 15, 520 |
+  | C40H82 | 970 | 17, 3495 | 18, 3616 |
+
+  - The eigh stage at n_ao = 490 / 970 drops from 12.1 / 62.5 to 8.8 / 42.2 ms.
+  - No call after the cold start is a full `eigh`. The earlier `passes=2, refresh=3e-2` took 22 iterations and 5.6 s at n_ao = 970.
+  - Below n_ao ≈ 300 the fixed per-call cost loses to aten `eigh`.
+  - The FP32 energy test is at its noise floor at n_ao = 970: successive energies differ by 4 ulp (4.9e-4 Eh), against a threshold of 3.1e-4 Eh. Iteration counts there vary by ±3 between nearby settings.

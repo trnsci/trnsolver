@@ -297,6 +297,7 @@ KERNEL_DTYPES: dict[str, tuple[torch.dtype, ...]] = {
     "jacobi_sweeps": _F32,
     "jacobi_block": _F32,
     "subspace_filter": _F32,
+    "subspace_step": _F32,
 }
 # The simulator takes numpy arrays, and BF16 has no numpy dtype: the
 # matmul_fp32out simulator variant gets FP32.
@@ -330,38 +331,84 @@ def kernel_takes(dtype: torch.dtype, *ops: str) -> bool:
     return all(dtype in KERNEL_DTYPES[op] for op in ops)
 
 
+# Ops already warned about float64 running at fp32 under backend "nki".
+_WARNED_FP32: set[str] = set()
+
+
+def _no_kernel_for_dtype(what: str, dtypes, ops: tuple[str, ...]) -> NotImplementedError:
+    """The ``TRNSOLVER_REQUIRE_NKI=1`` error for operands no kernel takes (trnblas#69)."""
+    dts = _dtype_names(sorted({str(d) for d in dtypes}))
+    allowed = _dtype_names(KERNEL_DTYPES[ops[0]])
+    return NotImplementedError(
+        f"trnsolver {what}: the NKI kernels take {allowed}, got {dts}. "
+        "Unset TRNSOLVER_REQUIRE_NKI to compute in torch."
+    )
+
+
+def _warn_fp32_once(what: str) -> None:
+    """One UserWarning per op: float64 computed by the FP32 kernels."""
+    if what in _WARNED_FP32:
+        return
+    _WARNED_FP32.add(what)
+    warnings.warn(
+        f"trnsolver {what}: backend 'nki' runs float64 input through the FP32 NKI "
+        "kernels; precision is reduced to fp32 (the result is float64). Use "
+        "backend 'auto' or 'pytorch' for float64 accuracy.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
+def _kernel_dtype(dtype: torch.dtype, ops: tuple[str, ...], what: str) -> torch.dtype | None:
+    """The dtype to hand the kernels ``ops`` for a ``dtype`` operand, or None: torch.
+
+    Call it only where an FP32 operand would run the kernels. The float64
+    policy (trnsolver#89, trnsci/trnsci#35):
+
+    - ``TRNSOLVER_REQUIRE_NKI=1``: NotImplementedError (takes precedence);
+    - backend ``"nki"``: float32, with one UserWarning per op (fp32 precision);
+    - backend ``"auto"``: None, so the caller computes in torch at float64.
+
+    float16 / bfloat16 go to float32 (lossless). Integer, bool and complex
+    give None (torch, which returns or raises what the pytorch backend does),
+    or NotImplementedError under ``TRNSOLVER_REQUIRE_NKI=1``.
+    """
+    if kernel_takes(dtype, *ops):
+        return dtype
+    fp32_ok = kernel_takes(torch.float32, *ops)
+    if fp32_ok and dtype in (torch.float16, torch.bfloat16):
+        return torch.float32
+    if _REQUIRE_NKI:
+        raise _no_kernel_for_dtype(what, (dtype,), ops)
+    if fp32_ok and dtype == torch.float64 and _backend == "nki":
+        _warn_fp32_once(what)
+        return torch.float32
+    return None
+
+
 def _kernel_operands(
-    *tensors: torch.Tensor, ops: tuple[str, ...], what: str, cast_fp64: bool = False
+    *tensors: torch.Tensor, ops: tuple[str, ...], what: str
 ) -> list[torch.Tensor] | None:
     """The operands to hand the kernels ``ops``, or None: compute in torch.
 
-    - every dtype taken by all of ``ops``: the tensors, unchanged;
-    - float16 / bfloat16 for an FP32 kernel: cast to float32 (lossless);
-    - float64 with ``cast_fp64``: cast to float32 (precision is fp32);
-    - anything else (float64, integer, bool, complex): None, so the caller
-      runs torch and returns what the pytorch backend returns. Under
-      ``TRNSOLVER_REQUIRE_NKI=1`` this raises NotImplementedError instead,
-      as trnblas does (trnblas#69).
+    Each operand follows :func:`_kernel_dtype`; None if any operand goes to
+    torch. Under ``TRNSOLVER_REQUIRE_NKI=1`` an operand no kernel takes
+    raises NotImplementedError naming all the operand dtypes.
 
-    The caller casts the kernel result back to the caller's dtype.
+    The caller casts the kernel result to the pytorch backend's dtype.
     """
+    if _REQUIRE_NKI and not all(
+        kernel_takes(t.dtype, *ops)
+        or (kernel_takes(torch.float32, *ops) and t.dtype in (torch.float16, torch.bfloat16))
+        for t in tensors
+    ):
+        raise _no_kernel_for_dtype(what, [t.dtype for t in tensors], ops)
     out = []
     for t in tensors:
-        if kernel_takes(t.dtype, *ops):
-            out.append(t)
-        elif kernel_takes(torch.float32, *ops) and (
-            t.dtype in (torch.float16, torch.bfloat16) or (cast_fp64 and t.dtype == torch.float64)
-        ):
-            out.append(t.float())
-        else:
-            if _REQUIRE_NKI:
-                dts = _dtype_names(sorted({str(x.dtype) for x in tensors}))
-                allowed = _dtype_names(KERNEL_DTYPES[ops[0]])
-                raise NotImplementedError(
-                    f"trnsolver {what}: the NKI kernels take {allowed}, got {dts}. "
-                    "Unset TRNSOLVER_REQUIRE_NKI to compute in torch."
-                )
+        dt = _kernel_dtype(t.dtype, ops, what)
+        if dt is None:
             return None
+        out.append(t if dt == t.dtype else t.to(dt))
     return out
 
 

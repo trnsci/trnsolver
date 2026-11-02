@@ -18,11 +18,39 @@ Returns the current backend string.
 
 Module-level boolean — `True` iff the `nki` package (NKI 0.3.0 Stable, Neuron SDK 2.29+) imported successfully.
 
+## Precision and dtypes
+
+Every trnsolver kernel computes in FP32 (`matmul_fp32out`: BF16 in, FP32
+out), and Trainium computes float64 at FP32 precision on device. float64
+input follows one rule wherever an FP32 input would run a kernel (`eigh` on
+the Householder path and `eigh_generalized` through it, `eigh_randomized`,
+`eigh(method="jacobi")`, the auto Jacobi region, `occupied_subspace`):
+
+| mode | float64 input |
+|------|---------------|
+| backend `"auto"` | computes in torch (aten on the input's device, or host LAPACK) at float64 accuracy; no kernel runs |
+| backend `"nki"` | cast to FP32 for the kernels, result returned as float64; one `UserWarning` per op (on its first call) says precision is reduced to fp32 |
+| `TRNSOLVER_REQUIRE_NKI=1` | raises `NotImplementedError` (either backend; takes precedence over the cast) |
+
+- **Result dtype** always matches what the pytorch backend returns for the
+  same inputs: float32, float64, bfloat16 and float16 (computed in FP32 and
+  cast back), and mixed-dtype operands (`torch.promote_types` rules, e.g.
+  `eigh_generalized` takes A's dtype).
+- Integer and bool input takes torch, which raises as the pytorch backend
+  does (`NotImplementedError` under `TRNSOLVER_REQUIRE_NKI=1`).
+- trnsolver has no complex kernels: complex64 / complex128 input takes aten
+  or torch on every backend.
+- Paths where FP32 input does not run a kernel either (the `eigh` aten
+  cutover below `TRNSOLVER_EIGH_NKI_MIN_N`, Jacobi on the XLA lineage) run
+  torch for float64 too.
+
+The same rule holds across the trnsci suite (trnsci/trnsolver#89).
+
 ## Environment variables
 
 | Variable | Effect |
 |----------|--------|
-| `TRNSOLVER_REQUIRE_NKI=1` | Kernel-path failures re-raise instead of silently falling back to PyTorch. Used by the validation suite to catch silent kernel breakage. |
+| `TRNSOLVER_REQUIRE_NKI=1` | Kernel-path failures re-raise instead of silently falling back to PyTorch, and inputs no kernel takes (float64, integer, bool) raise `NotImplementedError` (see [Precision and dtypes](#precision-and-dtypes)). Used by the validation suite to catch silent kernel breakage. |
 | `TRNSOLVER_EIGH_NKI_MIN_N=<n>` | On the native `neuron` device (and for host tensors on a TorchNeuron host), `eigh` uses `torch.linalg.eigh` for matrices with fewer than `n` rows and the NKI path otherwise. The NKI path is single-tile (n ≤ 128) and falls back to `torch.linalg.eigh` above that. Default 512; `0` always uses NKI. Ignored when `TRNSOLVER_REQUIRE_NKI=1`. (#42) |
 | `TRNSOLVER_EIGH_METHOD=auto\|jacobi` | `eigh` method when `method=` is not passed. `jacobi` selects the batched Jacobi solver (#48). Default `auto`. |
 | `TRNSOLVER_JACOBI_GROUP=<g>` | Jacobi kernel: tiles per launch (rounded down to a power of two). Default 128 (n ≤ 32: scalar kernel; 33 ≤ n ≤ 128: block kernel), split across the two physical cores of a logical NeuronCore. |
@@ -46,7 +74,7 @@ detected on the first kernel launch:
   on `device="neuron"`, also callable directly and inside
   `torch.compile(backend="neuron")`: `torch.ops.trnsolver.matvec`,
   `rank2_update`, `matmul`, `matmul_fp32out`, `apply_reflectors`,
-  `jacobi_sweeps`, `jacobi_block`. The ops
+  `jacobi_sweeps`, `jacobi_block`, `subspace_filter`, `subspace_step`. The ops
   are registered only once this path is selected.
 - **XLA (Trn1)**: kernels run on the `torch_xla` device, as before.
 

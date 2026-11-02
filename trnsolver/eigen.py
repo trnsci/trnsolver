@@ -393,9 +393,11 @@ def _jacobi_auto(A: torch.Tensor) -> bool:
     """True iff ``method="auto"`` should run the Jacobi kernel for A.
 
     Only FP32 batches on the native ``neuron`` device whose (n, batch) lies
-    in `_jacobi_auto_region`, and only where the kernel can run.
+    in `_jacobi_auto_region`, and only where the kernel can run. float64
+    batches there follow :func:`_jacobi_kernel_dtype`: under backend
+    ``"auto"`` they take the default dispatch (aten eigh at float64).
     """
-    if A.device.type != _NATIVE_DEVICE_TYPE or A.dtype != torch.float32:
+    if A.device.type != _NATIVE_DEVICE_TYPE or A.dtype not in (torch.float32, torch.float64):
         return False
     if A.dim() < 3 or A.shape[-1] != A.shape[-2]:
         return False
@@ -404,7 +406,26 @@ def _jacobi_auto(A: torch.Tensor) -> bool:
     region = _jacobi_auto_region()
     if not any(lo <= n <= hi and batch >= b_min for lo, hi, b_min in region):
         return False
-    return _jacobi_device_ok(n, A.dtype)
+    return _jacobi_kernel_dtype(n, A.dtype) is not None
+
+
+_JACOBI_OPS = ("jacobi_sweeps", "jacobi_block")
+
+
+def _jacobi_kernel_dtype(n: int, dtype: torch.dtype) -> torch.dtype | None:
+    """The dtype the Jacobi kernel runs ``dtype`` input in, or None: torch Jacobi.
+
+    float32 where :func:`_jacobi_device_ok` holds. float64 there follows the
+    suite policy (#89): None (torch Jacobi at float64) under backend
+    ``"auto"``; float32 with one UserWarning under backend ``"nki"``;
+    NotImplementedError under ``TRNSOLVER_REQUIRE_NKI=1``. Other dtypes take
+    the torch Jacobi (unchanged).
+    """
+    if dtype == torch.float64 and _jacobi_device_ok(n, torch.float32):
+        from .nki.dispatch import _kernel_dtype
+
+        return _kernel_dtype(dtype, _JACOBI_OPS, "eigh(method='jacobi')")
+    return dtype if _jacobi_device_ok(n, dtype) else None
 
 
 def _jacobi_device_ok(n: int, dtype: torch.dtype) -> bool:
@@ -413,8 +434,8 @@ def _jacobi_device_ok(n: int, dtype: torch.dtype) -> bool:
 
     if not (_use_nki() and HAS_NKI and 1 <= n <= 128):
         return False
-    if not kernel_takes(dtype, "jacobi_sweeps", "jacobi_block"):
-        return False  # float64 & co take the torch Jacobi, at full precision
+    if not kernel_takes(dtype, *_JACOBI_OPS):
+        return False  # see _jacobi_kernel_dtype for float64
     if _use_simulator():
         return True
     from .nki.dispatch import _get_dispatch_path
@@ -523,34 +544,36 @@ def _jacobi_eigh(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if X.shape[0] == 0:
         w = X.new_empty((0, n))
         V = X.new_empty((0, n, n))
-    elif _jacobi_device_ok(n, X.dtype):
+    elif (kdt := _jacobi_kernel_dtype(n, X.dtype)) is not None:
+        Xk = X.to(kdt)
         try:
             from .nki.jacobi import jacobi_eigh_device, jacobi_eigh_multicore
 
-            pool_cores, parts = _jacobi_pool_split(X)
-            devices = [X.device] if pool_cores else _jacobi_devices(X)
+            pool_cores, parts = _jacobi_pool_split(Xk)
+            devices = [Xk.device] if pool_cores else _jacobi_devices(Xk)
             if pool_cores:
                 from .nki.eigh_pool import jacobi_eigh_pool
 
                 try:
-                    w, V = jacobi_eigh_pool(X, pool_cores, parts)
+                    w, V = jacobi_eigh_pool(Xk, pool_cores, parts)
                 except Exception:
                     if _REQUIRE_NKI:
                         raise
-                    w, V = jacobi_eigh_device(X)
+                    w, V = jacobi_eigh_device(Xk)
             elif len(devices) > 1:
                 try:
-                    w, V = jacobi_eigh_multicore(X, devices)
+                    w, V = jacobi_eigh_multicore(Xk, devices)
                 except Exception:
                     if _REQUIRE_NKI:
                         raise
-                    w, V = jacobi_eigh_device(X)
+                    w, V = jacobi_eigh_device(Xk)
             else:
-                w, V = jacobi_eigh_device(X)
+                w, V = jacobi_eigh_device(Xk)
         except Exception:
             if _REQUIRE_NKI:
                 raise
             w, V, _ = _jacobi.jacobi_eigh_torch(X)
+        w, V = w.to(X.dtype), V.to(X.dtype)  # float64 under backend "nki"
     else:
         w, V, _ = _jacobi.jacobi_eigh_torch(X)
     w = w.reshape(*batch_shape, n)
@@ -566,14 +589,16 @@ def _householder_operand(A: torch.Tensor) -> torch.Tensor | None:
 
     The kernels compute in FP32. A float64 A reached them as is and came
     back as garbage (Trn2, n=2: rel err ~1e17) or raised a dtype mismatch
-    (#83): it runs in FP32 and comes back float64 (#84). Integer and bool A
-    take torch eigh, which raises as the pytorch backend does, or raise
-    NotImplementedError under ``TRNSOLVER_REQUIRE_NKI``. Whether float64
-    should take torch eigh at full precision instead is #89.
+    (#83). float64 follows the suite policy (#89): backend ``"auto"`` takes
+    torch eigh at float64; backend ``"nki"`` runs the kernels in FP32 (one
+    UserWarning) and returns float64; ``TRNSOLVER_REQUIRE_NKI=1`` raises
+    NotImplementedError. Integer and bool A take torch eigh, which raises
+    as the pytorch backend does, or raise NotImplementedError under
+    ``TRNSOLVER_REQUIRE_NKI``.
     """
     from .nki.dispatch import _kernel_operands
 
-    ops = _kernel_operands(A, ops=_HOUSEHOLDER_OPS, what="eigh", cast_fp64=True)
+    ops = _kernel_operands(A, ops=_HOUSEHOLDER_OPS, what="eigh")
     return None if ops is None else ops[0]
 
 

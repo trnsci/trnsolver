@@ -11,11 +11,16 @@ X from the previous iteration and refines it, per pass, with
                                   resident on chip
     E = Y - X (X^T Y)             the filtered correction outside span(X)
     Grams of [X, E] and F[X, E]   six kb x kb GEMM blocks
-    (theta, Q) = RR on span[X, E] 2 kb x 2 kb Rayleigh-Ritz, float64, host
-    X = [X, E] Q[:, :kb]          on F's device
+    (theta, Q) = RR on span[X, E] lowest kb pairs of the 2 kb pencil,
+                                  float64, host
+    X = [X, E] Q                  on F's device
 
 The first three lines are one NKI launch (``trnsolver/nki/subspace.py``);
 only the six Gram blocks (and one residual row) cross to the host. The
+last line runs at the start of the next pass's launch
+(``subspace_step_kernel``), so a pass is one launch, one D2H and one H2D
+copy; only the final pass's update runs as device ops. The number of
+passes adapts per call (``rtol``, ``tol``). The
 filter is the scaled Chebyshev filter of Zhou and Saad (SIAM J. Matrix Anal.
 Appl. 29(3), 2007; in SCF, Zhou, Saad, Tiago and Chelikowsky, J. Comput.
 Phys. 219, 2006): it damps ``[a, b] = [theta_kb, upper]`` and grows the
@@ -217,8 +222,56 @@ def _augmented_basis(G: torch.Tensor, kb: int, drop: float) -> torch.Tensor | No
     return torch.cat([top, bot], 0)
 
 
+def _eigh_lowest(A: torch.Tensor, nwant: int | None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Lowest ``nwant`` eigenpairs of a float64 symmetric A (all for None).
+
+    The full ``torch.linalg.eigh`` (MKL ``syevd``): on the 2 pinned host
+    threads of a trn2.3xlarge, SciPy's ``syevr`` subset driver was 3.5x
+    slower at d = 188 (its OpenBLAS LAPACK), so no subset solver is used.
+    """
+    w, V = torch.linalg.eigh(A)
+    if nwant is None or nwant >= A.shape[0]:
+        return w, V
+    return w[:nwant], V[:, :nwant]
+
+
+def _rr_cholesky(
+    G: torch.Tensor, H: torch.Tensor, drop: float, nwant: int | None
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Rayleigh-Ritz by Cholesky of the unit-diagonal Gram (None: fall back).
+
+    ``Gs = D G D = L L^T`` reduces the pencil to the standard problem
+    ``L^{-1} Hs L^{-T}`` (LAPACK ``sygst``'s reduction), whose lowest
+    ``nwant`` pairs are all the SCF uses. It applies when Gs is well
+    conditioned: ``lambda_min(Gs) >= 1 / |L^{-1}|_F^2`` (the trace of
+    Gs^{-1}) must be above ``drop``, the same floor below which the
+    eigendecomposition path drops directions; otherwise (dependent
+    correction columns, a zero column) it returns None.
+    """
+    dg = torch.diagonal(G)
+    if not bool((dg > 0).all()):
+        return None
+    dsc = torch.rsqrt(dg)
+    Gs = dsc[:, None] * G * dsc[None, :]
+    L, info = torch.linalg.cholesky_ex(Gs)
+    if int(info) != 0:
+        return None
+    Linv = torch.linalg.solve_triangular(L, torch.eye(L.shape[0], dtype=L.dtype), upper=False)
+    if not float((Linv * Linv).sum()) * drop < 1.0:
+        return None
+    Hs = dsc[:, None] * H * dsc[None, :]
+    A = Linv @ Hs @ Linv.T
+    theta, W = _eigh_lowest(0.5 * (A + A.T), nwant)
+    return theta, dsc[:, None] * (Linv.T @ W)
+
+
 def rayleigh_ritz(
-    G: torch.Tensor, H: torch.Tensor, drop: float = _DROP, *, kb: int | None = None
+    G: torch.Tensor,
+    H: torch.Tensor,
+    drop: float = _DROP,
+    *,
+    kb: int | None = None,
+    nwant: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Ritz pairs of the pencil (H, G) in float64: (theta (r,), Q (d, r)), Q^T G Q = I.
 
@@ -227,25 +280,55 @@ def rayleigh_ritz(
     ``kb`` (G, H of [X, E], X its first kb columns), the X block is
     orthonormalised by Cholesky and only E's block by an eigendecomposition,
     which halves that step's host cost.
+
+    ``nwant``: return only the lowest ``min(nwant, r)`` pairs. Then a
+    well-conditioned G (the usual case in SCF) takes one Cholesky of the
+    whole unit-diagonal Gram and one symmetric eigensolve of the reduced
+    matrix (``_rr_cholesky``) instead of a Cholesky, a rank-revealing
+    eigendecomposition of E's block and then the eigensolve; an
+    ill-conditioned one takes the rank-revealing path above.
     """
     G = G.to(torch.float64)
     H = H.to(torch.float64)
     G = 0.5 * (G + G.T)
     H = 0.5 * (H + H.T)
+    if nwant is not None:
+        fast = _rr_cholesky(G, H, drop, nwant)
+        if fast is not None:
+            return fast
     B = _augmented_basis(G, kb, drop) if kb is not None else None
     if B is None:
         B = _orth_basis(G, drop)
     Hb = B.T @ H @ B
-    theta, W = torch.linalg.eigh(0.5 * (Hb + Hb.T))
+    theta, W = _eigh_lowest(0.5 * (Hb + Hb.T), nwant)
     return theta, B @ W
 
 
-def _subspace_device_ok(F: torch.Tensor, kb: int) -> bool:
-    """True iff the filter runs as the NKI kernel for F and a kb-column block."""
+_SUBSPACE_OPS = ("subspace_filter", "subspace_step")
+
+
+def _subspace_kernel_dtype(F: torch.Tensor, kb: int) -> torch.dtype:
+    """The dtype the warm passes run F in: F's, or float32 for the kernel.
+
+    float64 F where an FP32 F would run the kernel follows the suite policy
+    (#89): float64 (filter_reference) under backend ``"auto"``; float32 with
+    one UserWarning under backend ``"nki"``; NotImplementedError under
+    ``TRNSOLVER_REQUIRE_NKI=1``.
+    """
+    if F.dtype != torch.float64 or not _subspace_device_ok(F, kb, torch.float32):
+        return F.dtype
+    from .nki.dispatch import _kernel_dtype
+
+    return _kernel_dtype(F.dtype, _SUBSPACE_OPS, "occupied_subspace") or F.dtype
+
+
+def _subspace_device_ok(F: torch.Tensor, kb: int, dtype: torch.dtype | None = None) -> bool:
+    """True iff the filter runs as the NKI kernel for F (as ``dtype``) and a kb-column block."""
     from .nki.dispatch import kernel_takes
 
-    # FP32 only: float64 F takes filter_reference, at full precision.
-    if not kernel_takes(F.dtype, "subspace_filter") or not (_use_nki() and HAS_NKI):
+    # FP32 only; float64 F is cast first or not at all (_subspace_kernel_dtype).
+    dtype = F.dtype if dtype is None else dtype
+    if not kernel_takes(dtype, *_SUBSPACE_OPS) or not (_use_nki() and HAS_NKI):
         return False
     if os.environ.get("TRNSOLVER_SUBSPACE_KERNEL", "1").strip() == "0":
         return False
@@ -264,17 +347,60 @@ def _subspace_device_ok(F: torch.Tensor, kb: int) -> bool:
     return _get_dispatch_path() == "native"
 
 
-def _run_filter(F: torch.Tensor, X: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
-    """One filter launch: the kernel where it applies, else the reference."""
+def _run_filter(
+    F: torch.Tensor, X: torch.Tensor, table: torch.Tensor, emit_x: bool = False
+) -> torch.Tensor:
+    """One filter launch: the kernel where it applies, else the reference.
+
+    ``emit_x``: prepend X (the ``[X; E; ...]`` layout of the fold path).
+    """
     if _subspace_device_ok(F, X.shape[1]):
         try:
             from .nki.subspace import run_filter_kernel
 
-            return run_filter_kernel(F, X, table)
+            return (
+                run_filter_kernel(F, X, table, emit_x) if emit_x else run_filter_kernel(F, X, table)
+            )
         except Exception:
             if _REQUIRE_NKI:
                 raise
-    return filter_reference(F, X, table.to(F.device))
+    out = filter_reference(F, X, table.to(F.device))
+    return torch.cat([X, out], 0) if emit_x else out
+
+
+def _fold_ok(F: torch.Tensor, kb: int) -> bool:
+    """True iff the passes chain through ``subspace_step_kernel`` (update on chip)."""
+    if os.environ.get("TRNSOLVER_SUBSPACE_FOLD", "1").strip() == "0":
+        return False
+    if not _subspace_device_ok(F, kb):
+        return False
+    from .nki.subspace import kernel_fits
+
+    return kernel_fits(F.shape[0], kb, fold=True)
+
+
+def _run_step(F: torch.Tensor, prev: torch.Tensor, Q: torch.Tensor, table: torch.Tensor):
+    """One fold launch: X = [X, E] Q from ``prev``, then the filter on it."""
+    from .nki.subspace import run_step_kernel, step_table
+
+    try:
+        return run_step_kernel(F, prev, step_table(Q, table))
+    except Exception:
+        if _REQUIRE_NKI:
+            raise
+    n, kb = F.shape[0], prev.shape[1]
+    Qd = _to(Q, F.device, F.dtype)
+    X = prev[:n] @ Qd[:kb] + prev[n : 2 * n] @ Qd[kb:]
+    return torch.cat([X, filter_reference(F, X, table.to(F.device))], 0)
+
+
+def step_reference(F: torch.Tensor, prev: torch.Tensor, Q: torch.Tensor, table: torch.Tensor):
+    """PyTorch twin of ``subspace_step_kernel``: ``[X; filter_reference(F, X, table)]``
+    with ``X = prev[:n] Q[:kb] + prev[n:2n] Q[kb:]``."""
+    n, kb = F.shape[0], prev.shape[1]
+    Q = Q.to(F.device, F.dtype)
+    X = prev[:n] @ Q[:kb] + prev[n : 2 * n] @ Q[kb:]
+    return torch.cat([X, filter_reference(F, X, table.to(F.device, F.dtype))], 0)
 
 
 def _to(t: torch.Tensor, device, dtype) -> torch.Tensor:
@@ -333,13 +459,14 @@ def occupied_subspace(
     *,
     guess: SubspaceState | torch.Tensor | None = None,
     buffer: int | None = None,
-    passes: int = 2,
-    tol: float | None = None,
+    passes: int = 6,
+    tol: float | str | None = "auto",
     degree: int | None = None,
     max_degree: int = _MAX_DEGREE,
     amp_max: float = _AMP_MAX,
     upper: float | str = "gershgorin",
-    refresh: float | None = 3e-2,
+    refresh: float | None = None,
+    rtol: float | None = 0.05,
 ) -> SubspaceResult:
     """Lowest k eigenpairs of a symmetric F by Chebyshev-filtered subspace iteration.
 
@@ -351,21 +478,36 @@ def occupied_subspace(
            block of starting vectors, or None for a cold start (one full
            float64 host ``eigh`` of F, returned exactly).
         buffer: extra block columns beyond k (default :func:`default_buffer`).
-        passes: at most this many filter + Rayleigh-Ritz passes.
+        passes: at most this many filter launches (each but a stopping
+           one followed by a Rayleigh-Ritz).
         tol: stop before a pass once every wanted residual
            ``|F x_j - theta_j x_j|`` of the block entering it is below
            ``tol * max(|theta_1|, |upper|)`` (that block is returned). Note
            the first pass checks the previous call's Ritz values against
-           the new F, an upper bound. None: always run ``passes`` passes.
+           the new F, an upper bound. ``"auto"`` (default): 30 units of
+           F's rounding (3.6e-6 for FP32), the residual's noise floor, so a
+           converged SCF gets its previous orbitals back unchanged (and a
+           bit-identical energy, which an FP32 ``dE`` convergence test
+           needs). None: no absolute stop.
+        rtol: stop before a pass once the wanted residual of the block
+           entering it is below ``rtol`` times the first pass's (the change
+           of F that the previous block saw), so the subspace error tracks
+           the SCF's own progress: early SCF iterations take up to
+           ``passes`` passes, late ones one Rayleigh-Ritz. None: no
+           relative stop.
         degree: fixed filter degree (from ``DEGREES``); default: chosen per
            pass by :func:`choose_degree` (``max_degree``, ``amp_max``).
         refresh: if the first pass finds a wanted residual above
-           ``refresh * max(|theta_1|, |upper|)`` (the block is far from F, as
-           in the first SCF iterations), return a full host eigh instead,
-           which also resets the warm start. None: never. The defaults
-           (``passes=2``, ``refresh=3e-2``) are the measured SCF setting:
-           DF-RHF in FP32 then needs the same iterations as with a full
-           eigh (n_ao = 250 / 490: 16 / 16 against 16 / 15).
+           ``refresh * max(|theta_1|, |upper|)``, return a full host eigh
+           instead (which also resets the warm start). None (default):
+           never. The defaults (``passes=6, rtol=0.05, tol="auto",
+           refresh=None``) are the measured SCF setting (trnsolver#85):
+           FP32 DF-RHF on Trn2 then takes within one iteration of a full
+           eigh (n_ao = 114 / 250 / 490 / 970: 11 / 14 / 15 / 18 against
+           11 / 14 / 16 / 17) with no full eigh after the cold start. The
+           earlier fixed ``passes=2, refresh=3e-2`` fell back to a full
+           eigh on most early iterations (14 of 21 at n_ao = 970) and took
+           22 iterations there.
         upper: spectral upper bound: a number, ``"gershgorin"`` (default;
            one reduction and one host sync per call), or ``"cached"`` (the
            state's bound: the cold start's top eigenvalue plus 5% of the
@@ -378,7 +520,10 @@ def occupied_subspace(
     The filter, the correction and the Gram blocks run as one NKI launch for
     FP32 F on the native ``neuron`` device (and under
     ``TRNSOLVER_USE_SIMULATOR=1``); elsewhere as :func:`filter_reference`.
-    The Rayleigh-Ritz is float64 on the host.
+    float64 F there runs :func:`filter_reference` at float64 under backend
+    ``"auto"``, the FP32 kernel (one UserWarning; float64 result) under
+    backend ``"nki"``, and raises NotImplementedError under
+    ``TRNSOLVER_REQUIRE_NKI=1``. The Rayleigh-Ritz is float64 on the host.
     """
     if F.dim() != 2 or F.shape[0] != F.shape[1]:
         raise ValueError(f"occupied_subspace expects (n, n); got {tuple(F.shape)}")
@@ -399,6 +544,8 @@ def occupied_subspace(
         state = SubspaceState(X=X, theta=theta, upper=bound)
         return SubspaceResult(_to(theta[:k], F.device, F.dtype), X[:, :k], state)
 
+    out_dtype = F.dtype
+    F = F.to(_subspace_kernel_dtype(F, kb))  # float32 for the kernel under backend "nki"
     cached = None
     if isinstance(guess, SubspaceState):
         X, theta, cached = guess.X.to(F.device, F.dtype), guess.theta, guess.upper
@@ -414,44 +561,72 @@ def occupied_subspace(
     else:
         b = float(upper)
 
+    if isinstance(tol, str):
+        if tol != "auto":
+            raise ValueError(f"tol must be a number, 'auto' or None; got {tol!r}")
+        tol = 30.0 * torch.finfo(F.dtype).eps
     resid = None
     w_dev = None  # theta[:k] on F's device, from the last pass's copy
     m = 0
     done = 0
+    # Fold path (NKI kernel): every launch emits [X; E; Grams; r], and the
+    # block update X <- [X, E] Q of pass p runs on chip at the start of
+    # launch p + 1, with Q sent in the same H2D copy as the scalar table.
+    fold = _fold_ok(F, kb)
+    prev = None  # last launch's output in the [X; E; ...] layout
+    Qp = None  # pending (2 kb, kb) host coefficients for prev, not yet applied
+    first = None  # the first pass's residual (scaled): the change seen by X
     for _ in range(max(1, passes)):
         a0, a = float(theta[0]), float(theta[-1])
         if not (a0 < a < b):
             # Degenerate block, or a bound below the block: refresh exactly.
             X, theta, b = cold()
             resid = w_dev = None
+            Qp = None
             break
         m = degree or choose_degree(theta, k, b, amp_max=amp_max, max_degree=max_degree)
         table = filter_table(chebyshev_coefficients(m, a0, a, b), theta)
-        out = _run_filter(F, X, table)
-        G, H, r = unpack_grams(out[n:].to("cpu", torch.float64), kb)
+        if Qp is not None:
+            out = _run_step(F, prev, Qp, table)
+            Qp = None
+        else:
+            out = _run_filter(F, X, table, emit_x=fold)
+        r0 = n if fold else 0
+        if fold:
+            X = out[:n]
+        G, H, r = unpack_grams(out[r0 + n :].to("cpu", torch.float64), kb)
         resid = torch.sqrt(torch.clamp(r, min=0.0))
         done += 1
-        if os.environ.get("TRNSOLVER_SUBSPACE_DEBUG"):
-            rel = float(resid[:k].max()) / max(abs(a0), abs(b))
-            print(f"occupied_subspace: pass {done} m={m} resid/scale={rel:.2e}")
         worst = float(resid[:k].max()) / max(abs(a0), abs(b))
-        if done == 1 and refresh is not None and worst > refresh:
-            # The block is far from the new F (early SCF): solve exactly.
-            X, theta, b = cold()
-            m = done = 0
-            w_dev = None
-            break
+        if os.environ.get("TRNSOLVER_SUBSPACE_DEBUG"):
+            print(f"occupied_subspace: pass {done} m={m} resid/scale={worst:.2e}")
+        if done == 1:
+            first = worst
+            if refresh is not None and worst > refresh:
+                # The block is far from the new F (early SCF): solve exactly.
+                X, theta, b = cold()
+                m = done = 0
+                w_dev = None
+                break
         if tol is not None and worst <= tol:
             break
-        theta, Q = rayleigh_ritz(G, H, kb=kb)
+        if done > 1 and rtol is not None and worst <= rtol * first:
+            break
+        theta, Q = rayleigh_ritz(G, H, kb=kb, nwant=kb)
+        w = min(kb, Q.shape[1])
+        if fold and w == kb and done < max(1, passes):
+            # Applied by the next launch (which also checks its residual).
+            prev, Qp = out, Q
+            continue
         # One H2D copy for the new block's coefficients and its Ritz values:
         # on Trn2 a second small copy right after the update took up to
         # 3.8 ms (a (41,) vector at n = 250), the packed one ~0.3 ms.
-        w = min(kb, Q.shape[1])
         pk = _to(torch.cat([Q[:, :w], theta[:w].reshape(1, w)], 0), F.device, F.dtype)
         Q, w_dev = pk[:-1], (pk[-1, :k] if w >= k else None)
-        X, theta = _complete(X @ Q[:kb] + out[:n] @ Q[kb:], theta[:kb], kb, seed=done)
-    state = SubspaceState(X=X, theta=theta, upper=b, degree=m, passes=done, residual=resid)
+        X, theta = _complete(X @ Q[:kb] + out[r0 : r0 + n] @ Q[kb:], theta[:kb], kb, seed=done)
     if w_dev is None:
         w_dev = _to(theta[:k], F.device, F.dtype)
+    if out_dtype != F.dtype:  # float64 F through the FP32 kernel: float64 result
+        X, w_dev = X.to(out_dtype), w_dev.to(out_dtype)
+    state = SubspaceState(X=X, theta=theta, upper=b, degree=m, passes=done, residual=resid)
     return SubspaceResult(w_dev, X[:, :k], state)

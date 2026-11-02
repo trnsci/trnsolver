@@ -18,10 +18,17 @@ and without ``TRNSOLVER_REQUIRE_NKI``, and must:
 - return the dtypes and shapes the pytorch backend returns for the same
   input, or raise where the pytorch backend raises (under REQUIRE_NKI a
   NotImplementedError is also allowed).
+
+The float64 policy (trnsolver#89) is tested on every kernel entry: under
+backend ``auto`` float64 computes in torch at float64 accuracy with no
+launch; under backend ``nki`` the FP32 kernels run with FP32 operands, the
+result is float64 and one UserWarning is emitted per op; under
+``TRNSOLVER_REQUIRE_NKI=1`` it raises NotImplementedError.
 """
 
 import sys
 import types
+import warnings
 
 import numpy as np
 import pytest
@@ -46,6 +53,7 @@ ALLOWED = {
     "jacobi_sweeps": F32,
     "jacobi_block": F32,
     "subspace_filter": F32,
+    "subspace_step": F32,
 }
 SIM_ALLOWED = {**ALLOWED, "matmul_fp32out": F32}
 
@@ -72,6 +80,16 @@ def _apply_reflectors(V_refs, Q):
     return Q.T.contiguous()
 
 
+def _filter(F, X, row, emit_x):
+    out = tsub.filter_reference(F, X, row)
+    return torch.cat([X, out], 0) if emit_x else out
+
+
+def _step(F, prev, qtab):
+    kb = prev.shape[1]
+    return tsub.step_reference(F, prev, qtab[: 2 * kb, :kb], qtab[2 * kb])
+
+
 REF = {
     "matvec": lambda A, v: A @ v,
     "rank2_update": lambda A, u, v: A - u @ v.T - v @ u.T,
@@ -81,7 +99,8 @@ REF = {
     # No rotation: the Jacobi driver runs its sweep cap and returns.
     "jacobi_sweeps": lambda Z, V, consts, sched, onezero: torch.stack([Z, V]),
     "jacobi_block": lambda Z, V, consts, sched, onezero: torch.stack([Z, V]),
-    "subspace_filter": lambda F, X, tab, sched: tsub.filter_reference(F, X, tab[0]),
+    "subspace_filter": lambda F, X, tab, sched: _filter(F, X, tab[0], sched.shape[1] == 2),
+    "subspace_step": lambda F, prev, qtab, sched: _step(F, prev, qtab),
 }
 
 
@@ -153,6 +172,7 @@ KERNEL_ATTRS = [
     (nj, "jacobi_sweeps_kernel", "jacobi_sweeps"),
     (nj, "jacobi_block_kernel", "jacobi_block"),
     (ns, "subspace_filter_kernel", "subspace_filter"),
+    (ns, "subspace_step_kernel", "subspace_step"),
 ]
 
 
@@ -165,6 +185,7 @@ def _install(monkeypatch, path, backend, require):
     for mod in (dispatch, eigen, tsub, trnsolver.nki):
         monkeypatch.setattr(mod, "_REQUIRE_NKI", require)
     monkeypatch.setattr(dispatch, "_backend", backend)
+    monkeypatch.setattr(dispatch, "_WARNED_FP32", set())
     monkeypatch.setattr(dispatch, "_native_ops", None)
     monkeypatch.setattr(dispatch, "_USE_SIMULATOR", path == "sim")
     # The "neuron" device is CPU here, so host inputs stand in for device ones.
@@ -175,7 +196,7 @@ def _install(monkeypatch, path, backend, require):
     monkeypatch.delitem(sys.modules, "trnsolver.nki._native", raising=False)
     monkeypatch.delattr(trnsolver.nki, "_native", raising=False)
     monkeypatch.setattr(nj, "_DEVICE_CONSTS", {})
-    monkeypatch.setattr(ns, "_sched", lambda m, device: torch.zeros((m, 1)))
+    monkeypatch.setattr(ns, "_sched", lambda m, device, cols=1: torch.zeros((m, cols)))
 
     if path == "native":
         monkeypatch.setattr(dispatch, "_dispatch_path", "native")
@@ -239,7 +260,10 @@ def _as(A, dtype):
 
 def _occupied(F):
     state = trnsolver.occupied_subspace(F, 3, buffer=3).state
-    return trnsolver.occupied_subspace(F, 3, guess=state, buffer=3, passes=1, refresh=None)
+    # Two passes with no early stop: the second runs the fold (step) kernel.
+    return trnsolver.occupied_subspace(
+        F, 3, guess=state, buffer=3, passes=2, tol=None, rtol=None, refresh=None
+    )
 
 
 def _env(**env):
@@ -290,6 +314,16 @@ APIS = [
         lambda dt: trnsolver.eigh_randomized(_sym(16, dt), 2, oversampling=3, n_iter=1, seed=0),
     ),
     ("occupied_subspace", {}, lambda dt: _occupied(_sym(12, dt))),
+    (
+        "eigh_generalized[B float64]",
+        _env(TRNSOLVER_EIGH_NKI_MIN_N="0"),
+        lambda dt: trnsolver.eigh_generalized(_sym(6, dt), _spd(6, torch.float64)),
+    ),
+    (
+        "eigh_generalized[B float32]",
+        _env(TRNSOLVER_EIGH_NKI_MIN_N="0"),
+        lambda dt: trnsolver.eigh_generalized(_sym(6, dt), _spd(6, torch.float32)),
+    ),
     ("cholesky", {}, lambda dt: trnsolver.cholesky(_spd(5, dt))),
     ("lu", {}, lambda dt: trnsolver.lu(_spd(5, dt))),
     ("qr", {}, lambda dt: trnsolver.qr(_spd(5, dt))),
@@ -395,30 +429,6 @@ def test_no_unsupported_dtype_reaches_a_kernel(monkeypatch, path, backend, requi
     assert not problems, "\n".join(problems)
 
 
-def test_require_nki_float64_eigh_runs_fp32_kernels_and_returns_float64(monkeypatch):
-    """#84's decision under REQUIRE_NKI: float64 runs in FP32, returns float64."""
-    rec, _ = _install(monkeypatch, "native", "nki", True)
-    A = _sym(6, torch.float64)
-    w, V = trnsolver.eigh(A)
-    assert w.dtype == V.dtype == torch.float64
-    torch.testing.assert_close(w, torch.linalg.eigvalsh(A), atol=1e-4, rtol=1e-4)
-    assert {op for _, op, _ in rec.launches} >= {"matvec", "rank2_update"}
-    assert not rec.violations
-
-
-@pytest.mark.parametrize("path", ["native", "xla", "sim"])
-def test_float64_eigh_without_require_runs_fp32_kernels(monkeypatch, path):
-    """#84 as merged: float64 runs the FP32 kernels and returns float64 (#89)."""
-    monkeypatch.setenv("TRNSOLVER_EIGH_NKI_MIN_N", "0")
-    rec, _ = _install(monkeypatch, path, "nki", False)
-    A = _sym(6, torch.float64)
-    w, V = trnsolver.eigh(A)
-    assert w.dtype == V.dtype == torch.float64
-    torch.testing.assert_close(w, torch.linalg.eigvalsh(A), atol=1e-4, rtol=1e-4)
-    assert {op for _, op, _ in rec.launches} >= {"matvec", "rank2_update"}
-    assert not rec.violations
-
-
 @pytest.mark.parametrize("dt", [torch.int32, torch.bool])
 def test_require_nki_refuses_non_float_eigh(monkeypatch, dt):
     _install(monkeypatch, "native", "nki", True)
@@ -426,14 +436,171 @@ def test_require_nki_refuses_non_float_eigh(monkeypatch, dt):
         trnsolver.eigh(_sym(6, dt))
 
 
-def test_require_nki_refuses_float64_eigh_randomized(monkeypatch):
-    _install(monkeypatch, "native", "nki", True)
-    with pytest.raises(NotImplementedError, match="eigh_randomized"):
-        trnsolver.eigh_randomized(_sym(16, torch.float64), 2, oversampling=3, seed=0)
+# ── the float64 policy (trnsolver#89, trnsci/trnsci#35) ──────────────────────
+#
+# Where an FP32 input would run the kernels:
+#   backend "auto"          -> torch at float64 accuracy, no kernel launch;
+#   backend "nki"           -> FP32 kernels, float64 result, one UserWarning per op;
+#   TRNSOLVER_REQUIRE_NKI=1 -> NotImplementedError (over either backend).
+
+# (name, env, fn(dtype) -> (w, V) or SubspaceResult, kernel ops it reaches,
+#  warning op name, dispatch paths with a kernel)
+FP64_KERNEL_APIS = [
+    (
+        "eigh[householder]",
+        _env(TRNSOLVER_EIGH_NKI_MIN_N="0"),
+        lambda dt: trnsolver.eigh(_sym(6, dt)),
+        {"matvec", "rank2_update"},
+        "eigh",
+        ("native", "xla", "sim"),
+    ),
+    (
+        "eigh_generalized",
+        _env(TRNSOLVER_EIGH_NKI_MIN_N="0"),
+        lambda dt: trnsolver.eigh_generalized(_sym(6, dt), _spd(6, dt)),
+        {"matvec", "rank2_update"},
+        "eigh",
+        ("native", "xla", "sim"),
+    ),
+    (
+        "eigh_randomized",
+        {},
+        lambda dt: trnsolver.eigh_randomized(_sym(16, dt), 2, oversampling=3, n_iter=1, seed=0),
+        {"matmul"},
+        "eigh_randomized",
+        ("native", "xla", "sim"),
+    ),
+    (
+        "eigh[jacobi]",
+        {},
+        lambda dt: trnsolver.eigh(_sym(6, dt, batch=(3,)), method="jacobi"),
+        {"jacobi_sweeps"},
+        "eigh(method='jacobi')",
+        ("native", "sim"),
+    ),
+    (
+        "eigh[jacobi block]",
+        {},
+        lambda dt: trnsolver.eigh(_sym(40, dt, batch=(2,)), method="jacobi"),
+        {"jacobi_block"},
+        "eigh(method='jacobi')",
+        ("native", "sim"),
+    ),
+    (
+        "eigh[auto jacobi region]",
+        _env(TRNSOLVER_EIGH_JACOBI_AUTO="1-128:1"),
+        lambda dt: trnsolver.eigh(_sym(6, dt, batch=(2,))),
+        {"jacobi_sweeps"},
+        "eigh(method='jacobi')",
+        ("native",),  # the region is for the native neuron device only
+    ),
+    (
+        "occupied_subspace",
+        {},
+        lambda dt: _occupied(_sym(12, dt)),
+        {"subspace_filter", "subspace_step"},
+        "occupied_subspace",
+        ("native", "sim"),
+    ),
+]
+FP64_CASES = [
+    pytest.param(path, name, env, fn, ops, what, id=f"{name}-{path}")
+    for name, env, fn, ops, what, paths in FP64_KERNEL_APIS
+    for path in paths
+]
 
 
-def test_float64_eigh_randomized_is_full_precision_torch(monkeypatch):
-    rec, _ = _install(monkeypatch, "native", "nki", False)
-    w, V = trnsolver.eigh_randomized(_sym(16, torch.float64), 2, oversampling=3, seed=0)
-    assert w.dtype == V.dtype == torch.float64
-    assert not [op for _, op, _ in rec.launches if op == "matmul"]
+def _eigvals(out):
+    return out.eigenvalues if hasattr(out, "eigenvalues") else out[0]
+
+
+def _run(monkeypatch, env, fn, dt):
+    with monkeypatch.context() as m:
+        for k, v in env.items():
+            m.setenv(k, v)
+        return fn(dt)
+
+
+def _pytorch_values(monkeypatch, env, fn, dt):
+    with monkeypatch.context() as m:
+        m.setattr(dispatch, "_backend", "pytorch")
+        return _run(m, env, fn, dt)
+
+
+def _fp32_policy_warnings(caught):
+    return [
+        w
+        for w in caught
+        if issubclass(w.category, UserWarning) and "reduced to fp32" in str(w.message)
+    ]
+
+
+@pytest.mark.parametrize("path,name,env,fn,ops,what", FP64_CASES)
+def test_float64_auto_computes_in_torch_at_float64(monkeypatch, path, name, env, fn, ops, what):
+    """backend "auto": float64 takes torch, at float64 accuracy, and no kernel runs."""
+    ref = _pytorch_values(monkeypatch, env, fn, torch.float64)
+    rec, _ = _install(monkeypatch, path, "auto", False)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out = _run(monkeypatch, env, fn, torch.float64)
+    assert not rec.launches, f"{name}: float64 under auto launched {rec.launches}"
+    assert not _fp32_policy_warnings(caught)
+    assert _signature(out) == _signature(ref)
+    assert _eigvals(out).dtype == torch.float64
+    torch.testing.assert_close(_eigvals(out), _eigvals(ref), atol=1e-10, rtol=1e-10)
+    # Sanity: the fp32 input on the same setup does run the kernels.
+    _run(monkeypatch, env, fn, torch.float32)
+    assert {op for _, op, _ in rec.launches} & ops
+
+
+@pytest.mark.parametrize("path,name,env,fn,ops,what", FP64_CASES)
+def test_float64_nki_runs_fp32_kernels_and_warns_once(monkeypatch, path, name, env, fn, ops, what):
+    """backend "nki": the FP32 kernels run, the result is float64, one warning per op."""
+    ref = _pytorch_values(monkeypatch, env, fn, torch.float64)
+    rec, _ = _install(monkeypatch, path, "nki", False)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        outs = [_run(monkeypatch, env, fn, torch.float64) for _ in range(3)]
+    reached = {op for _, op, _ in rec.launches}
+    assert reached & ops, f"{name}: expected {ops}, launched {reached}"
+    assert all(dts and all(d == torch.float32 for d in dts) for _, _, dts in rec.launches), (
+        rec.launches
+    )
+    assert not rec.violations and not rec.rejected
+    policy = _fp32_policy_warnings(caught)
+    assert len(policy) == 1, [str(w.message) for w in policy]
+    assert what in str(policy[0].message)
+    stub_rotates = not ops & {"jacobi_sweeps", "jacobi_block"}  # the Jacobi stubs do not
+    for out in outs:
+        assert _signature(out) == _signature(ref)
+        if stub_rotates:  # fp32 precision, not float64 (the kernels compute in FP32)
+            torch.testing.assert_close(_eigvals(out), _eigvals(ref), atol=1e-3, rtol=1e-3)
+
+
+def test_float64_nki_warns_once_per_op(monkeypatch):
+    """Each op warns once; a second op warns too (the set is per op name)."""
+    _install(monkeypatch, "sim", "nki", False)
+    monkeypatch.setenv("TRNSOLVER_EIGH_NKI_MIN_N", "0")
+    A = _sym(16, torch.float64)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for _ in range(2):
+            trnsolver.eigh(A)
+            trnsolver.eigh_randomized(A, 2, oversampling=3, seed=0)
+            trnsolver.eigh(A[:6, :6].reshape(1, 6, 6).expand(2, 6, 6), method="jacobi")
+    msgs = sorted(str(w.message).split(":")[0] for w in _fp32_policy_warnings(caught))
+    assert msgs == [
+        "trnsolver eigh",
+        "trnsolver eigh(method='jacobi')",
+        "trnsolver eigh_randomized",
+    ]
+
+
+@pytest.mark.parametrize("backend", ["nki", "auto"])
+@pytest.mark.parametrize("path,name,env,fn,ops,what", FP64_CASES)
+def test_float64_require_nki_raises(monkeypatch, backend, path, name, env, fn, ops, what):
+    """TRNSOLVER_REQUIRE_NKI=1: float64 raises on every kernel path, over either backend."""
+    rec, _ = _install(monkeypatch, path, backend, True)
+    with pytest.raises(NotImplementedError, match="TRNSOLVER_REQUIRE_NKI"):
+        _run(monkeypatch, env, fn, torch.float64)
+    assert not rec.launches

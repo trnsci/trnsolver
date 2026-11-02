@@ -24,11 +24,17 @@ The same cases run on a Trainium box (manual path, no hardware CI)::
         --conformance-device neuron
 
 Off the pytorch backend the tolerances relax to the FP32 kernel level and
-the fp64 gradchecks are skipped on a non-CPU device.
+the fp64 gradchecks are skipped on a non-CPU device. float64 and complex128
+follow the suite float64 policy (trnsolver#89): under ``--backend auto`` with
+host inputs they compute in torch at float64 and keep the float64 tolerance;
+only ``--backend nki`` (FP32 kernels) and device inputs relax them. Under
+``TRNSOLVER_REQUIRE_NKI=1`` a float64 input to a kernel path raises
+``NotImplementedError`` by design, and such cases are skipped.
 """
 
 from __future__ import annotations
 
+import functools
 import os
 import warnings
 
@@ -83,9 +89,16 @@ def _dn(dt):
     return str(dt).removeprefix("torch.")
 
 
+def _fp64_full_precision(dt) -> bool:
+    """float64 / complex128 computed at float64: the pytorch backend, or auto
+    with host inputs (float64 routes to torch, trnsolver#89). Explicit nki
+    runs it through the FP32 kernels; device aten computes it at fp32."""
+    return dt in (F64, C128) and (BACKEND == "pytorch" or (BACKEND == "auto" and DEV.type == "cpu"))
+
+
 def tol_for(dt, scale=1.0):
     t = TOL[dt] * scale
-    if BACKEND != "pytorch":
+    if BACKEND != "pytorch" and not _fp64_full_precision(dt):
         t = max(t, 2e-3)  # FP32 kernels (Jacobi sweeps, Householder) on device
     return t
 
@@ -173,11 +186,39 @@ def assert_dtype(x, dt, what):
     assert x.dtype == dt, f"{what}: dtype {x.dtype} != {dt}"
 
 
+def _require_nki() -> bool:
+    return BACKEND != "pytorch" and os.environ.get("TRNSOLVER_REQUIRE_NKI") == "1"
+
+
+_FP64_REFUSED = "float64 under TRNSOLVER_REQUIRE_NKI=1 raises by design (trnsolver#89)"
+
+
+def fp64_refusal_skips(test):
+    """Skip a float64 test whose kernel path refuses float64 under REQUIRE_NKI."""
+
+    @functools.wraps(test)
+    def wrapped(*a, **k):
+        try:
+            return test(*a, **k)
+        except NotImplementedError as e:
+            if _require_nki() and "TRNSOLVER_REQUIRE_NKI" in str(e) and "float64" in str(e):
+                pytest.skip(_FP64_REFUSED)
+            raise
+
+    return wrapped
+
+
 def guarded(fn, *inputs):
     """Call fn(*inputs) and fail if a tensor input is mutated or aliased by the output."""
     tin = [t for t in inputs if isinstance(t, torch.Tensor)]
     snaps = [t.detach().clone() for t in tin]
-    out = fn(*inputs)
+    try:
+        out = fn(*inputs)
+    except NotImplementedError as e:
+        fp64 = any(t.dtype in (F64, C128) for t in tin)
+        if _require_nki() and fp64 and "TRNSOLVER_REQUIRE_NKI" in str(e):
+            pytest.skip(_FP64_REFUSED)
+        raise
     for t, s in zip(tin, snaps, strict=True):
         assert torch.equal(host(t), host(s)), "input mutated in place"
     for o in out if isinstance(out, (tuple, list)) else (out,):
@@ -695,7 +736,7 @@ KNOWN["eigh_jacobi-0x0"] = pytest.mark.xfail(
 
 
 def _eigh_n129_mark():
-    if BACKEND != "pytorch" and os.environ.get("TRNSOLVER_REQUIRE_NKI") == "1":
+    if _require_nki():
         return "raise"  # Householder tridiag is single-tile n<=128 by design
     return None
 
@@ -1239,6 +1280,7 @@ def _skip_grad_off_cpu():
 
 
 @pytest.mark.parametrize("name,f,inputs,ref", [P(c[0], *c) for c in GRAD])
+@fp64_refusal_skips
 def test_gradcheck(name, f, inputs, ref):
     _skip_grad_off_cpu()
     ins = [dev(x.clone()).requires_grad_(True) for x in inputs]
@@ -1260,6 +1302,7 @@ def test_gradcheck(name, f, inputs, ref):
 @pytest.mark.parametrize(
     "name,f,inputs", [P(f"{c[0]}-gradgrad", *c[:3]) for c in GRAD if c[3] is not None]
 )
+@fp64_refusal_skips
 def test_gradgradcheck(name, f, inputs):
     _skip_grad_off_cpu()
     ins = [dev(x.clone()).requires_grad_(True) for x in inputs]
@@ -1417,6 +1460,7 @@ def test_lu_convention():
 # ---------------------------------------------------------------- axis 10: determinism / seeding
 
 
+@fp64_refusal_skips
 def test_eigh_randomized_same_seed():
     A, _ = _lowrank(48)
     a = host(ts.eigh_randomized(dev(A), 3, seed=11, n_iter=1))
@@ -1424,6 +1468,7 @@ def test_eigh_randomized_same_seed():
     assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
 
 
+@fp64_refusal_skips
 def test_eigh_randomized_seeds_differ_answer_same():
     A, _ = _lowrank(48)
     a = host(ts.eigh_randomized(dev(A), 3, seed=1))
@@ -1432,6 +1477,7 @@ def test_eigh_randomized_seeds_differ_answer_same():
     assert not torch.equal(a[1], b[1]), "different seeds gave bit-identical vectors (seed ignored?)"
 
 
+@fp64_refusal_skips
 def test_eigh_randomized_does_not_touch_global_rng():
     A, _ = _lowrank(48)
     torch.manual_seed(123)
@@ -1440,6 +1486,7 @@ def test_eigh_randomized_does_not_touch_global_rng():
     assert torch.equal(s0, torch.get_rng_state())
 
 
+@fp64_refusal_skips
 def test_eigh_randomized_f32_vs_f64():
     A, _ = _lowrank(48)
     a = host(ts.eigh_randomized(dev(A), 3, seed=11))
@@ -1448,6 +1495,7 @@ def test_eigh_randomized_f32_vs_f64():
     assert_close(b[0], a[0], 1e-4, "f32 vs f64 eigenvalues")
 
 
+@fp64_refusal_skips
 def test_eigh_jacobi_batch_order_independent():
     A = spd(N, batch=(4,))
     w1, _ = host(ts.eigh(dev(A), method="jacobi"))
@@ -1458,6 +1506,7 @@ def test_eigh_jacobi_batch_order_independent():
 
 
 @pytest.mark.parametrize("method", ["auto", "jacobi"])
+@fp64_refusal_skips
 def test_eigh_repeatable(method):
     A = herm(N)
     a = host(ts.eigh(dev(A), method=method))

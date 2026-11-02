@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **float64 policy for the NKI kernels (#89, trnsci/trnsci#35; the same rule
+  across the trnsci suite).** Every trnsolver kernel computes in FP32, and
+  Trainium computes float64 at FP32 precision on device. Where an FP32
+  input would run the kernels (`eigh` on the Householder path,
+  `eigh_generalized` through it, `eigh_randomized`, `eigh(method="jacobi")`,
+  the auto Jacobi region, `occupied_subspace`):
+  - **backend `auto`: float64 under `auto` now computes in torch at float64
+    accuracy (previously cast to fp32 on the NKI path).** `eigh` and
+    `eigh_generalized` take `torch.linalg.eigh`, the Jacobi entries the torch
+    Jacobi, the auto Jacobi region the default aten dispatch,
+    `occupied_subspace` its torch filter, `eigh_randomized` `torch.matmul`.
+    Affected: `eigh` / `eigh_generalized` float64 on the Householder path ran
+    the FP32 kernels in 0.21.0 (#84; before that, 0.4.0 through 0.20.0, it
+    gave garbage); this lands in 0.22.0.
+  - **backend `nki`: float64 runs the FP32 kernels and returns float64, with
+    one `UserWarning` per op** (the first call of each op) saying that
+    precision is reduced to fp32. This now also applies to the Jacobi
+    kernels and `occupied_subspace` (through 0.21.0 they took torch for
+    float64) and to `eigh_randomized` (a compile error on Trn2 through
+    0.21.0).
+  - **`TRNSOLVER_REQUIRE_NKI=1`: float64 raises `NotImplementedError` on every
+    kernel path**, under either backend, as trnblas does (trnblas#69). This
+    takes precedence over the `nki` cast. **Callers of
+    `eigh(method="jacobi")`, the auto Jacobi region and `occupied_subspace`
+    with float64 input under `TRNSOLVER_REQUIRE_NKI=1` now get
+    `NotImplementedError`** where through 0.21.0 they got a float64 torch
+    result; `eigh` / `eigh_generalized` float64 under it raise where 0.21.0
+    ran the FP32 kernels.
+  - **Result dtype:** always what the pytorch backend returns for the same
+    inputs, for float32, float64, bfloat16, float16 and mixed-dtype operands
+    (e.g. `eigh_generalized` with a float64 B), including after the FP32
+    kernels.
+  The library has no complex kernels; complex input keeps its aten / torch
+  routes (#65). Paths where an FP32 input would not run a kernel either (the
+  aten cutover, the XLA lineage for Jacobi) are unchanged.
+
+### Fixed
+
+- **float64, integer and bool operands reached the FP32 NKI kernels (#83,
+  trnsci/trnsci#35).** One dtype table (`KERNEL_DTYPES` in
+  `trnsolver/nki/dispatch.py`) now lists what each kernel takes, and
+  `_launch` (native and XLA) and the new `_simulate` (simulator) raise
+  `TypeError` for anything else, so no kernel is reached with another dtype.
+  The wrappers route first with one guard (`_kernel_dtype` /
+  `_kernel_operands`), which applies the float64 policy above. Integer and
+  bool input takes torch (which raises, as the pytorch backend does), or
+  raises `NotImplementedError` under `TRNSOLVER_REQUIRE_NKI=1`. float16 and
+  bfloat16 are cast to FP32 (lossless) and restored. Affected: every release
+  with the kernels.
+
+## [0.21.0] — 2026-11-02
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fixes — upgrade recommended.** Complex Hermitian and batched inputs used `.T` instead of `.mH` in `cholesky(upper)`, `solve_spd`, `inv_spd`, `inv_sqrt_spd`, `eigh_generalized`, `pinv` and `ssor` on every backend (#64); a real A with a complex B dropped its imaginary part (#66); `cg`/`gmres` returned `x0` for a zero or tiny b (#68); fp64 Householder `eigh` was wrong on device (#83); device matmuls now resolve lazy conjugates (aws-neuron-sdk#1455). New: `orthogonalizer` for near-singular overlaps (#72) and `occupied_subspace`, a Chebyshev-filtered subspace eigensolver for SCF (#78, #91).
+
 ### Fixed
 
 - **`eigh` on the NKI Householder path: float64 input gave garbage, and n = 1
@@ -17,26 +75,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   return float64. n = 1 returned `(1, 1)` eigenvalues (0.4.0 through 0.20.0)
   and now returns `(1,)`. `eigh_generalized` inherited both. Found by the
   round-3 device harness on Trn2 (trnsci/trnsci#35).
-- **float64, integer and bool operands reached the FP32 NKI kernels (#83,
-  trnsci/trnsci#35).** One dtype table (`KERNEL_DTYPES` in
-  `trnsolver/nki/dispatch.py`) now lists what each kernel takes, and
-  `_launch` (native and XLA) and the new `_simulate` (simulator) raise
-  `TypeError` for anything else, so no kernel is reached with another dtype.
-  The wrappers route first with one guard, `_kernel_operands`:
-  - `eigh` on the NKI Householder path (under `TRNSOLVER_REQUIRE_NKI=1`, on
-    the XLA lineage, the simulator, or with `TRNSOLVER_EIGH_NKI_MIN_N`
-    lowered): float64 gave garbage (Trn2, n = 2: rel err ~1e17) or a dtype
-    mismatch, and came back float32. It runs in FP32 and returns float64,
-    as in the entry above (#84), now through the shared guard. Integer and
-    bool input takes torch (which raises, as the pytorch backend does), or
-    raises `NotImplementedError` under `TRNSOLVER_REQUIRE_NKI=1`.
-    `eigh_generalized` inherits both.
-  - `eigh_randomized`: float64 reached the FP32 matmul kernel (a compile
-    error on Trn2). It now uses `torch.matmul` at full precision, or raises
-    `NotImplementedError` under `TRNSOLVER_REQUIRE_NKI=1`.
-  - The Jacobi `eigh` and `occupied_subspace` kernels already took FP32
-    only; they now read the same table. Affected: every release with the
-    kernels.
 - **Complex Hermitian and batched input gave wrong results with no error (#64).**
   `cholesky(upper=True)`, `solve_spd` (including `iterative_refinement=True`),
   `inv_spd`, `inv_sqrt_spd`, `eigh_generalized`, `eigh_randomized`, `pinv`
@@ -77,6 +115,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Real B is unchanged. Affected: 0.7.0–0.20.0. `eigh_generalized(A, None,
   X=X)` (new on main, #72) likewise promotes a real A for a complex X.
 
+
+- **`TRNSOLVER_JACOBI_ONEZERO` is a kernel argument ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454)).**
+  `jacobi_sweeps_kernel` and `jacobi_block_kernel` read the `_ONEZERO`
+  module global from their body, which the persistent NKI trace cache does
+  not key on, so a process could run a trace made under the other setting.
+  The flag is now their `onezero` argument (a static `int` on the
+  `trnsolver::jacobi_sweeps` / `jacobi_block` ops; `dispatch._launch` takes
+  `static=`). Both settings compute the same result; only the Tensor
+  Engine pass count differs.
+
 ### Added
 
 - **`occupied_subspace(F, k, guess=state)`: lowest-k eigensolver for SCF
@@ -95,6 +143,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   aten `eigh`. The host Rayleigh-Ritz dominates at n = 970. In DF-RHF it
   did not beat the full `eigh` in time to convergence at any measured
   size (docs/api/eigen.md).
+- **`occupied_subspace`: a cheaper host Rayleigh-Ritz, the block update
+  folded into the next launch, and adaptive passes instead of `refresh`
+  (#85, #86).**
+  - The Rayleigh-Ritz keeps only the lowest kb pairs. A well-conditioned
+    Gram takes one Cholesky and one `eigh`: at n = 970 that is 14 ms per
+    pass, against 16 ms.
+  - Each launch after a call's first applies the previous update
+    X = [X, E] Q on chip (`subspace_step_kernel`). Q arrives in the same
+    copy as the filter scalars. `TRNSOLVER_SUBSPACE_FOLD=0` turns this
+    off.
+  - New defaults: `passes=6`, `rtol=0.05` (stop once the residual has
+    dropped 20x), `tol="auto"` (30 ulp: return a converged block
+    unchanged, so an FP32 energy test can see two equal energies) and
+    `refresh=None`.
+  - Per call (2 passes) on Trn2: 5.6 / 9.3 / 34 ms at n = 250 / 490 /
+    970, against 7.8 / 12 / 40 ms before.
+  - FP32 DF-RHF on Trn2 takes 11 / 14 / 15 / 18 iterations at n_ao =
+    114 / 250 / 490 / 970, against 11 / 14 / 16 / 17 with a full `eigh`.
+    That is 1.10x faster at 490, 3% slower at 970 and 15-21% slower at
+    250 and below.
 - **`orthogonalizer(S, method, lindep)` and `eigh_generalized(F, S, X=X)`:
   a tolerance for near-singular overlaps (#72, for #15).** `"symmetric"`
   (Loewdin S^-1/2, the default), `"canonical"` (keeps the eigenvalues of S
@@ -139,17 +207,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   365 -> 163 ms per iteration). At LNC=1, C40H82 runs in 7.7 s fused; the
   unpack path no longer fits there (12 GB per physical core). Older
   trntensor keeps the unpack path.
-
-### Fixed
-
-- **`TRNSOLVER_JACOBI_ONEZERO` is a kernel argument ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454)).**
-  `jacobi_sweeps_kernel` and `jacobi_block_kernel` read the `_ONEZERO`
-  module global from their body, which the persistent NKI trace cache does
-  not key on, so a process could run a trace made under the other setting.
-  The flag is now their `onezero` argument (a static `int` on the
-  `trnsolver::jacobi_sweeps` / `jacobi_block` ops; `dispatch._launch` takes
-  `static=`). Both settings compute the same result; only the Tensor
-  Engine pass count differs.
 
 ## [0.20.0] — 2026-10-31
 
