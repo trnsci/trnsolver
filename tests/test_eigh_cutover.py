@@ -177,3 +177,30 @@ class TestAtenOnDevice:
         A = sym_matrix(8)
         w, V = eigen._aten_eigh_on_device(A)
         assert w.device == A.device and V.device == A.device
+
+
+class TestHouseholderPathShapesAndDtype:
+    """The NKI Householder path (reached under TRNSOLVER_REQUIRE_NKI=1, or on
+    a non-native device) returned (1, 1) eigenvalues for n=1 and float32 for a
+    float64 input."""
+
+    def test_n1_eigenvalues_are_1d(self):
+        A = torch.tensor([[3.5]], dtype=torch.float32)
+        w, V = eigen._householder_qr_eigh(A)
+        assert w.shape == (1,) and V.shape == (1, 1)
+        assert w.item() == 3.5
+
+    def test_float64_input_keeps_dtype(self, monkeypatch):
+        def fp32_kernel(A, tol=1e-10):
+            assert A.dtype != torch.float64, "float64 reached the fp32 kernels"
+            return torch.linalg.eigh(A)
+
+        monkeypatch.setattr(eigen, "_use_nki", lambda: True)
+        monkeypatch.setattr(eigen, "_REQUIRE_NKI", True)
+        monkeypatch.setattr(eigen, "_householder_qr_eigh", fp32_kernel)
+        g = torch.Generator().manual_seed(0)
+        M = torch.randn(6, 6, generator=g, dtype=torch.float64)
+        A = M + M.T
+        w, V = trnsolver.eigh(A)
+        assert w.dtype == V.dtype == torch.float64
+        torch.testing.assert_close(w, torch.linalg.eigvalsh(A), atol=1e-4, rtol=1e-5)

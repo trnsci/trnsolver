@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`eigh` on the NKI Householder path: float64 input gave garbage, and n = 1
+  returned `(1, 1)` eigenvalues** (silent, #83). The path runs under
+  `TRNSOLVER_REQUIRE_NKI=1` or on a non-native NKI device. float64 matrices
+  reached the fp32 kernels as is. On Trn2, n = 2 came back float32 with
+  rel err ~1e17 and n = 12 raised a dtype mismatch. They now run in fp32 and
+  return float64. n = 1 returned `(1, 1)` eigenvalues (0.4.0 through 0.20.0)
+  and now returns `(1,)`. `eigh_generalized` inherited both. Found by the
+  round-3 device harness on Trn2 (trnsci/trnsci#35).
 - **Complex Hermitian and batched input gave wrong results with no error (#64).**
   `cholesky(upper=True)`, `solve_spd` (including `iterative_refinement=True`),
   `inv_spd`, `inv_sqrt_spd`, `eigh_generalized`, `eigh_randomized`, `pinv`

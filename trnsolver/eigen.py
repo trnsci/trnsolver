@@ -87,7 +87,12 @@ def eigh(
         w, V = _aten_eigh_on_device(A)
     elif _use_nki():
         try:
-            w, V = _householder_qr_eigh(A, tol)
+            # The kernels compute in fp32. A float64 A reached them as is and
+            # came back as garbage (n=2: rel err ~1e17) or raised a dtype
+            # mismatch (#83): run in fp32 and return the caller's dtype.
+            Ak = A.float() if A.dtype == torch.float64 else A
+            w, V = _householder_qr_eigh(Ak, tol)
+            w, V = w.to(A.dtype), V.to(A.dtype)
         except Exception:
             if _REQUIRE_NKI:
                 raise
@@ -1100,7 +1105,8 @@ def _householder_qr_eigh(
     """
     n = A.shape[0]
     if n == 1:
-        return A[0].clone().unsqueeze(0), torch.eye(1, dtype=A.dtype, device=A.device)
+        # (1,) eigenvalues: `A[0].unsqueeze(0)` gave a (1, 1) tensor.
+        return A.reshape(1).clone(), torch.eye(1, dtype=A.dtype, device=A.device)
 
     diag, subdiag, V_refs = _householder_tridiag(A)
 
