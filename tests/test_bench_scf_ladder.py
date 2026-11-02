@@ -82,9 +82,11 @@ def test_run_one_small_system_against_pyscf(tmp_path):
         max_iter=60,
         warmup_iters=0,
         mp2_fp32=False,
+        store_dtype="auto",
         ref_max_nao=600,
     )
     out = lad.run_one(row, args)
     assert out["converged"] and out["solver"] == "orth" and out["build"]["outcore"]
+    assert out["store_dtype"] == "float64"
     assert abs(out["err_hf"]) < 1e-6 and abs(out["err_corr"]) < 1e-6
     lad.print_results([out])

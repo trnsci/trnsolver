@@ -201,14 +201,50 @@ def _pyscf_reference(row: dict, lindep: float, orth: str) -> dict:
     }
 
 
+def _build_child(spec, store_dir, dtype_name, conn):
+    try:
+        system = scf.make_system(
+            spec, outcore=True, store_dir=store_dir, store_dtype=getattr(torch, dtype_name)
+        )
+        conn.send(("ok", system.build.get("store")))
+    except Exception as exc:  # reported in the parent
+        conn.send(("error", repr(exc)))
+
+
+def _build_in_child(spec: str, store_dir, dtype: torch.dtype) -> scf.System:
+    """Build (or reuse) the out-of-core store in a child process, so its peak
+    RSS is the build's own (ru_maxrss is per process), then open it here."""
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    parent, child = ctx.Pipe()
+    p = ctx.Process(
+        target=_build_child, args=(spec, store_dir, str(dtype).replace("torch.", ""), child)
+    )
+    p.start()
+    status, val = parent.recv()
+    p.join()
+    if status != "ok":
+        raise RuntimeError(f"building {spec}: {val}")
+    return scf.load_store_system(val)
+
+
 def run_one(row: dict, args) -> dict:
     import scf_df_mp2 as mp2
 
     orth, lindep = _lindep_for(row["basis"])
     out = dict(row, orth=orth, lindep=lindep)
+    # float64 integrals for systems with a PySCF reference (the comparison
+    # then sees the orbitals, not B's fp32 rounding: 3e-6 Eh at C20H42 /
+    # cc-pVDZ); fp32 otherwise. The SCF casts to fp32 as it loads chunks.
+    if args.store_dtype == "auto":
+        store_dtype = torch.float64 if row["nao"] <= args.ref_max_nao else torch.float32
+    else:
+        store_dtype = getattr(torch, args.store_dtype)
     t0 = time.perf_counter()
-    system = scf.make_system(row["spec"], outcore=True, store_dir=args.store_dir)
+    system = _build_in_child(row["spec"], args.store_dir, store_dtype)
     out["build_s"] = time.perf_counter() - t0
+    out["store_dtype"] = str(store_dtype).replace("torch.", "")
     out["build"] = {k: v for k, v in system.build.items() if k != "store"}
     out["store"] = system.build.get("store")
     out["naux"] = system.naux
@@ -314,6 +350,12 @@ def main() -> None:
     ap.add_argument("--warmup-iters", type=int, default=3)
     ap.add_argument("--mp2-fp32", action="store_true", help="fp32 AO->MO and MP2 energy")
     ap.add_argument("--store-dir", default=None, help="df_store root (default $TRNSCI_DF_DIR)")
+    ap.add_argument(
+        "--store-dtype",
+        default="auto",
+        choices=("auto", "float32", "float64"),
+        help="integral store dtype (auto: float64 up to --ref-max-nao, else float32)",
+    )
     ap.add_argument("--threads", type=int, default=None)
     ap.add_argument("--out", default=None, help="write the rows as JSON here")
     args = ap.parse_args()
