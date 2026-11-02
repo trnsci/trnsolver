@@ -109,6 +109,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at that size. The J values are bit-identical to the device-gather path
   (CPU test).
 
+### Fixed
+
+- **`cg` gave a wrong gradient with respect to `A`; `schur` detached
+  silently; `gmres` backward raised (#76).** `cg` read its step sizes as
+  Python floats, so autograd differentiated a fixed polynomial in `A`
+  (relative error 0.55 at n = 5, 7.2 at n = 20). `cg` and `gmres` with a
+  tensor `A` now differentiate implicitly: backward solves the adjoint
+  system `A^H λ = ∂x` with the same solver, giving `∂b = λ` and
+  `∂A = -λ x^H` (one extra solve per backward; double backward works).
+  `gmres` with a callable `A` raises `RuntimeError` when `b` or `x0`
+  requires grad. `schur` now raises `RuntimeError` when `A` requires grad
+  in grad mode, instead of returning `Q` and `T` that contributed zero
+  gradient. Affected: every release through 0.21.0.
+
 ## [0.21.0] — 2026-11-02
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
