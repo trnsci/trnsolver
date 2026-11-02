@@ -27,11 +27,18 @@ S = build_overlap_matrix(...)  # SPD
 eigenvalues, eigenvectors = trnsolver.eigh_generalized(F, S)
 ```
 
+For large or diffuse basis sets `S` is numerically singular and its Cholesky fails or loses accuracy. Build an orthogonalizer once and reuse it every iteration:
+
+```python
+orth = trnsolver.orthogonalizer(S, "canonical", lindep=1e-7)  # float64, host
+eigenvalues, eigenvectors = trnsolver.eigh_generalized(F, S, X=orth.X)  # orth.rank pairs
+```
+
 ## Factorizations
 
 ```python
 L = trnsolver.cholesky(A_spd)  # A = LL^T
-P, L, U = trnsolver.lu(A)  # PA = LU
+P, L, U = trnsolver.lu(A)  # A = PLU (torch.linalg.lu convention)
 Q, R = trnsolver.qr(A)  # A = QR
 ```
 

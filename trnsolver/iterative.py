@@ -16,7 +16,7 @@ from collections.abc import Callable
 
 import torch
 
-from .factor import _restore, _to_fp32
+from .factor import _mH, _restore, _to_fp32
 
 
 def jacobi_preconditioner(A: torch.Tensor) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -29,7 +29,8 @@ def jacobi_preconditioner(A: torch.Tensor) -> Callable[[torch.Tensor], torch.Ten
     if torch.any(d.abs() < 1e-15):
         raise ValueError("Jacobi preconditioner: diagonal has near-zero entries")
     inv_d = 1.0 / d
-    return lambda r: r * inv_d
+    # r is (n,) or a block (n, k): scale rows, never columns.
+    return lambda r: r * (inv_d if r.dim() == 1 else inv_d.unsqueeze(-1))
 
 
 def block_jacobi_preconditioner(
@@ -121,7 +122,7 @@ def ssor_preconditioner(
         raise ValueError("ssor_preconditioner: diagonal has near-zero entries")
     # Lower triangular factor: D + ω * L_strictly_lower
     L_factor = omega * torch.tril(A, diagonal=-1) + torch.diag(d)
-    U_factor = L_factor.mH  # D + omega L^H: valid for symmetric / Hermitian A
+    U_factor = _mH(L_factor)  # D + omega L^H: valid for symmetric / Hermitian A
     dscale = omega * (2.0 - omega) * d
 
     def apply(r: torch.Tensor) -> torch.Tensor:
@@ -185,8 +186,11 @@ def cg(
     x = x0.clone() if x0 is not None else torch.zeros(n, dtype=b.dtype, device=b.device)
     r = b - matvec(x)
     b_norm = torch.linalg.norm(b).item()
-    if b_norm < 1e-15:
-        return _restore(x, orig), 0, 0.0
+    if b_norm == 0.0:
+        # A x = 0 has the solution x = 0 for any nonsingular A, whatever x0
+        # is. (A threshold of 1e-15 here returned x0, or zeros, with residual
+        # 0.0 for any small-scale but nonzero b.)
+        return _restore(torch.zeros_like(x), orig), 0, 0.0
 
     z = precond(r) if precond is not None else r.clone()
 
@@ -196,7 +200,9 @@ def cg(
     for k in range(maxiter):
         Ap = matvec(p)
         pAp = float(p.to(torch.float64).dot(Ap.to(torch.float64)))
-        if abs(pAp) < 1e-30:
+        # Exact breakdown only: an absolute threshold (1e-30) stopped
+        # small-scale problems (A, b ~ 1e-16) before the first step.
+        if pAp == 0.0:
             break
 
         alpha = rz / pAp
@@ -257,8 +263,11 @@ def gmres(
 
     x = x0.clone() if x0 is not None else torch.zeros(n, dtype=b.dtype, device=b.device)
     b_norm = torch.linalg.norm(b).item()
-    if b_norm < 1e-15:
-        return _restore(x, orig), 0, 0.0
+    if b_norm == 0.0:
+        # A x = 0 has the solution x = 0 for any nonsingular A, whatever x0
+        # is. (A threshold of 1e-15 here returned x0, or zeros, with residual
+        # 0.0 for any small-scale but nonzero b.)
+        return _restore(torch.zeros_like(x), orig), 0, 0.0
 
     total_iters = 0
 

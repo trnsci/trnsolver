@@ -26,7 +26,7 @@ import os
 
 import torch
 
-from .factor import _cholesky_lower, _complex_if, _restore, _to_fp32
+from .factor import _cholesky_lower, _complex_if, _mH, _restore, _to_fp32
 from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki, _use_simulator
 
 
@@ -99,12 +99,14 @@ def eigh(
 
 def eigh_generalized(
     A: torch.Tensor,
-    B: torch.Tensor,
+    B: torch.Tensor | None,
     tol: float = 1e-10,
+    *,
+    X: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generalized symmetric eigenvalue problem: A @ x = λ B @ x
 
-    Reduces to standard form via Cholesky of B:
+    Without ``X``, reduces to standard form via Cholesky of B:
         B = L @ L^H
         (L^{-1} A L^{-H}) y = λ y
         x = L^{-H} y
@@ -114,8 +116,21 @@ def eigh_generalized(
     The triangular solves use trnblas.trsm (NKI-accelerated blocked path)
     when trnblas is installed; they fall back to torch.linalg.solve_triangular
     otherwise. The inner eigh call dispatches to NKI per backend setting.
-    Closes #11.
+    Closes #11. The Cholesky fails (or loses all accuracy) when B is
+    numerically singular, as large or diffuse basis-set overlaps are.
+
+    With ``X`` (n, m) from :func:`trnsolver.orthogonalizer` (X^H B X = I on
+    B's kept subspace; ``B`` is then not used and may be None), it solves
+    (X^H A X) y = λ y and returns x = X y: m eigenpairs, with the
+    near-linear dependencies of B removed. X is cast to A's dtype and
+    device, so with an FP32 A on the device the two reduction GEMMs and the
+    back-transform run there (trnblas.gemm for real 2-D input); X itself is
+    built once, in float64 on the host (#72).
     """
+    if X is not None:
+        return _eigh_generalized_orth(A, X, tol)
+    if B is None:
+        raise ValueError("eigh_generalized needs B, or X from trnsolver.orthogonalizer")
     A, orig = _to_fp32(_complex_if(A, B))
     B = B.to(A.dtype)
 
@@ -130,6 +145,8 @@ def eigh_generalized(
     # and batches take torch.linalg.solve_triangular with conjugate
     # transposes of the last two dims (``.mH``): the reduction is
     # L^{-1} A L^{-H}, and ``.T`` neither conjugated nor kept batch dims.
+    # ``_mH`` resolves the lazy conj bit, which Neuron matmul ignores
+    # (aws-neuron/aws-neuron-sdk#1455).
     use_tb = _tb is not None and A.dim() == 2 and not A.is_complex()
 
     if use_tb:
@@ -139,17 +156,43 @@ def eigh_generalized(
         A_prime = _tb.trsm(1.0, L, L_inv_A.T, side="left", uplo="lower", trans=False).T
     else:
         L_inv_A = torch.linalg.solve_triangular(L, A, upper=False)
-        A_prime = torch.linalg.solve_triangular(L, L_inv_A.mH, upper=False).mH
+        A_prime = _mH(torch.linalg.solve_triangular(L, _mH(L_inv_A), upper=False))
 
-    A_prime = 0.5 * (A_prime + A_prime.mH)
+    A_prime = 0.5 * (A_prime + _mH(A_prime))
     eigenvalues, V_prime = eigh(A_prime, tol)
 
     if use_tb:
         eigenvectors = _tb.trsm(1.0, L, V_prime, side="left", uplo="lower", trans=True)
     else:
-        eigenvectors = torch.linalg.solve_triangular(L.mH, V_prime, upper=True)
+        eigenvectors = torch.linalg.solve_triangular(_mH(L), V_prime, upper=True)
 
     return _restore(eigenvalues, orig), _restore(eigenvectors, orig)
+
+
+def _eigh_generalized_orth(
+    A: torch.Tensor, X: torch.Tensor, tol: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """eigh_generalized with a precomputed orthogonalizer X (#72)."""
+    A, orig = _to_fp32(A)
+    X = X.to(device=A.device, dtype=A.dtype)
+    if X.shape[-2] != A.shape[-1]:
+        raise ValueError(f"X has {X.shape[-2]} rows, A is {A.shape[-1]} x {A.shape[-1]}")
+    plain = A.dim() == 2 and X.dim() == 2 and not A.is_complex()
+    try:
+        import trnblas as _tb
+    except ImportError:
+        _tb = None
+    if plain and _tb is not None:
+        Ap = _tb.gemm(1.0, X, _tb.gemm(1.0, A, X), transA=True)
+    else:
+        Ap = _mH(X) @ (A @ X)  # _mH: aws-neuron/aws-neuron-sdk#1455
+    Ap = 0.5 * (Ap + _mH(Ap))
+    if plain:
+        w, Vp = eigh(Ap, tol)
+    else:
+        w, Vp = torch.linalg.eigh(Ap)
+    V = _tb.gemm(1.0, X, Vp) if plain and _tb is not None else X @ Vp
+    return _restore(w, orig), _restore(V, orig)
 
 
 def eigh_randomized(
@@ -260,9 +303,11 @@ def eigh_randomized(
         AQ = _call_matmul(A, Q)
 
     # Project: B = Q^H A Q  (ℓ × ℓ, always FP32 in both paths). ``.mH``
-    # conjugates complex Hermitian A; for real A it is ``.T``.
-    B = Q.mH @ AQ
-    B = 0.5 * (B + B.mH)  # symmetrize for FP32 safety
+    # conjugates complex Hermitian A; for real A it is ``.T``. ``_mH``
+    # resolves the lazy conj bit, which Neuron matmul ignores
+    # (aws-neuron/aws-neuron-sdk#1455).
+    B = _mH(Q) @ AQ
+    B = 0.5 * (B + _mH(B))  # symmetrize for FP32 safety
 
     # Small eigenproblem: exact LAPACK eigh on (ℓ × ℓ) — always FP32
     eig_vals, V_small = torch.linalg.eigh(B)  # (ℓ,) ascending, (ℓ, ℓ)

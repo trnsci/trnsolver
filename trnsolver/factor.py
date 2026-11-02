@@ -51,6 +51,19 @@ def _complex_if(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return A
 
 
+def _mH(x: torch.Tensor) -> torch.Tensor:
+    """Conjugate transpose of the last two dims, with the conjugation applied.
+
+    ``x.mH`` of a complex tensor is a lazy view: it sets the conj bit and
+    leaves the data unconjugated. On a Neuron device matmul ignores that bit
+    (aws-neuron/aws-neuron-sdk#1455), so ``A.mH @ B`` computes ``A.mT @ B``.
+    ``resolve_conj()`` materializes the conjugate; for real input it is a
+    no-op. Use this for every ``.mH`` that reaches a device matmul or solve,
+    or is returned to the caller.
+    """
+    return x.mH.resolve_conj()
+
+
 # ----------------------------------------------------------------------
 # torch.compile support (#41)
 # ----------------------------------------------------------------------
@@ -229,12 +242,17 @@ def cholesky(A: torch.Tensor, upper: bool = False) -> torch.Tensor:
     if upper:
         # U = L^H, per matrix: ``.mH`` conjugates complex (Hermitian) input
         # and keeps leading batch dims, where ``.T`` reversed every dim.
-        return _restore(L.mH, orig)
+        return _restore(_mH(L), orig)
     return _restore(L, orig)
 
 
 def lu(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """LU factorization with partial pivoting: P @ A = L @ U
+    """LU factorization with partial pivoting: A = P @ L @ U
+
+    The ``torch.linalg.lu`` convention: P permutes the rows of L @ U back to
+    A, so ``P.mT @ A == L @ U``. (Before 0.20.1 this docstring said
+    ``P @ A = L @ U``, which holds only when the pivot permutation is its own
+    inverse.)
 
     Returns:
         P: Permutation matrix (n, n)
@@ -563,7 +581,7 @@ def solve_spd(
     # A = L L^H: back substitution with L^H (``.mH``: conjugate for complex,
     # last two dims only for a batch).
     Y = _solve_triangular(L, B, upper=False)
-    X = _solve_triangular(L.mH, Y, upper=True)
+    X = _solve_triangular(_mH(L), Y, upper=True)
     if iterative_refinement:
         # Compute residual in FP64 to capture the low-order bits that the
         # FP32 Cholesky solve missed. The correction dX is solved in FP32
@@ -574,7 +592,7 @@ def solve_spd(
         wide = torch.complex128 if A.is_complex() else torch.float64
         R = (B.to(wide) - A.to(wide) @ X.to(wide)).to(A.dtype)
         dY = _solve_triangular(L, R, upper=False)
-        dX = _solve_triangular(L.mH, dY, upper=True)
+        dX = _solve_triangular(_mH(L), dY, upper=True)
         X = X + dX
     if squeeze:
         X = X.squeeze(-1)
@@ -617,7 +635,7 @@ def pinv(A: torch.Tensor, rcond: float | None = None) -> torch.Tensor:
     # for a batch, and raised for an empty matrix).
     mask = s > rcond * s[..., :1]
     s_inv = torch.where(mask, 1.0 / s, torch.zeros_like(s))
-    result = (Vh.mH * s_inv.unsqueeze(-2)) @ U.mH
+    result = (_mH(Vh) * s_inv.unsqueeze(-2)) @ _mH(U)
     return _restore(result, orig)
 
 
@@ -636,7 +654,7 @@ def inv_sqrt_spd(A: torch.Tensor) -> torch.Tensor:
     # Per matrix V diag(w^-1/2) V^H: ``diag_embed``/``.mH`` keep batch dims
     # (``torch.diag`` of a batch of eigenvalue rows took their diagonal) and
     # conjugate complex V.
-    result = V @ torch.diag_embed(inv_sqrt_eig.to(V.dtype)) @ V.mH
+    result = V @ torch.diag_embed(inv_sqrt_eig.to(V.dtype)) @ _mH(V)
     return _restore(result, orig)
 
 

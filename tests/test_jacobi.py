@@ -757,6 +757,7 @@ class TestSimulator:
                 V.numpy(),
                 JK.block_constants(n, bs).numpy(),
                 np.zeros((JK._INNER_SWEEPS, 2 * bs, chains, 1), dtype=np.float32),
+                int(JK._ONEZERO),
             )
         )
         ref = _emulate_block_launch(Z, V, n, chains, nsteps=1)
@@ -797,6 +798,7 @@ def test_mlir_verifies(n, G, chains, lnc):
         Z,
         JK.jacobi_constants(n).numpy(),
         np.zeros((1, ne, chains), dtype=np.float32),
+        int(JK._ONEZERO),
         target="trn2",
         lnc=lnc,
         frontend=FrontendKind.TRACER,
@@ -824,6 +826,7 @@ def test_block_mlir_verifies(n, G, chains, lnc):
         Z,
         JK.block_constants(n, bs).numpy(),
         np.zeros((JK._INNER_SWEEPS, 2 * bs, chains), dtype=np.float32),
+        int(JK._ONEZERO),
         target="trn2",
         lnc=lnc,
         frontend=FrontendKind.TRACER,
