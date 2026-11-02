@@ -26,7 +26,7 @@ import os
 
 import torch
 
-from .factor import _cholesky_lower, _mH, _restore, _to_fp32
+from .factor import _cholesky_lower, _complex_if, _mH, _restore, _to_fp32
 from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki, _use_simulator
 
 
@@ -131,7 +131,7 @@ def eigh_generalized(
         return _eigh_generalized_orth(A, X, tol)
     if B is None:
         raise ValueError("eigh_generalized needs B, or X from trnsolver.orthogonalizer")
-    A, orig = _to_fp32(A)
+    A, orig = _to_fp32(_complex_if(A, B))
     B = B.to(A.dtype)
 
     try:
@@ -173,7 +173,10 @@ def _eigh_generalized_orth(
     A: torch.Tensor, X: torch.Tensor, tol: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """eigh_generalized with a precomputed orthogonalizer X (#72)."""
-    A, orig = _to_fp32(A)
+    # A complex X (from a complex Hermitian B) promotes a real A, as a
+    # complex B does on the Cholesky path (#66); X.to(A.dtype) dropped its
+    # imaginary part.
+    A, orig = _to_fp32(_complex_if(A, X))
     X = X.to(device=A.device, dtype=A.dtype)
     if X.shape[-2] != A.shape[-1]:
         raise ValueError(f"X has {X.shape[-2]} rows, A is {A.shape[-1]} x {A.shape[-1]}")

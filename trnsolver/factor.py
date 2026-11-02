@@ -38,6 +38,19 @@ def _restore(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return x.to(dtype) if dtype in _LOW_PRECISION else x
 
 
+def _complex_if(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """Promote a real A to complex when B is complex.
+
+    The solvers cast B to A's dtype. For a real A and a complex B that cast
+    dropped B's imaginary part (with only a UserWarning), where
+    ``torch.linalg.solve`` raises on the mismatch. Real B is unaffected.
+    """
+    if B.is_complex() and not A.is_complex():
+        real = torch.float32 if A.dtype in _LOW_PRECISION else A.dtype
+        return A.to(torch.promote_types(real, B.dtype))
+    return A
+
+
 def _mH(x: torch.Tensor) -> torch.Tensor:
     """Conjugate transpose of the last two dims, with the conjugation applied.
 
@@ -532,7 +545,7 @@ def solve(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     in lowerable ops), because Neuron cannot lower ``linalg_solve_ex`` (#41).
     There a singular A yields inf/NaN instead of raising ``LinAlgError``.
     """
-    A, orig = _to_fp32(A)
+    A, orig = _to_fp32(_complex_if(A, B))
     B = B.to(A.dtype)
     X = _solve_general(A, B)
     return _restore(X, orig)
@@ -559,7 +572,7 @@ def solve_spd(
     Returns:
         X: Solution (same shape as B).
     """
-    A, orig = _to_fp32(A)
+    A, orig = _to_fp32(_complex_if(A, B))
     B = B.to(A.dtype)
     L = cholesky(A)
     squeeze = B.dim() == 1
