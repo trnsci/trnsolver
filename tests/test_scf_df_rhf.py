@@ -318,7 +318,8 @@ def test_make_system_basis_suffix(monkeypatch):
 
     monkeypatch.setattr(scf, "pyscf_system", fake)
     scf.make_system("pyscf:benzene@aug-cc-pvdz")
-    assert seen == {"name": "benzene", "basis": "aug-cc-pvdz", "auxbasis": "aug-cc-pvdz-jkfit"}
+    want = {"name": "benzene", "basis": "aug-cc-pvdz", "auxbasis": "aug-cc-pvdz-jkfit"}
+    assert {k: seen[k] for k in want} == want
 
 
 @pytest.mark.parametrize("fused", [False, True])
@@ -400,6 +401,116 @@ def test_energy_delta_test_stalls_at_noise_floor_density_test_does_not():
 def test_conv_validation():
     with pytest.raises(ValueError, match="conv"):
         scf.run_scf(scf.h2_lattice(1), conv="bogus")
+
+
+# ---------------------------------------------------------------------------
+# Out-of-core DF integrals (examples/df_store.py)
+# ---------------------------------------------------------------------------
+
+import df_store  # noqa: E402
+
+
+def test_store_roundtrip_and_slices(tmp_path):
+    system = scf.h2_lattice(4)
+    B = system.B
+    st = df_store.store_from_tensor(
+        B, system.nao, str(tmp_path / "s"), dtype=torch.float64, chunk_bytes=B.shape[0] * 8 * 20
+    )
+    assert st.widths[0] < st.naux and len(st.widths) > 1  # several chunks
+    assert st.shape == B.shape and st.dtype == torch.float64
+    torch.testing.assert_close(st.to_tensor(), B, rtol=0, atol=0)
+    q0, q1 = st.widths[0] - 3, st.widths[0] + 5  # across a chunk boundary
+    torch.testing.assert_close(st[:, q0:q1], B[:, q0:q1], rtol=0, atol=0)
+    with pytest.raises(IndexError):
+        st[0:3, :]
+    import pickle
+
+    assert pickle.loads(pickle.dumps(st)).naux == st.naux
+    assert df_store.store_complete(str(tmp_path / "s"))
+    assert not df_store.store_complete(str(tmp_path / "missing"))
+
+
+def test_chunk_width_is_128_multiple_under_limit():
+    npair = 1658 * 1659 // 2
+    w = df_store.chunk_width(npair, 6064, 4, df_store.DEFAULT_CHUNK_BYTES)
+    assert w % 128 == 0 and npair * w * 4 <= df_store.DEFAULT_CHUNK_BYTES < 1 << 32
+
+
+def test_h2_lattice_store_matches_in_memory(tmp_path):
+    mem = scf.h2_lattice(6)
+    disk = scf.h2_lattice(6, store=str(tmp_path / "h2"), store_dtype=torch.float64)
+    assert isinstance(disk.B, df_store.DFStore) and disk.build["outcore"]
+    torch.testing.assert_close(disk.B.to_tensor(), mem.B, rtol=0, atol=1e-15)
+    e_mem = scf.run_scf(mem, dtype=torch.float64).energy
+    e_disk = scf.run_scf(disk, dtype=torch.float64)
+    assert e_disk.converged and e_disk.energy == pytest.approx(e_mem, abs=1e-11)
+    # fp32 store: rounding of B only.
+    disk32 = scf.h2_lattice(6, store=str(tmp_path / "h2f"), store_dtype=torch.float32)
+    assert disk32.B.dtype == torch.float32
+    assert abs(scf.energy_at_orbitals(disk32, e_disk.C_occ) - e_mem) < 1e-6
+
+
+def test_make_system_outcore_threshold_and_reuse(tmp_path, monkeypatch):
+    root = str(tmp_path)
+    small = scf.make_system("h2-lattice:3", store_dir=root)
+    assert not small.build.get("outcore") and isinstance(small.B, torch.Tensor)
+    monkeypatch.setattr(scf, "OUTCORE_GB", 1e-6)
+    big = scf.make_system("h2-lattice:3", store_dir=root)
+    assert big.build["outcore"] and big.B.path.startswith(root)
+
+    def boom(*a, **k):
+        raise AssertionError("rebuilt instead of reusing the store")
+
+    monkeypatch.setattr(scf, "s_gaussian_system", boom)
+    again = scf.make_system("h2-lattice:3", store_dir=root)
+    assert isinstance(again.B, df_store.DFStore) and again.nocc == big.nocc
+    torch.testing.assert_close(again.H, big.H)
+
+
+def test_water_cluster_geometry():
+    atoms = scf._water_cluster_atoms(8)
+    assert [a for a, _ in atoms].count("O") == 8 and len(atoms) == 24
+    xyz = torch.tensor([c for _, c in atoms])
+    d = torch.cdist(xyz, xyz)
+    mol = torch.arange(24) // 3
+    inter = mol[:, None] != mol[None, :]
+    assert float(d[inter].min()) > 1.5
+    o = xyz[0::3]
+    for k in range(8):
+        oh = (xyz[3 * k + 1 : 3 * k + 3] - o[k]).norm(dim=1)
+        torch.testing.assert_close(oh, torch.full((2,), 0.9572, dtype=oh.dtype), atol=1e-6, rtol=0)
+
+
+def test_pyscf_store_matches_incore(tmp_path):
+    pytest.importorskip("pyscf")
+    from pyscf import df, lib
+
+    mol = scf.pyscf_mol("water", "cc-pvdz")
+    ref = torch.from_numpy(lib.transpose(df.incore.cholesky_eri(mol, auxbasis="cc-pvdz-jkfit")))
+    # Tiny row blocks and chunks: several of each.
+    st = df_store.build_pyscf_store(
+        mol,
+        "cc-pvdz-jkfit",
+        str(tmp_path / "w"),
+        dtype=torch.float64,
+        chunk_bytes=ref.shape[0] * 8 * 50,
+        block_bytes=3 * 8 * 116 * 40,
+    )
+    assert st.meta["build"]["row_blocks"] > 3 and len(st.widths) > 1
+    torch.testing.assert_close(st.to_tensor(), ref, rtol=0, atol=1e-12)
+
+
+def test_pyscf_system_outcore_matches_incore(tmp_path):
+    pytest.importorskip("pyscf")
+    inc = scf.pyscf_system("water", reference=True)
+    ooc = scf.pyscf_system(
+        "water", outcore=True, store=str(tmp_path / "w"), store_dtype=torch.float64
+    )
+    assert ooc.build["outcore"] and ooc.ref_energy is None  # reference off by default
+    res = scf.run_scf(ooc, dtype=torch.float64)
+    assert res.energy == pytest.approx(inc.ref_energy, abs=1e-8)
+    loaded = scf.load_store_system(str(tmp_path / "w"))
+    assert loaded.nocc == 5 and loaded.B.naux == ooc.B.naux
 
 
 def test_truncated_basis_converges_in_orthonormal_measure():

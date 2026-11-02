@@ -65,17 +65,25 @@ def _set_backends(name: str) -> None:
         lib.set_backend(name)
 
 
-def _load_system(spec: str, cache_dir: str | None) -> System:
+def _load_system(spec: str, cache_dir: str | None, args=None) -> System:
+    """The system ``spec``: from ``--cache-dir`` (a .pt file) if cached, else built.
+
+    Out-of-core systems (``--outcore``, examples/df_store.py) cache themselves
+    as a store directory per spec under ``--store-dir`` and are not saved as .pt.
+    """
     path = None
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
         path = os.path.join(cache_dir, spec.replace(":", "_") + ".pt")
         if os.path.exists(path):
             return System(**torch.load(path))
+    outcore = {"auto": None, "on": True, "off": False}[args.outcore] if args else None
     t = time.perf_counter()
-    system = make_system(spec)
+    system = make_system(spec, outcore=outcore, store_dir=args.store_dir if args else None)
     print(f"# built {spec} in {time.perf_counter() - t:.1f} s", flush=True)
-    if path:
+    if system.build.get("outcore"):
+        print(f"# {spec}: {system.B!r}", flush=True)
+    elif path:
         torch.save(system.__dict__, path)
     return system
 
@@ -113,7 +121,7 @@ def _run_mode(system: System, mode: str, args):
 def bench_scf(args) -> None:
     rows = []
     for spec in args.systems.split(","):
-        system = _load_system(spec, args.cache_dir)
+        system = _load_system(spec, args.cache_dir, args)
         print(
             f"# {system.name}: n_ao={system.nao} naux={system.naux} nocc={system.nocc}",
             flush=True,
@@ -326,6 +334,13 @@ def main() -> None:
         help="pack P / unpack J on the host (auto: off the CPU above 1e6 pairs, #87)",
     )
     ap.add_argument("--cache-dir", default=None, help="cache built systems as .pt files")
+    ap.add_argument(
+        "--outcore",
+        default="auto",
+        choices=("auto", "on", "off"),
+        help="build B to an on-disk store (examples/df_store.py); auto: above OUTCORE_GB",
+    )
+    ap.add_argument("--store-dir", default=None, help="df_store root (default $TRNSCI_DF_DIR)")
     ap.add_argument(
         "--no-density-energy",
         dest="density_energy",

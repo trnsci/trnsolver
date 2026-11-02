@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`examples/df_store.py`: out-of-core DF integrals (#15).** At n_ao 1658
+  PySCF's in-core build held two float64 copies of B (133 GB, over the 124 GB
+  host), and window 3 had to go through a 67 GB HDF5 file and a separate fp32
+  conversion.
+  - `build_pyscf_store` computes `B = (mn|P) L^{-T}` a block of AO shell rows
+    at a time (PySCF `int3c2e`, `aosym="s2ij"`, then a triangular solve with
+    the metric's Cholesky factor, or PySCF's eigen fallback) and writes each
+    block's packed rows straight into the chunk files. Peak host memory is
+    one row block (1 GiB by default) plus the metric. It is the same tensor as
+    `df.incore.cholesky_eri` (CPU test, 1e-12).
+  - The store is a directory: `meta.json`, `system.pt` (H, S, nocc, e_nuc,
+    reference) and one C-contiguous `(npair, nq)` `.npy` file per aux chunk.
+    The chunks are 128-multiples under 2 GiB, below the 4 GiB
+    transposed-LHS limit (aws-neuron-sdk#1457). Each is one sequential read,
+    and memory-mapped without a copy.
+  - `DFStore` serves `B.shape`, `B.dtype` and `B[:, q0:q1]`, so `DFJK`
+    takes it as is, plus per-chunk loaders for streaming. fp32 by default:
+    33.4 GB at n_ao 1658.
+  - The synthetic H2-lattice integrals are generated in pair-row blocks too
+    (`h2_lattice(n, store=...)`).
+- **`make_system` goes out of core by default above `OUTCORE_GB` = 16 GB of
+  estimated build memory** (`outcore=True|False|None`). Stores go under
+  `store_dir` (default `$TRNSCI_DF_DIR` or `~/.cache/trnsci/df`), and a
+  finished store is reused without recomputing anything. With an
+  out-of-core build the PySCF reference energy is off unless asked for, and
+  uses PySCF's own DF build. `--outcore`, `--store-dir` and `--store-dtype`
+  on the example; `--outcore` and `--store-dir` on `bench_scf.py`.
+- **`pyscf:water<k>`**: a synthetic cluster of k water molecules on a 3.1 Å
+  cubic lattice with seeded orientations. `pyscf_mol` / `pyscf_sizes` give
+  the molecule and its basis sizes without computing integrals.
+
 ### Changed
 
 - **`examples/scf_df_rhf.py`: a noise-aware convergence test for fp32

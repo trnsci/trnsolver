@@ -34,6 +34,15 @@ Systems:
     pyscf:<name>@<basis> the same in another basis, fitted with <basis>-jkfit
                          (e.g. pyscf:alkane40@aug-cc-pvdz, n_ao = 1658, whose
                          diffuse functions make S near-singular).
+    pyscf:water<k>       a synthetic cluster of k water molecules on a cubic
+                         lattice (3.1 Angstrom spacing, seeded orientations).
+
+Out-of-core integrals: above ``OUTCORE_GB`` of estimated build memory (or
+with ``--outcore``) ``make_system`` builds B to an on-disk store
+(``examples/df_store.py``: one (npair, nq) .npy file per aux chunk, written a
+block of AO rows at a time, no full in-memory copy) under ``--store-dir``
+(default ``$TRNSCI_DF_DIR`` or ~/.cache/trnsci/df) and reuses it on the
+next run. ``System.B`` is then a ``DFStore``.
 
 Usage:
     python examples/scf_df_rhf.py --system h2-lattice:4
@@ -49,11 +58,21 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 
 import torch
+
+try:  # examples/df_store.py, next to this file
+    import df_store
+except ImportError:  # imported as a module from elsewhere
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    import df_store
 
 STAGES = ("jk", "fock", "diis", "eigh", "density", "energy")
 
@@ -64,6 +83,11 @@ STAGES = ("jk", "fock", "diis", "eigh", "density", "energy")
 # 330 ms J/K stage).
 HOST_PACK_NPAIR = 1_000_000
 
+# Build the DF integrals to disk (df_store) when the in-memory build would
+# need more than this many GB of host memory: PySCF's in-core path holds
+# two float64 copies (133 GB at n_ao 1658, against a 124 GB host, #15).
+OUTCORE_GB = 16.0
+
 
 # ---------------------------------------------------------------------------
 # Systems
@@ -72,15 +96,20 @@ HOST_PACK_NPAIR = 1_000_000
 
 @dataclass
 class System:
-    """One-electron matrices and packed DF integrals, float64 on the host."""
+    """One-electron matrices (float64, host) and packed DF integrals.
+
+    ``B`` is an in-memory (npair, naux) tensor or a ``df_store.DFStore``
+    (out of core, aux chunks on disk).
+    """
 
     name: str
     H: torch.Tensor  # (n, n) core Hamiltonian
     S: torch.Tensor  # (n, n) overlap
-    B: torch.Tensor  # (npair, naux) packed DF integrals, pack_tril order
+    B: torch.Tensor  # (npair, naux) packed DF integrals, pack_tril order (or a DFStore)
     nocc: int
     e_nuc: float
     ref_energy: float | None = None  # independent fp64 reference (PySCF), if any
+    build: dict = field(default_factory=dict)  # build time / memory / store path
 
     @property
     def nao(self) -> int:
@@ -157,8 +186,9 @@ def s_gaussian_system(
     aux_exps=_H_AUX_EXP,
     *,
     name: str = "s-gaussian",
-    aux_block: int = 64,
     lindep: float = 1e-10,
+    store: str | None = None,
+    store_dtype: torch.dtype = torch.float32,
 ) -> System:
     """Closed-form integrals for normalised primitive s Gaussians.
 
@@ -166,6 +196,8 @@ def s_gaussian_system(
     two-centre (P|Q) Coulomb integrals all reduce to the Boys function F0.
     The metric is inverted canonically (eigenvalues below ``lindep`` x max
     are dropped), so ``naux`` can come out below the fitting-set size.
+    With ``store`` (a directory) B is written there block by block
+    (``df_store``, in ``store_dtype``) and ``System.B`` is a ``DFStore``.
     """
     cen, a = _s_shells(centres, ao_exps)
     n = a.shape[0]
@@ -204,28 +236,33 @@ def s_gaussian_system(
     keep = w > lindep * w.max()
     Minv_half = U[:, keep] / torch.sqrt(w[keep])  # (naux_raw, naux)
 
-    # Packed three-centre integrals (mn|P), m >= n, blocked over P.
+    # Packed three-centre integrals (mn|P), m >= n, in blocks of pair rows:
+    # each block is (rows, naux_raw) @ Minv_half, so B is never needed whole.
     tri = torch.tril_indices(n, n)
     pm, pn = tri[0], tri[1]
     pp = p[pm, pn]
     pre = (nn * kab)[pm, pn]
     Pp = Pc[pm, pn]  # (npair, 3)
-    out = torch.zeros(pm.shape[0], int(keep.sum()), dtype=torch.float64)
-    for q0 in range(0, g.shape[0], aux_block):
-        gq_ = g[q0 : q0 + aux_block]
-        xq = xc[q0 : q0 + aux_block]
-        d2 = ((Pp[:, None, :] - xq[None, :, :]) ** 2).sum(-1)
-        rho = pp[:, None] * gq_[None, :] / (pp[:, None] + gq_[None, :])
+    del tri, pm, pn
+    naux = int(keep.sum())
+    npair = pp.shape[0]
+
+    def rows(p0, p1):
+        ppb, preb = pp[p0:p1, None], pre[p0:p1, None]
+        d2 = ((Pp[p0:p1, None, :] - xc[None, :, :]) ** 2).sum(-1)
+        rho = ppb * g[None, :] / (ppb + g[None, :])
         three = (
-            pre[:, None]
-            * ng[q0 : q0 + aux_block][None, :]
+            preb
+            * ng[None, :]
             * 2.0
             * math.pi**2.5
-            / (pp[:, None] * gq_[None, :] * torch.sqrt(pp[:, None] + gq_[None, :]))
+            / (ppb * g[None, :] * torch.sqrt(ppb + g[None, :]))
             * _boys0(rho * d2)
         )
-        out += three @ Minv_half[q0 : q0 + aux_block]
+        return three @ Minv_half
 
+    # ~4 float64 (rows, naux_raw) temporaries per block, about 256 MB.
+    row_block = max(1, (1 << 25) // (4 * g.shape[0]))
     zz = charges[:, None] * charges[None, :]
     rr = torch.cdist(centres, centres)
     iu = torch.triu_indices(len(charges), len(charges), 1)
@@ -233,7 +270,27 @@ def s_gaussian_system(
     nelec = int(round(float(charges.sum())))
     if nelec % 2:
         raise ValueError("closed-shell RHF needs an even electron count")
-    return System(name, H, S, out, nelec // 2, e_nuc)
+    fields = dict(name=name, H=H, S=S, nocc=nelec // 2, e_nuc=e_nuc)
+    if store is not None:
+        t0 = time.perf_counter()
+        B = df_store.build_rows_store(
+            n,
+            naux,
+            rows,
+            store,
+            dtype=store_dtype,
+            row_block=row_block,
+            system_fields=fields,
+            extra_meta={"spec": name},
+        )
+        build = dict(B.meta["build"], store=store, outcore=True)
+        build["build_s"] = time.perf_counter() - t0
+        return System(B=B, build=build, **fields)
+    out = torch.empty(npair, naux, dtype=torch.float64)
+    for p0 in range(0, npair, row_block):
+        p1 = min(npair, p0 + row_block)
+        out[p0:p1] = rows(p0, p1)
+    return System(B=out, **fields)
 
 
 def h2_lattice(n_mol: int, seed: int = 0, **kw) -> System:
@@ -274,6 +331,52 @@ _PYSCF_GEOMETRIES = {
 }
 
 
+def _water_cluster_atoms(k: int, spacing: float = 3.1, seed: int = 0):
+    """k water molecules on a cubic lattice (Angstrom), seeded random orientations.
+
+    A synthetic cluster: O at the lattice sites (``spacing`` apart), each
+    molecule rigidly rotated (O-H 0.9572, H-O-H 104.52 degrees) and redrawn
+    until no H is within 1.5 Angstrom of another molecule's atoms.
+    """
+    g = torch.Generator().manual_seed(seed)
+    side = math.ceil(k ** (1.0 / 3.0))
+    sites = [(i, j, m) for i in range(side) for j in range(side) for m in range(side)][:k]
+    half = math.radians(104.52) / 2
+    local = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [0.9572 * math.sin(half), 0.0, 0.9572 * math.cos(half)],
+            [-0.9572 * math.sin(half), 0.0, 0.9572 * math.cos(half)],
+        ],
+        dtype=torch.float64,
+    )
+    placed: list[torch.Tensor] = []
+    for site in sites:
+        o = torch.tensor(site, dtype=torch.float64) * spacing
+        for _ in range(100):
+            q, _r = torch.linalg.qr(torch.randn(3, 3, generator=g, dtype=torch.float64))
+            xyz = local @ q.T + o
+            if not placed or float(torch.cdist(xyz, torch.cat(placed)).min()) > 1.5:
+                break
+        placed.append(xyz)
+    atoms = []
+    for xyz in placed:
+        for sym, c in zip(("O", "H", "H"), xyz.tolist(), strict=True):
+            atoms.append((sym, tuple(c)))
+    return atoms
+
+
+def _molecule_atoms(name: str):
+    """Atom list (Angstrom) of a named example system."""
+    if name == "benzene":
+        return _benzene_atoms()
+    if name.startswith("alkane"):
+        return _alkane_atoms(int(name[len("alkane") :]))
+    if name.startswith("water") and name != "water":
+        return _water_cluster_atoms(int(name[len("water") :]))
+    return _PYSCF_GEOMETRIES[name]
+
+
 def _benzene_atoms():
     atoms = []
     for i in range(6):
@@ -283,53 +386,172 @@ def _benzene_atoms():
     return atoms
 
 
+def pyscf_mol(name: str, basis: str = "cc-pvdz"):
+    """The PySCF ``Mole`` of a named example system (no integrals computed)."""
+    from pyscf import gto
+
+    return gto.M(atom=_molecule_atoms(name), basis=basis, verbose=0)
+
+
+def pyscf_sizes(name: str, basis: str = "cc-pvdz", auxbasis: str | None = None) -> dict:
+    """n_ao, naux (before metric decomposition), nocc and atom count, from the basis only."""
+    from pyscf import df
+
+    mol = pyscf_mol(name, basis)
+    auxmol = df.addons.make_auxmol(mol, auxbasis or f"{basis}-jkfit")
+    return {"nao": mol.nao, "naux": auxmol.nao, "nocc": mol.nelectron // 2, "natm": mol.natm}
+
+
 def pyscf_system(
     name: str,
     basis: str = "cc-pvdz",
     auxbasis: str = "cc-pvdz-jkfit",
-    reference: bool = True,
+    reference: bool | None = None,
+    store: str | None = None,
+    store_dtype: torch.dtype = torch.float32,
+    outcore: bool | None = None,
+    outcore_gb: float | None = None,
 ) -> System:
     """Real-molecule integrals from PySCF; ``reference`` also runs PySCF's DF-RHF.
 
     For a basis other than cc-pVDZ the reference removes S's linear
     dependencies the PySCF way (``scf.addons.remove_linear_dep_``).
-    """
-    from pyscf import df, gto, lib, scf
 
-    if name == "benzene":
-        atom = _benzene_atoms()
-    elif name.startswith("alkane"):
-        atom = _alkane_atoms(int(name[len("alkane") :]))
-    else:
-        atom = _PYSCF_GEOMETRIES[name]
-    mol = gto.M(atom=atom, basis=basis, verbose=0)
+    Out of core (``outcore``; default: when PySCF's in-core build, two
+    float64 copies of B, would exceed ``outcore_gb``, default
+    :data:`OUTCORE_GB`), B is built block by block into the store directory
+    ``store`` (``df_store.build_pyscf_store``; the same B as
+    ``df.incore.cholesky_eri``) and the reference, when asked for, uses
+    PySCF's own DF build. ``reference`` defaults to in-core builds only.
+    """
+    from pyscf import df, lib, scf
+
+    t0 = time.perf_counter()
+    mol = pyscf_mol(name, basis)
+    naux_est = df.addons.make_auxmol(mol, auxbasis).nao
+    est = df_store.pyscf_incore_bytes(mol.nao, naux_est)
+    limit = 1e9 * (OUTCORE_GB if outcore_gb is None else outcore_gb)
+    if outcore is None:
+        outcore = est > limit
+    if reference is None:
+        reference = not outcore
     H = torch.from_numpy(mol.intor_symmetric("int1e_kin") + mol.intor_symmetric("int1e_nuc"))
     S = torch.from_numpy(mol.intor_symmetric("int1e_ovlp"))
-    cderi = df.incore.cholesky_eri(mol, auxbasis=auxbasis)  # (naux, npair)
+    tag = name if basis.lower() == "cc-pvdz" else f"{name}@{basis}"
+    fields = dict(
+        name=f"pyscf:{tag}", H=H, S=S, nocc=mol.nelectron // 2, e_nuc=float(mol.energy_nuc())
+    )
+    cderi = None
+    if outcore:
+        if store is None:
+            store = os.path.join(
+                df_store.default_store_root(), _store_tag(fields["name"], store_dtype)
+            )
+        B = df_store.build_pyscf_store(
+            mol,
+            auxbasis,
+            store,
+            dtype=store_dtype,
+            system_fields=fields,
+            extra_meta={"spec": fields["name"], "basis": basis},
+        )
+        build = dict(B.meta["build"], store=store, outcore=True, incore_estimate_bytes=est)
+    else:
+        cderi = df.incore.cholesky_eri(mol, auxbasis=auxbasis)  # (naux, npair)
+        B = torch.from_numpy(lib.transpose(cderi))  # (npair, naux)
+        build = {"outcore": False, "incore_estimate_bytes": est}
+    build["build_s"] = time.perf_counter() - t0
+    build["peak_rss_bytes"] = df_store.peak_rss_bytes()
     ref = None
     if reference:
         mf = scf.RHF(mol).density_fit(auxbasis=auxbasis)
-        mf.with_df._cderi = cderi
+        if cderi is not None:
+            mf.with_df._cderi = cderi
         mf.conv_tol = 1e-11
         if basis.lower() != "cc-pvdz":
             mf = scf.addons.remove_linear_dep_(mf)
         ref = float(mf.kernel())
-    B = torch.from_numpy(lib.transpose(cderi))  # (npair, naux)
-    tag = name if basis.lower() == "cc-pvdz" else f"{name}@{basis}"
-    return System(f"pyscf:{tag}", H, S, B, mol.nelectron // 2, float(mol.energy_nuc()), ref)
+    if outcore and ref is not None:
+        # Record the reference with the store so a cached load keeps it.
+        torch.save(dict(fields, ref_energy=ref), os.path.join(store, "system.pt"))
+    return System(B=B, ref_energy=ref, build=build, **fields)
 
 
-def make_system(spec: str, **kw) -> System:
+def _store_tag(name: str, dtype: torch.dtype) -> str:
+    return name.replace(":", "_").replace("@", "_") + "-" + str(dtype).replace("torch.", "")
+
+
+def load_store_system(path: str) -> System:
+    """A system from a finished store directory (``df_store``)."""
+    B = df_store.DFStore(path)
+    f = df_store.load_system_fields(path)
+    return System(B=B, build=dict(B.meta.get("build", {}), store=path, outcore=True), **f)
+
+
+def make_system(
+    spec: str,
+    *,
+    outcore: bool | None = None,
+    store_dir: str | None = None,
+    store_dtype: torch.dtype = torch.float32,
+    outcore_gb: float | None = None,
+    reuse: bool = True,
+    **kw,
+) -> System:
+    """The system ``spec`` (see the module docstring).
+
+    Out of core (``outcore=True``, or by default when the in-memory build
+    would need more than ``outcore_gb`` GB, :data:`OUTCORE_GB`), B goes to
+    ``<store_dir>/<spec>-<dtype>`` (``store_dir`` default
+    ``df_store.default_store_root()``) and a finished store there is reused
+    (``reuse``) without recomputing anything.
+    """
     kind, _, arg = spec.partition(":")
+    root = store_dir or df_store.default_store_root()
+    if outcore is not False and reuse:
+        path = os.path.join(root, _store_tag(_canonical_name(spec), store_dtype))
+        if df_store.store_complete(path, {"spec": _canonical_name(spec)}):
+            return load_store_system(path)
     if kind == "h2-lattice":
-        return h2_lattice(int(arg or 4))
+        n_mol = int(arg or 4)
+        if outcore is None:
+            # Two float64 (npair, naux) copies: the build and the System.
+            n = 8 * n_mol
+            est = 2 * df_store.df_bytes(n, 8 * 2 * n_mol, 8)
+            outcore = est > 1e9 * (OUTCORE_GB if outcore_gb is None else outcore_gb)
+        if outcore:
+            path = os.path.join(root, _store_tag(f"h2-lattice:{n_mol}", store_dtype))
+            return h2_lattice(n_mol, store=path, store_dtype=store_dtype)
+        return h2_lattice(n_mol)
     if kind == "pyscf":
         name, _, basis = (arg or "water").partition("@")
         if basis:
             kw.setdefault("basis", basis)
             kw.setdefault("auxbasis", f"{basis}-jkfit")
+        if outcore is not False:
+            kw.setdefault("outcore", outcore)
+            kw.setdefault("outcore_gb", outcore_gb)
+            kw.setdefault("store_dtype", store_dtype)
+            kw.setdefault(
+                "store", os.path.join(root, _store_tag(_canonical_name(spec), store_dtype))
+            )
+        else:
+            kw.setdefault("outcore", False)
         return pyscf_system(name, **kw)
     raise ValueError(f"unknown system {spec!r}")
+
+
+def _canonical_name(spec: str) -> str:
+    """``System.name`` of a spec: pyscf:x@cc-pvdz is pyscf:x."""
+    kind, _, arg = spec.partition(":")
+    if kind == "pyscf":
+        name, _, basis = (arg or "water").partition("@")
+        return (
+            f"pyscf:{name}" if not basis or basis.lower() == "cc-pvdz" else f"pyscf:{name}@{basis}"
+        )
+    if kind == "h2-lattice":
+        return f"h2-lattice:{int(arg or 4)}"
+    return spec
 
 
 # ---------------------------------------------------------------------------
@@ -1163,6 +1385,16 @@ def main():
     ap.add_argument("--no-diis", action="store_true")
     ap.add_argument("--max-iter", type=int, default=60)
     ap.add_argument(
+        "--outcore",
+        default="auto",
+        choices=("auto", "on", "off"),
+        help=f"build B to an on-disk store (auto: above {OUTCORE_GB:g} GB of build memory)",
+    )
+    ap.add_argument("--store-dir", default=None, help="store root (default $TRNSCI_DF_DIR)")
+    ap.add_argument(
+        "--store-dtype", default="float32", choices=("float32", "float64"), help="store dtype"
+    )
+    ap.add_argument(
         "--conv",
         default="auto",
         choices=("auto", "energy", "density"),
@@ -1174,7 +1406,14 @@ def main():
     if args.device.startswith("neuron"):
         import torch_neuronx  # noqa: F401
 
-    system = make_system(args.system)
+    system = make_system(
+        args.system,
+        outcore={"auto": None, "on": True, "off": False}[args.outcore],
+        store_dir=args.store_dir,
+        store_dtype=getattr(torch, args.store_dtype),
+    )
+    if system.build.get("outcore"):
+        print(f"# B out of core: {system.B!r}")
     print(
         f"{system.name}: n_ao={system.nao} naux={system.naux} nocc={system.nocc} "
         f"device={args.device} dtype={args.dtype} solver={args.solver}"
