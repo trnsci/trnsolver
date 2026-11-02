@@ -42,11 +42,17 @@ from .nki import HAS_NKI, get_backend, set_backend
 # Orthogonalizers (overlap matrices with near-linear dependencies)
 from .orthogonalize import Orthogonalizer, orthogonalizer
 
+# Occupied-subspace solver for SCF (Chebyshev-filtered subspace iteration)
+from .subspace import SubspaceResult, SubspaceState, occupied_subspace
+
 __all__ = [
     # Eigen
     "eigh",
     "eigh_generalized",
     "eigh_randomized",
+    "occupied_subspace",
+    "SubspaceState",
+    "SubspaceResult",
     # Factorization
     "cholesky",
     "lu",

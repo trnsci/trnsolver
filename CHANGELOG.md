@@ -50,9 +50,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `A = P @ L @ U` (the `torch.linalg.lu` convention), which differs whenever
   the pivot permutation is not its own inverse. The docs now match; the
   returned values are unchanged. Affected docs: every release through 0.20.0.
+- **A real matrix with a complex right-hand side dropped the imaginary part
+  (#66).** `solve`, `solve_spd` and `eigh_generalized` cast B to A's dtype,
+  so a complex B lost its imaginary part with only a UserWarning, and the
+  result was real. A real A is now promoted to complex when B is complex.
+  Real B is unchanged. Affected: 0.7.0–0.20.0. `eigh_generalized(A, None,
+  X=X)` (new on main, #72) likewise promotes a real A for a complex X.
 
 ### Added
 
+- **`occupied_subspace(F, k, guess=state)`: lowest-k eigensolver for SCF
+  (#77).** Warm-started Chebyshev-filtered subspace iteration. Per pass,
+  one NKI launch (`trnsolver/nki/subspace.py`) keeps F resident in SBUF,
+  runs the degree-8 filter as Tensor Engine GEMMs, forms the correction
+  E = Y - X X^T Y and the six Gram blocks of span[X, E]; the 2kb x 2kb
+  Rayleigh-Ritz runs in float64 on the host. FP32 DF-RHF on the host
+  reference filter converges in the same iterations as with a full `eigh`
+  (water 10 / 10, benzene 11 / 10, H2 lattice 9 / 10, C10H22 16 / 16).
+  `examples/scf_df_rhf.py --solver subspace`, `bench_scf.py --solver
+  subspace`, `scripts/bench_occupied_subspace.py`. Simulator and MLIR
+  verified (lnc = 1, 2). On Trn2 the `-m neuron` tests pass at LNC = 1
+  and 2, with the trace cache on and off. Per call (2 passes) it takes
+  13 / 16 / 44 ms at n = 250 / 490 / 970, against 3.8 / 12.6 / 68 ms for
+  aten `eigh`. The host Rayleigh-Ritz dominates at n = 970. In DF-RHF it
+  did not beat the full `eigh` in time to convergence at any measured
+  size (docs/api/eigen.md).
 - **`orthogonalizer(S, method, lindep)` and `eigh_generalized(F, S, X=X)`:
   a tolerance for near-singular overlaps (#72, for #15).** `"symmetric"`
   (Loewdin S^-1/2, the default), `"canonical"` (keeps the eigenvalues of S

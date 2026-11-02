@@ -28,6 +28,10 @@ host LAPACK, ``trnsolver.eigh`` on a ``neuron`` tensor (default dispatch),
 its host-fallback parts (D2H, LAPACK, H2D), the single-matrix Jacobi kernel
 (n <= 128) and ``trnsolver.eigh`` of a host tensor with the NKI backend.
 
+``--solver subspace`` replaces the per-iteration eigh by
+``trnsolver.occupied_subspace`` (warm-started Chebyshev-filtered subspace
+iteration; ``--subspace-opts`` passes its keyword arguments as JSON).
+
 Examples:
     OMP_NUM_THREADS=2 taskset -c 2,8 python scripts/bench_scf.py \\
         --systems h2-lattice:16,pyscf:benzene --modes cpu,cpu64,neuron,neuron-nosync
@@ -38,6 +42,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import statistics
 import sys
@@ -81,6 +86,7 @@ def _run_mode(system: System, mode: str, args):
     library first-call costs); its time is reported as ``cold``."""
     kw = dict(
         solver=args.solver,
+        subspace_opts=json.loads(args.subspace_opts) if args.subspace_opts else None,
         orth=args.orth,
         lindep=args.lindep,
         k_cache_gb=args.k_cache_gb,
@@ -153,6 +159,9 @@ def bench_scf(args) -> None:
                 + ",".join(f"{k}:{v:.1f}" for k, v in res.setup_ms.items()),
                 flush=True,
             )
+            if res.info.get("subspace"):
+                # (degree, passes) per iteration; (0, 0) is a full eigh (cold or refresh).
+                print("SUBSPACE " + json.dumps(res.info["subspace"]), flush=True)
         for row in rows:
             if row["system"] == system.name:
                 row["ref"] = ref
@@ -282,7 +291,14 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--systems", default="h2-lattice:16")
     ap.add_argument("--modes", default="cpu,cpu64")
-    ap.add_argument("--solver", default="orth", choices=("orth", "generalized", "purify"))
+    ap.add_argument(
+        "--solver", default="orth", choices=("orth", "generalized", "purify", "subspace")
+    )
+    ap.add_argument(
+        "--subspace-opts",
+        default="",
+        help="JSON keyword arguments for occupied_subspace, e.g. '{\"passes\": 2}'",
+    )
     ap.add_argument("--orth", default="symmetric", choices=("symmetric", "canonical", "cholesky"))
     ap.add_argument("--lindep", type=float, default=1e-7)
     ap.add_argument("--max-iter", type=int, default=60)

@@ -224,8 +224,6 @@ def _decide(what):
     return pytest.mark.xfail(strict=True, reason=f"trnsci/trnsolver#76 needs decision: {what}")
 
 
-X66 = _pending(66, 67, "real A with complex B drops B's imaginary part")
-
 KNOWN: dict[str, pytest.MarkDecorator] = {}  # filled in next to each case table
 
 
@@ -1086,9 +1084,9 @@ def test_iterative_dtype(solver, dt):
 
 
 MIXED = [
-    P("solve-Af32-Bc64", "solve", marks=X66),
-    P("solve_spd-Af32-Bc64", "solve_spd", marks=X66),
-    P("eigh_generalized-Af32-Bc64", "eigh_generalized", marks=X66),
+    P("solve-Af32-Bc64", "solve"),
+    P("solve_spd-Af32-Bc64", "solve_spd"),
+    P("eigh_generalized-Af32-Bc64", "eigh_generalized"),
 ]
 
 

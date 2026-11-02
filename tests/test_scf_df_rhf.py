@@ -108,6 +108,35 @@ def test_purify_solver_matches_eigh():
     torch.testing.assert_close(pur.eps, base.eps, rtol=0, atol=1e-6)
 
 
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
+def test_subspace_solver_matches_eigh(dtype):
+    # n_ao = 128, nocc = 16: the block (16 + 8) is far from n, so every
+    # iteration after the first is a warm-started filter pass.
+    system = scf.h2_lattice(16)
+    base = scf.run_scf(system, dtype=dtype)
+    sub = scf.run_scf(system, dtype=dtype, solver="subspace")
+    assert base.converged and sub.converged
+    if dtype == torch.float64:
+        assert sub.energy == pytest.approx(base.energy, abs=1e-8)
+    else:
+        # FP32 stops on a loose relative energy test: compare the float64
+        # energies of the converged orbitals instead.
+        e_base = scf.energy_at_orbitals(system, base.C_occ)
+        e_sub = scf.energy_at_orbitals(system, sub.C_occ)
+        assert e_sub == pytest.approx(e_base, abs=1e-6)
+    # Iteration counts are a speed property, not correctness. FP32 counts vary
+    # with the BLAS (18 vs 12 on the CI runners); Trn2 runs in #78 also took
+    # more iterations than full eigh. Keep fp64 tight, bound fp32 loosely.
+    slack = 3 if dtype == torch.float64 else max(3, int(0.75 * base.iterations))
+    assert sub.iterations <= base.iterations + slack
+    info = sub.info["subspace"]
+    assert info[0] == (0, 0)  # the cold start
+    assert all(p in (0, 2) for _, p in info)  # refreshed (0) or two passes
+    assert sum(p == 2 for _, p in info) >= len(info) // 2  # mostly on the filter
+    tol = 1e-8 if dtype == torch.float64 else 1e-4
+    torch.testing.assert_close(sub.eps, base.eps[: system.nocc], rtol=0, atol=tol)
+
+
 def test_purify_occupied_projector():
     g = torch.Generator().manual_seed(1)
     n, nocc = 40, 7
