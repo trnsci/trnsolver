@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Eager NKI kernel calls skip the per-call handle rebuild and the custom-op
+  layer (same fix as trnblas#92).** On the native path a `trnsolver::`
+  custom-op call cost about 0.1 ms of host time before the kernel was queued,
+  against 0.016 ms for aten. Most of it went to nki's `Kernel.__call__`,
+  which rebuilds the torch handle on every call, plus the `torch.library`
+  layer. `dispatch._launch` now calls a `torch_neuronx.wrap_nki` handle built
+  once per kernel; `static=` arguments (the Jacobi `onezero`) get the op
+  body's `int()`. On trn2 (LNC=2), a `matvec` launch drops from 0.121 to
+  0.032 ms of issue time (e2e 0.203 to 0.130 ms) and a 128x128x32 `matmul`
+  from 0.123 to 0.032 ms (e2e 0.196 to 0.117 ms). `eigh` itself is host-bound
+  and gains less: n=32 on the Householder kernels 86.7 to 76.1 ms, a 4x32x32
+  Jacobi batch 6.10 to 5.95 ms. Results are bit-identical. `torch.compile`,
+  requires-grad, int64 and tensor-subclass inputs keep the custom op.
+  `TRNSOLVER_NKI_EAGER_HANDLE=0` turns this off;
+  `scripts/bench_eager_handle.py` measures it.
+
 ### Fixed
 
 - **`eigh` on the NKI Householder path: float64 input gave garbage, and n = 1

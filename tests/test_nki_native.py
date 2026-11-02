@@ -130,6 +130,77 @@ class TestNativeDispatch:
         torch.testing.assert_close(out, expected.float() * 2.0, rtol=tol, atol=2 * tol)
 
 
+class TestEagerHandle:
+    """Eager calls take the cached handle; results match the custom op bit for bit."""
+
+    @pytest.fixture
+    def D(self, monkeypatch):
+        from trnsolver.nki import dispatch
+
+        monkeypatch.setattr(dispatch, "_eager_handles", {})
+        return dispatch
+
+    @pytest.mark.parametrize("name", OPS)
+    def test_handle_matches_op_and_is_cached(self, D, name):
+        args, expected, tol = _cases()[name]
+        dev = [a.to(DEV) for a in args]
+        op = D._get_native_ops()[name](*dev).cpu()
+        for _ in range(3):
+            out = D._native_call(name, dev)
+            assert out.device.type == DEV
+            assert torch.equal(out.cpu(), op)
+        assert list(D._eager_handles) == [id(D._native_kernel(name)[0])]
+        torch.testing.assert_close(op.float(), expected.float(), rtol=tol, atol=tol)
+
+    def _on_off(self, D, monkeypatch, fn):
+        monkeypatch.setattr(D, "_EAGER_HANDLE_ENABLED", False)
+        ref = tuple(t.cpu() for t in fn())
+        assert D._eager_handles == {}
+        monkeypatch.setattr(D, "_EAGER_HANDLE_ENABLED", True)
+        return tuple(t.cpu() for t in fn()), ref
+
+    def test_eigh_householder_kernels(self, D, monkeypatch):
+        monkeypatch.setenv("TRNSOLVER_EIGH_NKI_MIN_N", "0")
+        A = _sym(32, seed=32)
+        (w, V), (w0, V0) = self._on_off(D, monkeypatch, lambda: trnsolver.eigh(A.to(DEV)))
+        assert torch.equal(w, w0) and torch.equal(V, V0)
+        assert D._eager_handles, "no kernel launch went through the handle"
+        ref = torch.linalg.eigh(A).eigenvalues
+        torch.testing.assert_close(w, ref, rtol=1e-3, atol=1e-3)
+
+    @pytest.mark.parametrize("batch,n", [(4, 32), (2, 64)])
+    def test_eigh_jacobi_static_arg_passes_through(self, D, monkeypatch, batch, n):
+        """The Jacobi kernels take `onezero` as a `static=` argument."""
+        from trnsolver.nki import jacobi
+
+        A = torch.stack([_sym(n, seed=n + i) for i in range(batch)])
+        (w, V), (w0, V0) = self._on_off(
+            D, monkeypatch, lambda: trnsolver.eigh(A.to(DEV), method="jacobi")
+        )
+        assert torch.equal(w, w0) and torch.equal(V, V0)
+        jk = {id(getattr(jacobi, k, None)) for k in ("jacobi_sweeps_kernel", "jacobi_block_kernel")}
+        assert jk & set(D._eager_handles), "no Jacobi launch went through the handle"
+        ref = torch.linalg.eigh(A).eigenvalues
+        torch.testing.assert_close(w, ref, rtol=1e-3, atol=1e-3)
+
+    def test_flag_off_uses_op(self, D, monkeypatch):
+        monkeypatch.setattr(D, "_EAGER_HANDLE_ENABLED", False)
+        args, expected, tol = _cases()["matmul"]
+        out = D._native_call("matmul", [a.to(DEV) for a in args]).cpu()
+        assert D._eager_handles == {}
+        torch.testing.assert_close(out, expected, rtol=tol, atol=tol)
+
+    def test_native_call_inside_compile_uses_op(self, D):
+        @torch.compile(backend="neuron", fullgraph=True, dynamic=False)
+        def scaled(a, v):
+            return D._native_call("matmul", [a, v]) * 2.0
+
+        args, expected, tol = _cases()["matmul"]
+        out = scaled(*(a.to(DEV) for a in args)).cpu()
+        assert D._eager_handles == {}
+        torch.testing.assert_close(out, expected * 2.0, rtol=tol, atol=2 * tol)
+
+
 class TestNativeDrivers:
     @pytest.mark.parametrize("n", [8, 32, 128])
     def test_eigh_kernel_path_device_input(self, n, monkeypatch):

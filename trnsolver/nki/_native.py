@@ -24,6 +24,8 @@ import torch
 from torch_neuronx import nki_op
 
 from . import dispatch as _d
+from . import jacobi as _j
+from . import subspace as _s
 
 # Fake (meta) implementations: output shape/dtype only, no kernel trace.
 # Used by torch.compile tracing and for meta-device inputs.
@@ -116,6 +118,22 @@ def subspace_filter(
 
     return _s.subspace_filter_kernel(F, X, table, sched)
 
+
+# The kernel each single-kernel op's body calls, as (module, attribute) plus,
+# for ops whose body converts an argument (`int(onezero)`), the conversion per
+# argument position (None: passed as is). Used by the eager handle in
+# `dispatch._native_call`, which resolves the kernel at call time (the
+# attributes exist only when nki is importable) and applies the conversions.
+KERNELS = {
+    "matvec": (_d, "matvec_kernel"),
+    "rank2_update": (_d, "rank2_update_kernel"),
+    "matmul": (_d, "matmul_kernel"),
+    "matmul_fp32out": (_d, "matmul_kernel_fp32out"),
+    "apply_reflectors": (_d, "apply_reflectors_kernel"),
+    "jacobi_sweeps": (_j, "jacobi_sweeps_kernel", (None, None, None, None, int)),
+    "jacobi_block": (_j, "jacobi_block_kernel", (None, None, None, None, int)),
+    "subspace_filter": (_s, "subspace_filter_kernel"),
+}
 
 # Keyed by the short op name used in `dispatch._launch`.
 OPS = {
