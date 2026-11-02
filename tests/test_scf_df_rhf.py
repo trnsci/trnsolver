@@ -513,6 +513,73 @@ def test_pyscf_system_outcore_matches_incore(tmp_path):
     assert loaded.nocc == 5 and loaded.B.naux == ooc.B.naux
 
 
+# ---------------------------------------------------------------------------
+# Streamed J/K (trntensor.AuxStream)
+# ---------------------------------------------------------------------------
+
+
+def _need_aux_stream():
+    trntensor = pytest.importorskip("trntensor")
+    if not hasattr(trntensor, "AuxStream"):
+        pytest.skip("trntensor without AuxStream (trntensor#102)")
+
+
+@pytest.mark.parametrize("devices", [None, ["cpu", "cpu", "cpu"]])
+@pytest.mark.parametrize("resident", [0.0, 1e12])
+@pytest.mark.parametrize("host_pack", [False, True])
+def test_streamed_jk_matches_blocks(devices, resident, host_pack):
+    _need_aux_stream()
+    system = scf.h2_lattice(20)  # naux 320
+    n = system.nao
+    g = torch.Generator().manual_seed(7)
+    C = torch.randn(n, system.nocc, generator=g, dtype=torch.float64)
+    P = 2 * C @ C.T
+    ref = scf.DFJK(system.B, n, k_cache_bytes=0, k_block=100, fused=False)
+    # 128-column chunks: 128 + 128 + 64.
+    st = scf.DFJK(
+        system.B,
+        n,
+        stream=True,
+        devices=devices,
+        resident_bytes=resident,
+        chunk_bytes=n * (n + 1) // 2 * 8 * 128,
+        host_pack=host_pack,
+    )
+    assert st.stream is not None and st.stream.widths == [128, 128, 64]
+    J, K = st.jk(P, C)
+    torch.testing.assert_close(J, ref.j(P))
+    torch.testing.assert_close(K, ref.k(C))
+    torch.testing.assert_close(st.j(P), J)
+    torch.testing.assert_close(st.k(C), K)
+
+
+def test_streamed_scf_from_store(tmp_path):
+    _need_aux_stream()
+    mem = scf.h2_lattice(6)
+    disk = scf.h2_lattice(6, store=str(tmp_path / "h2"), store_dtype=torch.float64)
+    base = scf.run_scf(mem, dtype=torch.float64)
+    res = scf.run_scf(disk, dtype=torch.float64)  # streams by default (DFStore)
+    assert res.converged and res.energy == pytest.approx(base.energy, abs=1e-11)
+    si = res.info["stream"]
+    assert si is not None and si["resident"] == 0 and len(si["iters"]) == res.iterations
+    assert all(it["bytes"] == disk.B.nbytes for it in si["iters"])
+    # In-memory B, streamed on request: same energy, nothing streamed on the
+    # CPU when everything is resident.
+    res2 = scf.run_scf(mem, dtype=torch.float64, jk_stream=True, jk_resident_gb=1e3)
+    assert res2.energy == pytest.approx(base.energy, abs=1e-11)
+    assert res2.info["stream"]["iters"][-1]["bytes"] == 0
+    # fp32 run from the fp32 store, noise-aware convergence.
+    disk32 = scf.h2_lattice(6, store=str(tmp_path / "h2f"))
+    r32 = scf.run_scf(disk32, dtype=torch.float32)
+    assert r32.converged
+    assert abs(scf.energy_at_orbitals(disk32, r32.C_occ) - base.energy) < 1e-6
+
+
+def test_stream_off_for_in_memory_by_default():
+    system = scf.h2_lattice(2)
+    assert scf.DFJK(system.B, system.nao).stream is None
+
+
 def test_truncated_basis_converges_in_orthonormal_measure():
     """With functions dropped by the orthogonalizer, the commutator and the
     density change are measured in the kept orthonormal basis, where both can

@@ -88,6 +88,12 @@ HOST_PACK_NPAIR = 1_000_000
 # two float64 copies (133 GB at n_ao 1658, against a 124 GB host, #15).
 OUTCORE_GB = 16.0
 
+# Streamed J/K (trntensor.AuxStream): per-device bytes of integral chunks
+# kept resident. One Trn2 logical core (LNC=2) has 24 GiB of HBM; an
+# allocation probe failed at 24 GB, so leave room for the kernels' working
+# memory and the compiled graphs.
+DEVICE_RESIDENT_GB = 20.0
+
 
 # ---------------------------------------------------------------------------
 # Systems
@@ -654,6 +660,18 @@ class DFJK:
     ``host_pack`` packs P (n^2 -> npair) and unpacks J (npair -> n^2) on
     the host instead of with device gathers. The default (``None``) does so
     off the CPU when npair exceeds :data:`HOST_PACK_NPAIR` (#87).
+
+    ``stream=True`` hands the integrals to ``trntensor.AuxStream``: aux
+    chunks under ``chunk_bytes`` (2 GiB, below the 4 GiB transposed-LHS limit
+    of aws-neuron-sdk#1457), dealt round-robin over ``devices``, resident up
+    to ``resident_bytes`` per device (default :data:`DEVICE_RESIDENT_GB` on
+    a NeuronCore, 0 on the CPU) and otherwise uploaded every iteration by a
+    loader thread, ``prefetch`` chunks ahead per device, while the device
+    works on the previous chunk. J and K come from one pass over the chunks
+    (``df_coulomb`` + ``df_exchange`` per chunk). The default (``None``)
+    streams an out-of-core ``df_store.DFStore`` B (from its chunk files,
+    memory-mapped) when trntensor has ``AuxStream``. Problem size is then
+    bounded by host memory or disk, not HBM.
     """
 
     def __init__(
@@ -668,6 +686,10 @@ class DFJK:
         square: bool = False,
         fused: bool | None = None,
         host_pack: bool | None = None,
+        stream: bool | None = None,
+        resident_bytes: float | None = None,
+        prefetch: int = 1,
+        chunk_bytes: int | None = None,
     ):
         import trntensor
 
@@ -695,6 +717,16 @@ class DFJK:
         self.tril = tril.to(idx_dev)
         self.pair_w = w.to(idx_dev)
         self.sym = _sym_to_packed_index(n).to(idx_dev)
+        self.stream = None
+        self.squares = None
+        self.B3 = None
+        if stream is None:
+            stream = (
+                isinstance(B, df_store.DFStore) and hasattr(trntensor, "AuxStream") and not square
+            )
+        if stream:
+            self._init_stream(B, dtype, resident_bytes, prefetch, chunk_bytes, square)
+            return
         full_bytes = n * n * naux * torch.finfo(dtype).bits // 8
         if k_block is None and self.fused:
             # No square is ever built: one block per device. Without
@@ -727,6 +759,54 @@ class DFJK:
             for i in range(len(self.blocks)):
                 self.squares.append(trntensor.unpack_tril(self.blocks[i], n))
                 self.blocks[i] = None
+
+    def _init_stream(self, B, dtype, resident_bytes, prefetch, chunk_bytes, square):
+        import trntensor
+
+        if not hasattr(trntensor, "AuxStream"):
+            raise RuntimeError("streamed J/K needs trntensor with AuxStream (trntensor#102)")
+        if square:
+            raise ValueError("stream and square are exclusive")
+        chunk_bytes = chunk_bytes or trntensor.stream.DEFAULT_CHUNK_BYTES
+        itemsize = torch.empty((), dtype=dtype).element_size()
+        npair = self.n * (self.n + 1) // 2
+        if isinstance(B, df_store.DFStore) and max(B.widths) * npair * itemsize <= chunk_bytes:
+            chunks = B.loaders()  # memory-mapped chunk files
+        else:
+            # Column views, made contiguous (and cast) as each is loaded.
+            w = trntensor.aux_chunk_width(npair, self.naux, chunk_bytes, itemsize)
+            chunks = [(lambda q0=q0, w=w: B[:, q0 : q0 + w]) for q0 in range(0, self.naux, w)]
+        if resident_bytes is None:
+            resident_bytes = 0.0 if self.device.type == "cpu" else DEVICE_RESIDENT_GB * 1e9
+        self.stream = trntensor.AuxStream(
+            chunks,
+            self.n,
+            devices=self.devices,
+            dtype=dtype,
+            resident_bytes=resident_bytes,
+            prefetch=prefetch,
+        )
+        self.fused = True
+        self.blocks = []
+        self.k_block = max(self.stream.widths)
+
+    def _stream_pw(self, P: torch.Tensor) -> torch.Tensor:
+        """Weighted packed density for the stream (on the host with ``host_pack``)."""
+        if self.host_pack:
+            return P.cpu().reshape(-1).index_select(0, self.tril) * self.pair_w
+        return P.reshape(-1).index_select(0, self.tril) * self.pair_w
+
+    def _stream_unpack(self, jp: torch.Tensor) -> torch.Tensor:
+        if self.host_pack:
+            jp = jp.cpu()
+        return jp.index_select(0, self.sym).reshape(self.n, self.n).to(self.device)
+
+    def _stream_jk(self, P, C_occ):
+        out = torch.device("cpu") if self.host_pack else self.device
+        pw = self._stream_pw(P) if P is not None else None
+        Jp, K = self.stream.jk(pw, C_occ, alpha=2.0, out_device=out)
+        J = self._stream_unpack(Jp) if Jp is not None else None
+        return J, (K.to(self.device) if K is not None else None)
 
     def _scatter(self, x: torch.Tensor) -> dict:
         """x on every device: itself on its own, through the host elsewhere."""
@@ -761,6 +841,8 @@ class DFJK:
         import trnblas
         import trntensor
 
+        if self.stream is not None:
+            return self._stream_jk(P, None)[0]
         if self.squares is not None:
             ps = self._scatter(P.reshape(-1))
             parts = {}
@@ -789,6 +871,8 @@ class DFJK:
         import trnblas
         import trntensor
 
+        if self.stream is not None:
+            return self._stream_jk(None, C_occ)[1]
         n, nocc = C_occ.shape
         cs = self._scatter(C_occ)
         parts = {}
@@ -821,6 +905,9 @@ class DFJK:
         is read once per iteration (by the half-transform GEMM) plus once by
         the J GEMV, instead of twice by J alone.
         """
+        if self.stream is not None:
+            # One pass: each streamed chunk is uploaded once for J and K.
+            return self._stream_jk(P, C_occ)
         if self.squares is None:
             return self.j(P), self.k(C_occ)
         import trnblas
@@ -1033,6 +1120,9 @@ def run_scf(
     jk_square: bool = False,
     jk_fused: bool | None = None,
     jk_host_pack: bool | None = None,
+    jk_stream: bool | None = None,
+    jk_resident_gb: float | None = None,
+    jk_prefetch: int = 1,
     subspace_opts: dict | None = None,
     verbose: bool = False,
 ) -> SCFResult:
@@ -1092,8 +1182,11 @@ def run_scf(
     picks the fused packed-integral K (:class:`DFJK`; default: on a neuron
     device when trntensor has ``df_exchange``) and ``jk_host_pack`` packs
     P / unpacks J on the host (default: off the CPU above
-    :data:`HOST_PACK_NPAIR` pairs, #87); everything else stays on
-    ``device``.
+    :data:`HOST_PACK_NPAIR` pairs, #87); ``jk_stream`` streams the integrals
+    over aux chunks (``trntensor.AuxStream``; default: for an out-of-core
+    B) with ``jk_resident_gb`` per device kept resident (default
+    :data:`DEVICE_RESIDENT_GB` on a NeuronCore) and ``jk_prefetch`` uploads
+    in flight per device. Everything else stays on ``device``.
     """
     import trnblas
 
@@ -1144,6 +1237,9 @@ def run_scf(
         square=jk_square,
         fused=jk_fused,
         host_pack=jk_host_pack,
+        stream=jk_stream,
+        resident_bytes=None if jk_resident_gb is None else jk_resident_gb * 1e9,
+        prefetch=jk_prefetch,
     )
     sync()
     setup["upload"] = 1e3 * (time.perf_counter() - t0)
@@ -1174,6 +1270,7 @@ def run_scf(
     stage_ms: list[dict[str, float]] = []
     converged = False
     history: dict[str, list[float]] = {"dE": [], "err_rms": [], "dp_rms": []}
+    stream_iters: list[dict] = []
     e_noise = float("nan")
     d_noise = float("nan")
     P_prev = None
@@ -1184,6 +1281,11 @@ def run_scf(
         tm.start("jk")
         J, K = jk.jk(P, C_occ)
         tm.stop()
+        if jk.stream is not None:
+            st = jk.stream.stats
+            stream_iters.append(
+                {"bytes": st.bytes_streamed, "wait_s": st.wait_s, "load_s": st.load_s}
+            )
 
         tm.start("fock")
         F = H + J - 0.5 * K
@@ -1303,6 +1405,14 @@ def run_scf(
         info={
             "k_block": jk.k_block,
             "host_pack": jk.host_pack,
+            "stream": None
+            if jk.stream is None
+            else {
+                "chunks": len(jk.stream.widths),
+                "width": jk.k_block,
+                "resident": jk.stream.stats.chunks_resident,
+                "iters": stream_iters,
+            },
             "conv": conv,
             "e_noise": e_noise,
             "d_noise": d_noise,
@@ -1365,10 +1475,12 @@ def _energy_at_orbitals(system: System, C_occ: torch.Tensor) -> float:
     M = C.T @ system.S @ C
     C = C @ trnsolver.inv_sqrt_spd(0.5 * (M + M.T))
     P = 2.0 * C @ C.T
+    # An out-of-core B streams from its chunk files (float64 per chunk).
     jk = DFJK(
         system.B, system.nao, k_cache_bytes=0, k_block=min(256, system.naux), dtype=torch.float64
     )
-    F = system.H + jk.j(P) - 0.5 * jk.k(C)
+    J, K = jk.jk(P, C)
+    F = system.H + J - 0.5 * K
     return float(0.5 * (P * (system.H + F)).sum()) + system.e_nuc
 
 
@@ -1394,6 +1506,14 @@ def main():
     ap.add_argument(
         "--store-dtype", default="float32", choices=("float32", "float64"), help="store dtype"
     )
+    ap.add_argument(
+        "--jk-stream",
+        default="auto",
+        choices=("auto", "on", "off"),
+        help="stream B over aux chunks (trntensor.AuxStream; auto: for an out-of-core B)",
+    )
+    ap.add_argument("--resident-gb", type=float, default=None, help="per-device resident chunks")
+    ap.add_argument("--jk-devices", default=None, help="comma-separated J/K devices")
     ap.add_argument(
         "--conv",
         default="auto",
@@ -1428,6 +1548,9 @@ def main():
         diis=not args.no_diis,
         max_iter=args.max_iter,
         conv=args.conv,
+        jk_stream={"auto": None, "on": True, "off": False}[args.jk_stream],
+        jk_resident_gb=args.resident_gb,
+        jk_devices=args.jk_devices.split(",") if args.jk_devices else None,
         verbose=True,
     )
     print(
@@ -1440,6 +1563,14 @@ def main():
         )
     med = res.stage_median_ms()
     print("median stage ms: " + "  ".join(f"{s}={med[s]:.2f}" for s in STAGES))
+    if res.info.get("stream"):
+        si = res.info["stream"]
+        last = si["iters"][-1] if si["iters"] else {}
+        print(
+            f"streamed J/K: {si['chunks']} chunks of {si['width']} aux, {si['resident']} resident; "
+            f"last iteration {last.get('bytes', 0) / 1e9:.2f} GB streamed, "
+            f"wait {last.get('wait_s', 0):.2f} s"
+        )
     print(
         f"loop {res.total_ms:.1f} ms; setup "
         + ", ".join(f"{k}={v:.1f}" for k, v in res.setup_ms.items())

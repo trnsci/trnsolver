@@ -102,6 +102,9 @@ def _run_mode(system: System, mode: str, args):
         jk_fused={"auto": None, "fused": True, "unpack": False}[args.jk_k],
         jk_host_pack={"auto": None, "on": True, "off": False}[args.host_pack],
         conv=args.conv,
+        jk_stream={"auto": None, "on": True, "off": False}[args.jk_stream],
+        jk_resident_gb=args.resident_gb,
+        jk_prefetch=args.prefetch,
     )
     if mode in ("cpu", "cpu64"):
         _set_backends("pytorch")
@@ -333,6 +336,19 @@ def main() -> None:
         choices=("auto", "on", "off"),
         help="pack P / unpack J on the host (auto: off the CPU above 1e6 pairs, #87)",
     )
+    ap.add_argument(
+        "--jk-stream",
+        default="auto",
+        choices=("auto", "on", "off"),
+        help="stream B over aux chunks (trntensor.AuxStream); auto: for an out-of-core B",
+    )
+    ap.add_argument(
+        "--resident-gb",
+        type=float,
+        default=None,
+        help="per-device GB of streamed chunks kept resident (default 20 on a NeuronCore)",
+    )
+    ap.add_argument("--prefetch", type=int, default=1, help="uploads in flight per device")
     ap.add_argument("--cache-dir", default=None, help="cache built systems as .pt files")
     ap.add_argument(
         "--outcore",
