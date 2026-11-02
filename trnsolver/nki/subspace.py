@@ -13,7 +13,16 @@ F (n x n, FP32) resident in SBUF and, for a block X (n x kb, kb <= 512):
     X^T X, X^T F X, X^T E, (FX)^T E,      the six kb x kb Gram blocks of
     E^T E, E^T F E                        span[X, E] (Tensor Engine)
 
-and returns them packed as (n + 6 kb + 1, kb): ``[E; six Grams; r]``.
+and returns them packed as (n + 6 kb + 1, kb): ``[E; six Grams; r]``
+(with an (m, 2) ``sched``, the block X first: (2 n + 6 kb + 1, kb)).
+
+``subspace_step_kernel(F, prev, qtab, sched)`` is the same launch for the
+next pass: it first forms the Rayleigh-Ritz update ``X = X0 Q1 + E0 Q2``
+on chip from the previous launch's packed ``[X0; E0; ...]`` output and the
+(2 kb, kb) coefficients Q in ``qtab`` (which also carries the scalar rows,
+so one H2D copy serves the pass), then filters it, emitting ``[X; E; six
+Grams; r]``. Per row tile that is 2 nck Tensor Engine transposes of X0 and
+E0 and one accumulation group of 2 nck matmuls against Q's row chunks.
 
 Layout. ``Fs[p, j, :] = F[j * 128 + p, :]`` (row tile j on the partitions,
 zero-padded to nt * 128 rows and columns), and every block of vectors is

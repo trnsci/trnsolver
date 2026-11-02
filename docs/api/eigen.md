@@ -99,11 +99,24 @@ The correction form matters in FP32. The filter grows core levels far below the 
 
 `examples/scf_df_rhf.py --solver subspace` uses it on `XᵀFX`.
 
-Measured on Trn2 (one logical NeuronCore, host pinned to 2 CPUs; #78):
+Measured on Trn2 (one logical NeuronCore, host pinned to 2 CPUs, `GOMP_SPINCOUNT=10000`; #78, #85, #86):
 
-- **Per call, default 2 passes, n = 250 / 490 / 970:** 13 / 16 / 44 ms, against 3.8 / 12.6 / 68 ms for aten `eigh` on the device tensor. With one pass it is 4.5 / 7.9 / 21 ms.
-- **Where the time goes:** the kernel takes 0.5–0.7 ms per pass. The float64 host Rayleigh-Ritz takes 1.2 / 3.5 / 16 ms per pass, and the rest is the per-pass host round trip.
-- **Host threads:** when the host threads share CPUs with the Neuron runtime, libgomp's default spin-wait after each host LAPACK call delays the next device operations by up to about 4 ms. `GOMP_SPINCOUNT=10000` removes that delay without slowing LAPACK: the per-call times become 7.8 / 12 / 40 ms. `OMP_WAIT_POLICY=PASSIVE` also removes it, but slows LAPACK.
-- **DF-RHF time to convergence:** the full `eigh` was faster at every size measured (n_ao = 114–970).
-  - At n_ao = 970 the default `refresh` turned 14 of 18 solves into full `eigh`s.
-  - With `refresh=None` the eigh stage drops from 74 to 44 ms, but the SCF needs 26 iterations instead of 17.
+- **Per call, fixed passes, n = 250 / 490 / 970** (`scripts/bench_occupied_subspace.py`, `tol=None, rtol=None`):
+  - 2 passes: 5.6 / 9.3 / 34 ms, against 3.8 / 11.4 / 67 ms for aten `eigh` on the device tensor (7.8 / 12 / 40 ms before #86);
+  - 1 pass: 3.6 / 5.4 / 18 ms.
+- **Where the time goes:** the kernel takes 0.4–0.7 ms per pass. The host Rayleigh-Ritz takes 0.9 / 2.9 / 14 ms per pass, against 1.2 / 3.6 / 16 ms for the two-eigendecomposition path. At n = 970 it is one float64 `eigh` of the 372-wide reduced matrix. SciPy's subset driver (`syevr`) was 3.5× slower than the full MKL `eigh` on these threads, so it is not used.
+- **Accuracy is unchanged:** after 2 passes the projector error is 1.4e-5 / 2.5e-5 / 6.0e-5, eigenvalues are within 1.2e-7 relative, and orthogonality is within 2.5e-7.
+- **Host threads:** when the host threads share CPUs with the Neuron runtime, libgomp's default spin-wait after each host LAPACK call delays the next device operations by up to about 4 ms. `GOMP_SPINCOUNT=10000` removes that delay without slowing LAPACK. `OMP_WAIT_POLICY=PASSIVE` also removes it, but slows LAPACK.
+- **DF-RHF time to convergence** (`bench_scf.py`, `neuron-nosync`, with the defaults above):
+
+  | system | n_ao | full `eigh`: iterations, ms | `occupied_subspace`: iterations, ms |
+  |---|---|---|---|
+  | benzene | 114 | 11, 106 | 11, 128 |
+  | C10H22 | 250 | 14, 191 | 14, 220 |
+  | C20H42 | 490 | 16, 573 | 15, 520 |
+  | C40H82 | 970 | 17, 3495 | 18, 3616 |
+
+  - The eigh stage at n_ao = 490 / 970 drops from 12.1 / 62.5 to 8.8 / 42.2 ms.
+  - No call after the cold start is a full `eigh`. The earlier `passes=2, refresh=3e-2` took 22 iterations and 5.6 s at n_ao = 970.
+  - Below n_ao ≈ 300 the fixed per-call cost loses to aten `eigh`.
+  - The FP32 energy test is at its noise floor at n_ao = 970: successive energies differ by 4 ulp (4.9e-4 Eh), against a threshold of 3.1e-4 Eh. Iteration counts there vary by ±3 between nearby settings.

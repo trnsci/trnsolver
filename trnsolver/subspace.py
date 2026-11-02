@@ -11,11 +11,16 @@ X from the previous iteration and refines it, per pass, with
                                   resident on chip
     E = Y - X (X^T Y)             the filtered correction outside span(X)
     Grams of [X, E] and F[X, E]   six kb x kb GEMM blocks
-    (theta, Q) = RR on span[X, E] 2 kb x 2 kb Rayleigh-Ritz, float64, host
-    X = [X, E] Q[:, :kb]          on F's device
+    (theta, Q) = RR on span[X, E] lowest kb pairs of the 2 kb pencil,
+                                  float64, host
+    X = [X, E] Q                  on F's device
 
 The first three lines are one NKI launch (``trnsolver/nki/subspace.py``);
 only the six Gram blocks (and one residual row) cross to the host. The
+last line runs at the start of the next pass's launch
+(``subspace_step_kernel``), so a pass is one launch, one D2H and one H2D
+copy; only the final pass's update runs as device ops. The number of
+passes adapts per call (``rtol``, ``tol``). The
 filter is the scaled Chebyshev filter of Zhou and Saad (SIAM J. Matrix Anal.
 Appl. 29(3), 2007; in SCF, Zhou, Saad, Tiago and Chelikowsky, J. Comput.
 Phys. 219, 2006): it damps ``[a, b] = [theta_kb, upper]`` and grows the
