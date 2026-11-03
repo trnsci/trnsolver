@@ -436,6 +436,24 @@ def test_chunk_width_is_128_multiple_under_limit():
     assert w % 128 == 0 and npair * w * 4 <= df_store.DEFAULT_CHUNK_BYTES < 1 << 32
 
 
+def test_shell_row_blocks_int32_ao_loc():
+    """PySCF's ao_loc is int32: the block-size test must not wrap past 2**31
+    (alkane43 / cc-pVTZ, n_ao 2522: a 13 GB row block, OOM)."""
+    import numpy as np
+
+    # 360 f-like shells of 7 functions (n_ao 2520), naux 6037, 1 GiB blocks.
+    ao_loc = np.arange(0, 7 * 361, 7, dtype=np.int32)
+    nbas, naux, cap = 360, 6037, 1 << 30
+    blocks = df_store._shell_row_blocks(ao_loc, nbas, naux, cap)
+    assert blocks[0][0] == 0 and blocks[-1][1] == nbas
+    assert all(a[1] == b[0] for a, b in zip(blocks[:-1], blocks[1:], strict=True))
+    for i0, i1 in blocks:
+        m0, m1 = int(ao_loc[i0]), int(ao_loc[i1])
+        rows = m1 * (m1 + 1) // 2 - m0 * (m0 + 1) // 2
+        # at most one shell over the cap (a single shell is always allowed)
+        assert i1 - i0 == 1 or 3 * rows * naux * 8 <= cap
+
+
 def test_h2_lattice_store_matches_in_memory(tmp_path):
     mem = scf.h2_lattice(6)
     disk = scf.h2_lattice(6, store=str(tmp_path / "h2"), store_dtype=torch.float64)
@@ -588,6 +606,28 @@ def test_streamed_scf_from_store(tmp_path):
     r32 = scf.run_scf(disk32, dtype=torch.float32)
     assert r32.converged
     assert abs(scf.energy_at_orbitals(disk32, r32.C_occ) - base.energy) < 1e-6
+
+
+def test_host_float64_stream_over_fp32_store_chunks(tmp_path):
+    """A float64 host pass (the canonical Fock) over an fp32 store whose
+    chunks double past chunk_bytes uses the store's chunks. The re-split
+    raised at n_ao 2522, where 128 float64 columns exceed 2 GiB (#115)."""
+    _need_aux_stream()
+    system = scf.h2_lattice(10)
+    n, (npair, naux) = system.nao, system.B.shape
+    cb = npair * 4 * 128
+    st = df_store.store_from_tensor(
+        system.B, n, str(tmp_path / "s"), dtype=torch.float32, chunk_bytes=cb
+    )
+    assert max(st.widths) == 128 and naux > 128
+    C = torch.linalg.qr(torch.randn(n, 6, dtype=torch.float64))[0]
+    P = 2 * C @ C.T
+    jk = scf.DFJK(st, n, device="cpu", dtype=torch.float64, stream=True, chunk_bytes=cb)
+    J, K = jk.jk(P, C)
+    ref = scf.DFJK(st.to_tensor().double(), n, device="cpu", dtype=torch.float64)
+    J0, K0 = ref.jk(P, C)
+    torch.testing.assert_close(J, J0)
+    torch.testing.assert_close(K, K0)
 
 
 def test_stream_off_for_in_memory_by_default():

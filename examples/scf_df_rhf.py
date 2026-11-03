@@ -800,8 +800,16 @@ class DFJK:
         chunk_bytes = chunk_bytes or trntensor.stream.DEFAULT_CHUNK_BYTES
         itemsize = torch.empty((), dtype=dtype).element_size()
         npair = self.n * (self.n + 1) // 2
-        if isinstance(B, df_store.DFStore) and max(B.widths) * npair * itemsize <= chunk_bytes:
-            chunks = B.loaders()  # memory-mapped chunk files
+        on_host = all(d.type == "cpu" for d in self.devices)
+        if isinstance(B, df_store.DFStore) and (
+            on_host or max(B.widths) * npair * itemsize <= chunk_bytes
+        ):
+            # Memory-mapped chunk files. The chunk_bytes bound is the device
+            # matmul's (aws-neuron-sdk#1457). On the host the store's own
+            # chunks are used as they are: a float64 pass over an fp32 store
+            # doubles each chunk's bytes, and at n_ao 2522 not even 128 float64
+            # columns fit 2 GiB, so the re-split raised (trnsci/trnsci#115).
+            chunks = B.loaders()
             widths = list(B.widths)
         else:
             # Column views, made contiguous (and cast) as each is loaded.
