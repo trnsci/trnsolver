@@ -7,7 +7,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Eager NKI kernel calls skip the per-call handle rebuild and the custom-op
+  layer (same fix as trnblas#92).** On the native path a `trnsolver::`
+  custom-op call cost about 0.1 ms of host time before the kernel was queued,
+  against 0.016 ms for aten. Most of it went to nki's `Kernel.__call__`,
+  which rebuilds the torch handle on every call, plus the `torch.library`
+  layer. `dispatch._launch` now calls a `torch_neuronx.wrap_nki` handle built
+  once per kernel; `static=` arguments (the Jacobi `onezero`) get the op
+  body's `int()`. On trn2 (LNC=2), a `matvec` launch drops from 0.121 to
+  0.032 ms of issue time (e2e 0.203 to 0.130 ms) and a 128x128x32 `matmul`
+  from 0.123 to 0.032 ms (e2e 0.196 to 0.117 ms). `eigh` itself is host-bound
+  and gains less: n=32 on the Householder kernels 86.7 to 76.1 ms, a 4x32x32
+  Jacobi batch 6.10 to 5.95 ms. Results are bit-identical. `torch.compile`,
+  requires-grad, int64 and tensor-subclass inputs keep the custom op, as
+  does the folded `occupied_subspace` pass (`subspace_step`) for now.
+  `TRNSOLVER_NKI_EAGER_HANDLE=0` turns this off;
+  `scripts/bench_eager_handle.py` measures it.
+
 ### Added
+
+- **`pivoted_cholesky(..., block=, sub_fn=, relax=)`: block row requests
+  for the pivoted-Cholesky build (#114).**
+  - A round takes the `block` largest remaining diagonals as candidates and
+    picks pivots greedily from their exact c × c Schur complement. It
+    accepts a candidate while its diagonal is at least `relax` times the
+    largest one outside the round. With `relax=1` that is the one-row
+    algorithm's pivot sequence (up to ties).
+  - The accepted pivots' rows come from one `rows_fn` call, so a device
+    kernel evaluation (`trnsparse.kernel_matmul(X, X[idx], I)`) makes one
+    launch per round. One GEMM gives the Schur rows and one triangular
+    solve the new columns, in float64 on the host, independent of the
+    device's reduction order.
+  - `sub_fn(idx)` gives `K[idx][:, idx]`, so only accepted rows are
+    requested. Without it, every candidate row is.
+  - GP kernel (RBF, ℓ = 0.15, d = 3, rank 1024, CPU), with
+    `block=512, relax=0.5`:
+    - n = 10⁵: 26 calls instead of 1024, 0.85 s against 4.1 s;
+    - n = 10⁶: 61 calls, 11.3 s against 34.6 s, with fp32 kernel rows. Two
+      host threads; the factor adds 4.5 s (`"host64"`) or 5.2 s
+      (`"projected"`).
+  - CG iteration counts are unchanged at n = 2×10⁴, 5×10⁴ and 10⁵.
+  - The default `block=1` keeps one row per step. The factor is now
+    stored row-major internally, so appending a column is stride-1.
+- **`PivotedLowRankPreconditioner(..., apply="projected")`: an fp32
+  on-device apply that does not cancel (#114).**
+  - Q is an orthonormal basis of L's range, from the Gram matrix LᵀL in
+    float64 on the host (one n × k × k GEMM; no n × k QR).
+  - The apply is `Q (Σ² + sI)⁻¹ QᵀV + (I − QQᵀ)V/s`, with the projection
+    applied twice: four (n × k) GEMMs on the device, no host round trip.
+  - The single-pass Woodbury form (`"native"`) leaves an error of about
+    u·√k·‖V‖ along the captured subspace, which the 1/s weight amplifies.
+    The second pass removes it. What remains is orthogonal to Q and
+    perturbs the preconditioner only to second order.
+  - CPU, fp32 operator, R = 33, rank 1024, tol 1e-6, `"host64"` against
+    `"projected"`:
+    - n = 2×10⁴, noise 1e-2: 10 and 10 iterations. Posterior mean against
+      scipy `cho_solve`: 6.0e-5 and 6.1e-5.
+    - n = 2×10⁴, noise 1e-3: 30 and 30.
+    - n = 5×10⁴: 20 and 20.
+    - n = 10⁵: 20 and 20 (column maximum 15 and 15). The posterior means
+      differ by 6.4e-5.
+    - `"native"` does not converge in 150–200 iterations on the same cases.
+  - Opt-in. `apply="auto"` is unchanged: `"host64"` for a non-float64 L.
+  - `tests/test_block_neuron.py` holds the device gates: apply accuracy on
+    the device, CG iterations against `"host64"`, and a build from device
+    rows.
+- **`cg_block`: block CG for many right-hand sides on matrix-free operators (#97).**
+  - R independent preconditioned CG recurrences, one per column of an (n, R)
+    B, driven by ONE operator call A(P) on the whole block per iteration.
+    The GP exemplar (trnsci/trnsci#109) gets the posterior-mean solve and
+    every log-det probe solve from the same applications.
+  - Converged columns freeze through `torch.where` masks (α = β = 0) and the
+    block keeps its shape. Zero columns return zero, converged at
+    iteration 0.
+  - The host reads the convergence state only every `check_every`
+    iterations. That changes when the loop stops, never the solution.
+  - `info` has per-column iterations, the converged and breakdown masks,
+    the recurrence residual, and a true residual ‖B − A X‖ / ‖B‖ from one
+    extra call at the end. Report both: on an RBF kernel + 1e-4 I
+    (n = 2000), fp32 recurrence residuals of 1e-4 had true residuals of
+    0.05–0.5.
+  - `return_coeffs=True` adds per-column α, β histories and r₀ᵀ M r₀.
+- **`PivotedLowRankPreconditioner(..., apply="auto")` applies in float64 on
+  the host for a non-float64 L.** The Woodbury form V − W (Wᵀ V) cancels
+  (W Wᵀ is within s/λ of the identity on the captured subspace), so in fp32
+  the applied operator is wrong by up to u·√k·λ/s there. On a GP with
+  noise 1e-3 (n = 2×10⁴, rank 1024) fp32 preconditioned CG did not
+  converge in 150 iterations; with the host-float64 apply it converges in
+  30, against 20 in full float64. `apply="native"` keeps the old
+  on-device path.
+- **`cg_block_ir`:** fp32 inner `cg_block` inside a float64 host refinement
+  loop, the same shape as `gmres_ir`. Returns a float64 host X and
+  per-outer-step true residuals. With the pivoted preconditioner it reaches
+  1e-10 relative residual on that matrix where fp32 alone stalls.
+- **`pivoted_cholesky(diag_fn, rows_fn, rank)` and
+  `pivoted_lowrank_preconditioner(diag_fn, rows_fn, rank, shift)`:** rank-k
+  greedy pivoted Cholesky from the diagonal plus one row of K per step. The
+  preconditioner applies (L Lᵀ + shift I)⁻¹ as two (n × k) GEMMs, through
+  the low-rank-plus-diagonal inverse identity (k × k factor built once, in
+  float64 on the host). It also has `logdet()` (matrix determinant lemma)
+  and `sample()` (probes from N(0, L Lᵀ + shift I)). On the RBF matrices
+  above, rank 100 cuts CG iterations by about 10×.
+- **`lanczos_tridiag_from_cg` and `slq_logdet`:** Lanczos tridiagonals from
+  CG coefficients, and stochastic Lanczos quadrature for log det(A) over one
+  `cg_block` of probes. Probes are Rademacher, or N(0, P) when preconditioned
+  (log det P is then exact and only the remainder is estimated). Within 4
+  standard errors of `torch.linalg.slogdet` at n = 1024 with 64 probes.
 
 - **`scripts/bench_scf_ladder.py`: a DF-RHF + DF-MP2 size ladder (#15).**
   - **Systems.** Linear alkanes C_k H_{2k+2} and k-water clusters, both
@@ -110,6 +217,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **float64 policy for the NKI kernels (#89, trnsci/trnsci#35; the same rule
+  across the trnsci suite).** Every trnsolver kernel computes in FP32, and
+  Trainium computes float64 at FP32 precision on device. Where an FP32
+  input would run the kernels (`eigh` on the Householder path,
+  `eigh_generalized` through it, `eigh_randomized`, `eigh(method="jacobi")`,
+  the auto Jacobi region, `occupied_subspace`):
+  - **backend `auto`: float64 under `auto` now computes in torch at float64
+    accuracy (previously cast to fp32 on the NKI path).** `eigh` and
+    `eigh_generalized` take `torch.linalg.eigh`, the Jacobi entries the torch
+    Jacobi, the auto Jacobi region the default aten dispatch,
+    `occupied_subspace` its torch filter, `eigh_randomized` `torch.matmul`.
+    Affected: `eigh` / `eigh_generalized` float64 on the Householder path ran
+    the FP32 kernels in 0.21.0 (#84; before that, 0.4.0 through 0.20.0, it
+    gave garbage); this lands in 0.22.0.
+  - **backend `nki`: float64 runs the FP32 kernels and returns float64, with
+    one `UserWarning` per op** (the first call of each op) saying that
+    precision is reduced to fp32. This now also applies to the Jacobi
+    kernels and `occupied_subspace` (through 0.21.0 they took torch for
+    float64) and to `eigh_randomized` (a compile error on Trn2 through
+    0.21.0).
+  - **`TRNSOLVER_REQUIRE_NKI=1`: float64 raises `NotImplementedError` on every
+    kernel path**, under either backend, as trnblas does (trnblas#69). This
+    takes precedence over the `nki` cast. **Callers of
+    `eigh(method="jacobi")`, the auto Jacobi region and `occupied_subspace`
+    with float64 input under `TRNSOLVER_REQUIRE_NKI=1` now get
+    `NotImplementedError`** where through 0.21.0 they got a float64 torch
+    result; `eigh` / `eigh_generalized` float64 under it raise where 0.21.0
+    ran the FP32 kernels.
+  - **Result dtype:** always what the pytorch backend returns for the same
+    inputs, for float32, float64, bfloat16, float16 and mixed-dtype operands
+    (e.g. `eigh_generalized` with a float64 B), including after the FP32
+    kernels.
+  - **float64 on the `neuron` device is computed on the host under `auto`.**
+    Device aten computes float64 at fp32 precision (measured on Trn2), so
+    "torch at float64 accuracy" did not hold for device-resident input.
+    Every public op now copies a float64 / complex128 operand on the
+    `neuron` device to the host, computes there and returns the result on
+    the original device in float64 / complex128, with one `UserWarning` per
+    op ("float64 on the neuron device is computed on the host for float64
+    accuracy (device arithmetic is fp32); pass float32 to stay on device").
+    **`TRNSOLVER_FP64_ON_DEVICE=1` keeps device aten (fp32 precision)** for
+    callers who prefer speed. Host-resident float64 and backends `nki` /
+    `pytorch` are unchanged. **Under `TRNSOLVER_REQUIRE_NKI=1` a float64 /
+    complex128 operand on the `neuron` device now raises
+    `NotImplementedError` at every public op** (backends `auto` and `nki`,
+    no host copy, ahead of `TRNSOLVER_FP64_ON_DEVICE=1`). Before, the routes
+    with no kernel (`solve_spd`, `inv_spd`, `pinv`, `cg`, `gmres`, ...) ran
+    device aten at fp32 precision with no error. One decorator
+    (`nki.dispatch._fp64_host_guard`) holds the rule; the preconditioner
+    constructors (`jacobi_` / `block_jacobi_` / `ssor_preconditioner`), which
+    return closures, use `_fp64_host_preconditioner`: the closure computes on
+    the host and returns `z` on `r`'s device. The block CG routes (#97)
+    follow the same rule: `cg_block` is guarded; `pivoted_cholesky` builds
+    in float64 on the host for every input (#117, one row or batched with
+    `rows_fn` / `sub_fn`), so a device-resident float64 diagonal needs no
+    extra host route and L returns to its device; and
+    `PivotedLowRankPreconditioner`'s `apply="auto"` and `apply="projected"`
+    (#117, an on-device apply) pick `"host64"` for a float64 L on the device
+    (one `UserWarning`). `cg_block_ir` already refines in float64 on the host.
+  The library has no complex kernels; complex input keeps its aten / torch
+  routes (#65). Paths where an FP32 input would not run a kernel either (the
+  aten cutover, the XLA lineage for Jacobi) are unchanged.
+
 - **`examples/scf_df_rhf.py`: a noise-aware convergence test for fp32
   (#15).** `run_scf(conv="auto"|"energy"|"density")`; `"auto"` keeps the
   energy test in float64 and uses `"density"` otherwise.
@@ -161,6 +331,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still held. At alkane43 / cc-pVTZ over 4 cores (19.2 GB per core), the second
   upload failed with NRT_RESOURCE. The new `DFJK.close()` is called at the end of
   `run_scf` and after the canonical Fock build in `scf_df_mp2.py`.
+- **float64, integer and bool operands reached the FP32 NKI kernels (#83,
+  trnsci/trnsci#35).** One dtype table (`KERNEL_DTYPES` in
+  `trnsolver/nki/dispatch.py`) now lists what each kernel takes, and
+  `_launch` (native and XLA) and the new `_simulate` (simulator) raise
+  `TypeError` for anything else, so no kernel is reached with another dtype.
+  The wrappers route first with one guard (`_kernel_dtype` /
+  `_kernel_operands`), which applies the float64 policy above. Integer and
+  bool input takes torch (which raises, as the pytorch backend does), or
+  raises `NotImplementedError` under `TRNSOLVER_REQUIRE_NKI=1`. float16 and
+  bfloat16 are cast to FP32 (lossless) and restored. Affected: every release
+  with the kernels.
 
 - **`cg` dropped the imaginary part of complex input (#100).** Its inner
   products were `float(u.dot(v))`: unconjugated, and cast to real, so a

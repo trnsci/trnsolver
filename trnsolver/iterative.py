@@ -17,8 +17,10 @@ from collections.abc import Callable
 import torch
 
 from .factor import _mH, _restore, _to_fp32
+from .nki.dispatch import _fp64_host_guard, _fp64_host_preconditioner
 
 
+@_fp64_host_preconditioner("jacobi_preconditioner")
 def jacobi_preconditioner(A: torch.Tensor) -> Callable[[torch.Tensor], torch.Tensor]:
     """Build a Jacobi (diagonal) preconditioner M(r) = r / diag(A).
 
@@ -33,6 +35,7 @@ def jacobi_preconditioner(A: torch.Tensor) -> Callable[[torch.Tensor], torch.Ten
     return lambda r: r * (inv_d if r.dim() == 1 else inv_d.unsqueeze(-1))
 
 
+@_fp64_host_preconditioner("block_jacobi_preconditioner")
 def block_jacobi_preconditioner(
     A: torch.Tensor,
     block_size: int = 16,
@@ -85,6 +88,7 @@ def block_jacobi_preconditioner(
     return apply
 
 
+@_fp64_host_preconditioner("ssor_preconditioner")
 def ssor_preconditioner(
     A: torch.Tensor,
     omega: float = 1.0,
@@ -177,6 +181,7 @@ class _ImplicitSolve(torch.autograd.Function):
         return gA, lam, None
 
 
+@_fp64_host_guard("cg")
 @torch.compiler.disable
 def cg(
     A: torch.Tensor | Callable,
@@ -299,6 +304,7 @@ def _cg_impl(A, b, x0, tol, maxiter, M, orig=None):
     return _restore(x, orig), maxiter, torch.linalg.norm(r).item() / b_norm
 
 
+@_fp64_host_guard("gmres")
 @torch.compiler.disable
 def gmres(
     A: torch.Tensor | Callable,
@@ -423,6 +429,7 @@ def _gmres_impl(A, b, x0, tol, maxiter, restart, orig=None):
     return _restore(x, orig), total_iters, torch.linalg.norm(r).item() / b_norm
 
 
+@_fp64_host_guard("gmres_ir")
 @torch.compiler.disable
 def gmres_ir(
     A: torch.Tensor,
