@@ -311,55 +311,172 @@ def pivoted_cholesky(
     rank: int,
     *,
     tol: float = 0.0,
+    block: int = 1,
+    sub_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    relax: float = 1.0,
 ) -> torch.Tensor:
     """Greedy partially pivoted Cholesky, K ≈ L Lᵀ, from diagonal and row access.
 
-    Step m picks the largest remaining diagonal entry i of the Schur
-    complement, asks for that ONE row of K, ``rows_fn(idx)`` with ``idx`` an
-    int64 tensor of length 1 on the diagonal's device, and appends the
-    column l = (K[i, :] − L[i, :m] Lᵀ) / √dᵢ. Total K access is the diagonal
-    plus ``rank`` rows; no n × n matrix is formed.
+    Each step adds the pivot i with the largest remaining diagonal of the
+    Schur complement and the column l = (K[:, i] − L Lᵢᵀ) / √dᵢ. Total K
+    access is the diagonal plus the requested rows; no n × n matrix is
+    formed.
+
+    ``block`` > 1 batches the work (#114). A round takes the ``block``
+    largest remaining diagonals as candidates and runs greedy pivoted
+    Cholesky on their exact c × c Schur complement, accepting a candidate
+    only while its remaining diagonal is at least ``relax`` times the
+    largest remaining diagonal outside the round (which can only have
+    shrunk since the round began). With ``relax=1`` that is exactly the
+    pivot the one-row-per-step algorithm takes, so ``block`` changes the
+    number of ``rows_fn`` calls, not the pivots (up to ties and rounding).
+    The accepted pivots' rows then come from one ``rows_fn`` call, their
+    Schur rows from one (j × m) · (m × n) GEMM and the new columns from one
+    triangular solve, so a matrix-free K (a device kernel evaluation) sees
+    one large launch per round instead of one row per pivot.
+
+    The c × c candidate block comes from ``sub_fn(idx)`` when given (cheap:
+    c² kernel entries), so ``rows_fn`` is only asked for accepted pivots.
+    Without it, ``rows_fn`` is asked for all c candidate rows and the
+    rejected ones are wasted. On smooth kernels the largest diagonals
+    cluster in space, so strict greedy (``relax=1``) accepts few of them
+    per round; ``relax`` < 1 (e.g. 0.5) accepts more at a small cost in
+    approximation quality per pivot.
+
+    The arithmetic (Schur rows, the new columns and the diagonal update)
+    runs in float64 on the host, whatever device ``rows_fn`` returns on, so
+    the factor does not depend on how a device reduces (the LNC split).
 
     Args:
         diag_fn: ``diag_fn() -> (n,)``, the diagonal of K (PSD; without any
             noise / shift term).
-        rows_fn: ``rows_fn(idx) -> (len(idx), n)``, rows ``idx`` of K.
+        rows_fn: ``rows_fn(idx) -> (len(idx), n)``, rows ``idx`` of K, any
+            device and floating dtype. ``idx`` is an int64 host tensor of
+            at most ``block`` distinct indices.
         rank: Maximum rank k.
         tol: Stop early when the trace of the remaining Schur complement is
             at most ``tol · trace(K)``. Also stops when the largest remaining
             diagonal reaches roundoff (n · eps · max diag), so a rank-r K
             gives at most r columns.
+        block: Candidates per round (default 1: one row per pivot, the
+            original behaviour).
+        sub_fn: Optional ``sub_fn(idx) -> (len(idx), len(idx))``, the
+            submatrix K[idx][:, idx].
+        relax: Acceptance factor in (0, 1] for candidates after the first
+            of a round (the first is always the global greedy pivot).
 
     Returns:
-        L: (n, k) with k ≤ rank, in the diagonal's dtype and device. Each
-        step reads one scalar back to the host (the pivot); this is a
-        build-time cost of k syncs.
+        L: (n, k) with k ≤ rank, in the diagonal's dtype and on its device.
     """
-    d = diag_fn().clone()
+    if int(block) < 1:
+        raise ValueError(f"pivoted_cholesky: block must be >= 1, got {block}")
+    if not 0 < relax <= 1:
+        raise ValueError(f"pivoted_cholesky: relax must be in (0, 1], got {relax}")
+    d_in = diag_fn()
+    out_dtype, out_device = d_in.dtype, d_in.device
+    d = d_in.detach().to(device=_HOST, dtype=torch.float64).clone()
     n = d.shape[0]
     rank = min(int(rank), n)
-    dtype, device = d.dtype, d.device
-    L = torch.zeros(n, rank, dtype=dtype, device=device)
+    # Lt[m] is column m of L: rows of Lt are contiguous, so appending a
+    # column and the (j × m) · (m × n) Schur GEMM are both stride-1.
+    Lt = torch.zeros(rank, n, dtype=torch.float64)
     trace0 = float(d.sum())
-    floor = n * torch.finfo(dtype).eps * float(d.max()) if n else 0.0
-    chosen = torch.zeros(n, dtype=torch.bool, device=device)
+    floor = n * torch.finfo(out_dtype).eps * float(d.max()) if n else 0.0
+    chosen = torch.zeros(n, dtype=torch.bool)
+
+    def host64(T, *shape):
+        return T.detach().reshape(*shape).to(device=_HOST, dtype=torch.float64)
+
     m = 0
     while m < rank:
-        i = int(torch.argmax(d))
-        di = float(d[i])
-        if di <= floor or float(d.sum()) <= tol * trace0:
+        rem = float(d.sum())
+        live = int((d > floor).sum())
+        if live == 0 or rem <= tol * trace0:
             break
-        idx = torch.tensor([i], dtype=torch.int64, device=device)
-        row = rows_fn(idx).reshape(-1).to(dtype=dtype, device=device)
-        col = (row - L[:, :m] @ L[i, :m]) / math.sqrt(di)
-        chosen[i] = True
-        col = torch.where(chosen, torch.zeros_like(col), col)
-        col[i] = math.sqrt(di)
-        L[:, m] = col
-        d = torch.clamp(d - col * col, min=0)
-        d = torch.where(chosen, torch.zeros_like(d), d)
-        m += 1
-    return L[:, :m].clone()
+        c = min(int(block), live)
+        if c < live:
+            top = torch.topk(d, c + 1)
+            cand, outside = top.indices[:c], relax * float(top.values[c])
+        else:
+            cand, outside = torch.topk(d, c).indices, 0.0
+        Lc = Lt[:m, cand]  # (m, c): L at the candidates
+        if sub_fn is not None:
+            K_c = None
+            Scc = host64(sub_fn(cand), c, c) - Lc.T @ Lc
+        else:
+            K_c = host64(rows_fn(cand), c, n)
+            Scc = K_c[:, cand] - Lc.T @ Lc
+        # Greedy pivoted Cholesky on the c × c Schur block of the candidates.
+        Scc = (Scc + Scc.T) / 2
+        Sw = Scc.clone()
+        taken = torch.zeros(c, dtype=torch.bool)
+        order: list[int] = []
+        while len(order) < min(c, rank - m):
+            rdiag = torch.diagonal(Sw)
+            p = int(torch.argmax(torch.where(taken, -math.inf, rdiag)))
+            dp = float(rdiag[p])
+            # The first candidate is the global greedy pivot; later ones must
+            # still beat (relax times) everything outside the round.
+            if dp <= floor or (order and dp < outside):
+                break
+            col = Sw[:, p] / math.sqrt(dp)
+            Sw -= torch.outer(col, col)
+            taken[p] = True
+            order.append(p)
+        if not order:  # pragma: no cover - roundoff: the largest Schur diagonal is not positive
+            break
+        perm = torch.tensor(order, dtype=torch.int64)
+        C, bad = torch.linalg.cholesky_ex(Scc[perm][:, perm])
+        if int(bad) > 0:  # pragma: no cover - rounding: keep the leading positive-definite pivots
+            perm, C = perm[: int(bad) - 1], C[: int(bad) - 1, : int(bad) - 1]
+            if perm.numel() == 0:
+                break
+        piv = cand[perm]
+        j = perm.numel()
+        K_p = K_c[perm] if K_c is not None else host64(rows_fn(piv), j, n)
+        S = K_p - Lt[:m, piv].T @ Lt[:m] if m else K_p  # Schur rows of the pivots
+        Lnew = torch.linalg.solve_triangular(C, S, upper=False)  # (j, n)
+        # Honour tol pivot by pivot: keep pivot r only if the trace before it is above tol.
+        after = rem - torch.cumsum((Lnew * Lnew).sum(1), 0)
+        keep = 1 + int((after[:-1] > tol * trace0).sum())
+        Lnew, piv = Lnew[:keep], piv[:keep]
+        chosen[piv] = True
+        Lnew[:, chosen] = 0.0
+        Lnew[:, piv] = C[:keep, :keep].T
+        Lt[m : m + keep] = Lnew
+        d = torch.clamp(d - (Lnew * Lnew).sum(0), min=0)
+        d[chosen] = 0.0
+        m += keep
+    return Lt[:m].T.contiguous().to(dtype=out_dtype, device=out_device)
+
+
+def _gram_basis(L64: torch.Tensor, G: torch.Tensor, shift: float):
+    """Orthonormal Q (n × k') and λ (k',) with L Lᵀ ≈ Q diag(λ) Qᵀ, float64 host.
+
+    From the Gram matrix G = Lᵀ L (already formed for the k × k factor):
+    G = V diag(λ) Vᵀ and Q = L V λ^(-1/2), one (n × k) · (k × k) GEMM, no
+    n × k QR. Directions with λ ≤ 1e-6 · shift are dropped: the
+    preconditioner applies 1/(λ + s) ≈ 1/s there, as it does off L's range,
+    so dropping them changes it by at most 1e-6 relative, and it bounds the
+    Gram loss of orthogonality, about eps · λ_max / λ_min. The two-pass
+    apply tolerates a loss far above fp32 roundoff (it enters at second
+    order); above 1e-6 one more Gram pass restores Q to float64
+    orthogonality and rediagonalises.
+    """
+    eps = torch.finfo(torch.float64).eps
+    lam, V = torch.linalg.eigh(G)
+    keep = lam > 1e-6 * shift
+    lam, V = lam[keep], V[:, keep]
+    if lam.numel() == 0:
+        return L64.new_zeros(L64.shape[0], 0), lam
+    Q = L64 @ (V / lam.sqrt())
+    if eps * float(lam.max() / lam.min()) > 1e-6:
+        lam1, V1 = torch.linalg.eigh(Q.T @ Q)
+        Q = Q @ (V1 / lam1.sqrt())
+        T = lam1.sqrt()[:, None] * V1.T  # Q_old = Q_new T
+        lam, V2 = torch.linalg.eigh((T * lam) @ T.T)
+        Q = Q @ V2
+    return Q, lam
 
 
 class PivotedLowRankPreconditioner:
@@ -382,12 +499,26 @@ class PivotedLowRankPreconditioner:
       device (one (n, R) round trip per application);
     - ``"native"``: W in L's dtype on L's device (fast; accurate only while
       u·√k·λ_max/s ≪ 1, e.g. float64 L);
+    - ``"projected"`` (#114): in L's dtype on L's device, stable in fp32.
+      With L = Q Σ Gᵀ (Q orthonormal, built once in float64 on the host),
+      (L Lᵀ + s I)⁻¹ V = Q (Σ² + s I)⁻¹ Qᵀ V + (I − Q Qᵀ) V / s. The
+      cancellation is all in the projection (I − Q Qᵀ) V, so it is applied
+      twice (Y = V − Q (QᵀV), then Y − Q (QᵀY), folded with the diagonal
+      term into four (n × k) GEMMs). One pass leaves an error of about
+      u·√k·‖V‖ along Q, which the 1/s weight blows up; the second pass
+      takes that out, so what is left is an error orthogonal to Q, which
+      perturbs the preconditioner only to second order. No host round
+      trip; the (k,) diagonal stays on the device too.
     - ``"auto"`` (default): ``"native"`` for float64 L, else ``"host64"``.
 
     Attributes:
         L: (n, k) low-rank factor.
         shift: s > 0.
-        W: (n, k) whitened factor L C⁻ᵀ (float64 host for ``"host64"``).
+        W: (n, k) whitened factor L C⁻ᵀ (float64 host for ``"host64"``;
+            None for ``"projected"``).
+        Q, g: ``"projected"`` only: the (n, k) orthonormal basis of L's
+            columns and the (k,) weights s / (σ² + s), in L's dtype on L's
+            device.
         apply: the resolved mode.
     """
 
@@ -395,8 +526,10 @@ class PivotedLowRankPreconditioner:
         shift = float(shift)
         if not shift > 0:
             raise ValueError(f"PivotedLowRankPreconditioner: shift must be > 0, got {shift}")
-        if apply not in ("auto", "host64", "native"):
-            raise ValueError(f"apply must be 'auto', 'host64' or 'native', got {apply!r}")
+        if apply not in ("auto", "host64", "native", "projected"):
+            raise ValueError(
+                f"apply must be 'auto', 'host64', 'native' or 'projected', got {apply!r}"
+            )
         if apply == "auto":
             apply = "native" if L.dtype == torch.float64 else "host64"
         self.apply = apply
@@ -404,8 +537,15 @@ class PivotedLowRankPreconditioner:
         self.shift = shift
         L64 = L.to(device=_HOST, dtype=torch.float64)
         k = L64.shape[1]
-        C = torch.linalg.cholesky(shift * torch.eye(k, dtype=torch.float64) + L64.T @ L64)
+        G = L64.T @ L64
+        C = torch.linalg.cholesky(shift * torch.eye(k, dtype=torch.float64) + G)
         self._C = C
+        self.Q = self.g = self.W = None
+        if apply == "projected":
+            Q, lam = _gram_basis(L64, G, shift)
+            self.Q = Q.to(device=L.device, dtype=L.dtype)
+            self.g = (shift / (lam + shift)).to(device=L.device, dtype=L.dtype)
+            return
         W = torch.linalg.solve_triangular(C, L64.T, upper=False).T
         self.W = W if apply == "host64" else W.to(device=L.device, dtype=L.dtype)
 
@@ -414,8 +554,23 @@ class PivotedLowRankPreconditioner:
             V64 = V.detach().to(device=_HOST, dtype=torch.float64)
             out = (V64 - self.W @ (self.W.T @ V64)) / self.shift
             return out.to(device=V.device, dtype=V.dtype)
+        if self.apply == "projected":
+            return self._apply_projected(V)
         W = self.W if V.dtype == self.W.dtype else self.W.to(V.dtype)
         return (V - W @ (W.T @ V)) / self.shift
+
+    def _apply_projected(self, V: torch.Tensor) -> torch.Tensor:
+        vec = V.dim() == 1
+        Vm = V.unsqueeze(-1) if vec else V
+        Q, g = self.Q, self.g
+        if Q.dtype != Vm.dtype:
+            Q, g = Q.to(Vm.dtype), g.to(Vm.dtype)
+        c1 = Q.T @ Vm
+        Y = Vm - Q @ c1  # (I − Q Qᵀ) V, first pass
+        c2 = Q.T @ Y  # what the first pass left along Q
+        # z = (Y − Q c2)/s + Q (c1 + c2)/(σ² + s) = (Y − Q (c2 − g ⊙ (c1 + c2)))/s
+        out = (Y - Q @ (c2 - g[:, None] * (c1 + c2))) / self.shift
+        return out.squeeze(-1) if vec else out
 
     def logdet(self) -> float:
         """log det(L Lᵀ + shift·I), by the matrix determinant lemma (float64)."""

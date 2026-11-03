@@ -274,6 +274,213 @@ class TestPivotedCholesky:
             trnsolver.PivotedLowRankPreconditioner(L, noise, apply="fp16")
 
 
+def _scaled_rbf(n, seed=0):
+    """RBF kernel with distinct diagonal entries (no pivot ties), float64."""
+    K, _ = _rbf(n, seed=seed)
+    g = torch.Generator().manual_seed(seed + 1)
+    a = 0.5 + torch.rand(n, generator=g, dtype=torch.float64)
+    return a[:, None] * K * a[None, :]
+
+
+class TestPivotedCholeskyBlock:
+    """Block row requests for pivoted Cholesky (#114)."""
+
+    def test_strict_block_takes_the_sequential_pivots(self):
+        K = _scaled_rbf(400)
+        diag = lambda: torch.diagonal(K).clone()  # noqa: E731
+        L1 = trnsolver.pivoted_cholesky(diag, lambda i: K[i], 60)
+        for sub in (None, lambda i: K[i][:, i]):
+            Lb = trnsolver.pivoted_cholesky(diag, lambda i: K[i], 60, block=32, sub_fn=sub)
+            assert Lb.shape == L1.shape
+            assert torch.allclose(Lb, L1, atol=1e-10)
+
+    def test_sub_fn_asks_rows_only_for_accepted_pivots(self):
+        K = _scaled_rbf(500)
+        asked = []
+
+        def rows(idx):
+            assert idx.dtype == torch.int64 and idx.device.type == "cpu"
+            asked.append(idx.numel())
+            return K[idx]
+
+        L = trnsolver.pivoted_cholesky(
+            lambda: torch.diagonal(K).clone(), rows, 80, block=64, sub_fn=lambda i: K[i][:, i]
+        )
+        assert L.shape == (500, 80)
+        assert sum(asked) == 80
+        assert len(asked) < 80 and max(asked) <= 64
+
+    def test_without_sub_fn_asks_whole_candidate_blocks(self):
+        K = _scaled_rbf(300)
+        asked = []
+
+        def rows(idx):
+            asked.append(idx.numel())
+            return K[idx]
+
+        L = trnsolver.pivoted_cholesky(lambda: torch.diagonal(K).clone(), rows, 40, block=16)
+        assert L.shape == (300, 40)
+        assert all(a == 16 for a in asked) and sum(asked) >= 40
+
+    @pytest.mark.parametrize("relax", [1.0, 0.5, 0.25])
+    def test_relaxed_block_quality_and_calls(self, relax):
+        K = _scaled_rbf(600)
+        diag = lambda: torch.diagonal(K).clone()  # noqa: E731
+        calls = []
+
+        def rows(idx):
+            calls.append(idx.numel())
+            return K[idx]
+
+        L1 = trnsolver.pivoted_cholesky(diag, lambda i: K[i], 100)
+        Lb = trnsolver.pivoted_cholesky(
+            diag, rows, 100, block=128, relax=relax, sub_fn=lambda i: K[i][:, i]
+        )
+        assert Lb.shape == (600, 100)
+        # Still a pivoted Cholesky factor: exact on the pivot rows, PSD remainder.
+        E = K - Lb @ Lb.T
+        assert float(torch.linalg.eigvalsh(E).min()) > -1e-10
+        assert float(torch.trace(E)) <= 1.5 * float(torch.trace(K - L1 @ L1.T))
+        assert len(calls) < 100
+
+    def test_full_rank_exact_with_blocks(self):
+        n, r = 80, 9
+        G = torch.randn(n, r, dtype=torch.float64, generator=torch.Generator().manual_seed(3))
+        K = G @ G.T
+        L = trnsolver.pivoted_cholesky(
+            lambda: torch.diagonal(K).clone(), lambda i: K[i], n, block=8, relax=0.5,
+            sub_fn=lambda i: K[i][:, i],
+        )  # fmt: skip
+        assert L.shape[1] == r
+        assert torch.allclose(L @ L.T, K, atol=1e-10 * float(K.abs().max()))
+
+    def test_tol_with_blocks(self):
+        K, _ = _rbf(300)
+        tr = float(torch.trace(K))
+        L = trnsolver.pivoted_cholesky(
+            lambda: torch.diagonal(K).clone(), lambda i: K[i], 300, tol=1e-6, block=64
+        )
+        L1 = trnsolver.pivoted_cholesky(
+            lambda: torch.diagonal(K).clone(), lambda i: K[i], 300, tol=1e-6
+        )
+        assert L.shape[1] < 300
+        assert float(torch.trace(K - L @ L.T)) <= 1e-6 * tr * 1.0001
+        # Stopped at the first pivot that reaches tol, not at the end of a block.
+        assert float(torch.trace(K - L[:, :-1] @ L[:, :-1].T)) > 1e-6 * tr
+        assert abs(L.shape[1] - L1.shape[1]) <= 2
+
+    def test_fp32_rows_and_dtype(self):
+        K = _scaled_rbf(200)
+        L = trnsolver.pivoted_cholesky(
+            lambda: torch.diagonal(K).float(), lambda i: K[i].float(), 20, block=8
+        )
+        assert L.dtype == torch.float32 and L.shape == (200, 20)
+
+    def test_bad_args(self):
+        K = _scaled_rbf(20)
+        d = lambda: torch.diagonal(K).clone()  # noqa: E731
+        with pytest.raises(ValueError):
+            trnsolver.pivoted_cholesky(d, lambda i: K[i], 5, block=0)
+        with pytest.raises(ValueError):
+            trnsolver.pivoted_cholesky(d, lambda i: K[i], 5, relax=0.0)
+        with pytest.raises(ValueError):
+            trnsolver.pivoted_cholesky(d, lambda i: K[i], 5, relax=1.5)
+
+
+class TestProjectedApply:
+    """apply="projected": the fp32 on-device apply that does not cancel (#114)."""
+
+    def test_matches_dense_float64(self):
+        K, _ = _rbf(150)
+        shift = 1e-2
+        L = trnsolver.pivoted_cholesky(lambda: torch.diagonal(K).clone(), lambda i: K[i], 30)
+        P = trnsolver.PivotedLowRankPreconditioner(L, shift, apply="projected")
+        assert P.apply == "projected" and P.W is None
+        assert P.Q.dtype == torch.float64 and P.Q.shape[0] == 150
+        Q = P.Q
+        assert torch.allclose(Q.T @ Q, torch.eye(Q.shape[1], dtype=torch.float64), atol=1e-10)
+        dense = L @ L.T + shift * torch.eye(150, dtype=torch.float64)
+        V = torch.randn(150, 4, dtype=torch.float64)
+        assert torch.allclose(P(V), torch.linalg.solve(dense, V), rtol=1e-6, atol=1e-8)
+        assert torch.allclose(P(V[:, 0]), torch.linalg.solve(dense, V[:, 0]), atol=1e-8)
+        assert P.logdet() == pytest.approx(torch.linalg.slogdet(dense)[1].item(), rel=1e-10)
+
+    def test_ill_conditioned_basis_gets_second_gram_pass(self):
+        # λ spans 1e6 .. 1e-6 with a tiny shift: eps · λmax/λmin > 1e-6, so
+        # the Gram basis is re-orthogonalised.
+        n, k, shift = 200, 12, 1e-12
+        g = torch.Generator().manual_seed(4)
+        U, _ = torch.linalg.qr(torch.randn(n, k, generator=g, dtype=torch.float64))
+        W, _ = torch.linalg.qr(torch.randn(k, k, generator=g, dtype=torch.float64))
+        L = (U * torch.logspace(3, -3, k, dtype=torch.float64)) @ W
+        P = trnsolver.PivotedLowRankPreconditioner(L, shift, apply="projected")
+        Q = P.Q
+        assert Q.shape == (n, k)
+        assert torch.allclose(Q.T @ Q, torch.eye(k, dtype=torch.float64), atol=1e-12)
+        lam = shift / P.g - shift
+        ref = torch.linalg.svdvals(L) ** 2
+        assert torch.allclose(lam.sort().values, ref.sort().values, rtol=1e-6)
+
+    def test_zero_factor_gives_empty_basis(self):
+        L = torch.zeros(50, 3, dtype=torch.float64)
+        P = trnsolver.PivotedLowRankPreconditioner(L, 0.5, apply="projected")
+        assert P.Q.shape == (50, 0)
+        V = torch.randn(50, 2, dtype=torch.float64)
+        assert torch.allclose(P(V), V / 0.5)
+
+    def test_fp32_accurate_where_native_cancels(self):
+        n, noise = 1500, 1e-3
+        K, _ = _rbf(n, noise=noise)
+        L = trnsolver.pivoted_cholesky(lambda: torch.diagonal(K).clone(), lambda i: K[i], 400)
+        dense = L @ L.T + noise * torch.eye(n, dtype=torch.float64)
+        # Residual-like input: mostly along the captured subspace, where the
+        # cancellation is worst.
+        V = (L @ torch.randn(400, 3, dtype=torch.float64) + 1e-2 * torch.randn(n, 3)).float()
+
+        def err(mode):
+            # Residual ‖V − P z‖/‖V‖: weights the error along the captured
+            # directions by λ, which is what breaks CG (the norm-wise forward
+            # error hides it).
+            out = trnsolver.PivotedLowRankPreconditioner(L.float(), noise, apply=mode)(V)
+            assert out.dtype == torch.float32
+            return float((V.double() - dense @ out.double()).norm() / V.double().norm())
+
+        e_proj, e_native = err("projected"), err("native")
+        assert e_proj < 1e-3
+        assert e_native > 100 * e_proj
+
+    def test_fp32_converges_in_host64_iterations(self):
+        n, noise = 1500, 1e-3
+        K, A = _rbf(n, noise=noise, dtype=torch.float32)
+        K64 = K.double()
+        L = trnsolver.pivoted_cholesky(lambda: torch.diagonal(K64).clone(), lambda i: K64[i], 400)
+        B = torch.randn(n, 3)
+        Xh, host = trnsolver.cg_block(
+            A, B, trnsolver.PivotedLowRankPreconditioner(L.float(), noise), tol=1e-5, maxiter=300
+        )
+        X, proj = trnsolver.cg_block(
+            A, B, trnsolver.PivotedLowRankPreconditioner(L.float(), noise, apply="projected"),
+            tol=1e-5, maxiter=300,
+        )  # fmt: skip
+        assert bool(host["converged"].all()) and bool(proj["converged"].all())
+        assert abs(proj["iterations"] - host["iterations"]) <= 1
+        assert torch.equal(proj["col_iterations"], host["col_iterations"]) or (
+            (proj["col_iterations"] - host["col_iterations"]).abs().max() <= 1
+        )
+        x64 = torch.linalg.solve(A.double(), B.double())
+
+        def fwd(Y):
+            return float(((Y.double() - x64).norm(dim=0) / x64.norm(dim=0)).max())
+
+        assert fwd(X) < 2 * fwd(Xh) + 1e-4
+
+    def test_auto_unchanged(self):
+        K, _ = _rbf(100)
+        L = trnsolver.pivoted_cholesky(lambda: torch.diagonal(K).clone(), lambda i: K[i], 10)
+        assert trnsolver.PivotedLowRankPreconditioner(L.float(), 1e-2).apply == "host64"
+        assert trnsolver.PivotedLowRankPreconditioner(L, 1e-2).apply == "native"
+
+
 class TestCGBlockIR:
     def test_reaches_1e10_with_fp32_inner(self):
         n, noise = 1000, 1e-4
