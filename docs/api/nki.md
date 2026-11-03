@@ -30,7 +30,7 @@ the Householder path and `eigh_generalized` through it, `eigh_randomized`,
 |------|---------------|
 | backend `"auto"` | computes in torch at float64 accuracy; no kernel runs. Host input runs host torch (LAPACK); input on the `neuron` device is computed on the host (see below) |
 | backend `"nki"` | cast to FP32 for the kernels, result returned as float64; one `UserWarning` per op (on its first call) says precision is reduced to fp32 |
-| `TRNSOLVER_REQUIRE_NKI=1` | raises `NotImplementedError` (either backend; takes precedence over the cast) |
+| `TRNSOLVER_REQUIRE_NKI=1` | raises `NotImplementedError` (either backend; takes precedence over the cast). float64 / complex128 on the `neuron` device raise at every public op, including the routes with no kernel (see below) |
 
 - **float64 on the `neuron` device.** Device aten computes float64 at fp32
   precision (measured on Trn2), so under backend `"auto"` every public op
@@ -52,8 +52,13 @@ the Householder path and `eigh_generalized` through it, `eigh_randomized`,
   and `PivotedLowRankPreconditioner(apply="auto")` applies a float64 L that
   is on the device as `"host64"`. To keep device aten (fp32 precision, no
   host round trip), pass float32, or set `TRNSOLVER_FP64_ON_DEVICE=1`.
-  Backends `"nki"` and `"pytorch"` and `TRNSOLVER_REQUIRE_NKI=1` are not
-  affected.
+  Backends `"nki"` and `"pytorch"` are not affected. Under
+  `TRNSOLVER_REQUIRE_NKI=1` (backends `"auto"` and `"nki"`), a float64 /
+  complex128 operand on the `neuron` device raises `NotImplementedError` at
+  every public op (and in `pivoted_cholesky` / `PivotedLowRankPreconditioner`),
+  with no host copy, ahead of `TRNSOLVER_FP64_ON_DEVICE`; before, the routes
+  with no kernel (`solve_spd`, `inv_spd`, `pinv`, `cg`, ...) ran device aten
+  at fp32 precision with no error.
 - **Result dtype** always matches what the pytorch backend returns for the
   same inputs: float32, float64, bfloat16 and float16 (computed in FP32 and
   cast back), and mixed-dtype operands (`torch.promote_types` rules, e.g.

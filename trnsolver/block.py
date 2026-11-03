@@ -34,7 +34,12 @@ from collections.abc import Callable
 import torch
 
 from .factor import _restore, _to_fp32
-from .nki.dispatch import _fp64_host_device, _fp64_host_guard, _warn_fp64_host_once
+from .nki.dispatch import (
+    _fp64_host_device,
+    _fp64_host_guard,
+    _refuse_device_fp64,
+    _warn_fp64_host_once,
+)
 
 _HOST = torch.device("cpu")
 
@@ -341,7 +346,9 @@ def pivoted_cholesky(
     # float64 policy: a float64 diagonal on the neuron device under backend
     # "auto" is factored on the host (device aten computes float64 at fp32
     # precision) and L goes back to the diagonal's device (`_fp64_host_guard`
-    # cannot see the tensors behind the two callables).
+    # cannot see the tensors behind the two callables); NotImplementedError
+    # under TRNSOLVER_REQUIRE_NKI.
+    _refuse_device_fp64("pivoted_cholesky", (d,), {})
     home = _fp64_host_device((d,), {})
     if home is not None:
         _warn_fp64_host_once("pivoted_cholesky")
@@ -410,6 +417,7 @@ class PivotedLowRankPreconditioner:
             raise ValueError(f"PivotedLowRankPreconditioner: shift must be > 0, got {shift}")
         if apply not in ("auto", "host64", "native"):
             raise ValueError(f"apply must be 'auto', 'host64' or 'native', got {apply!r}")
+        _refuse_device_fp64("PivotedLowRankPreconditioner", (L,), {})
         if apply == "auto":
             apply = "native" if L.dtype == torch.float64 else "host64"
             if apply == "native" and _fp64_host_device((L,), {}) is not None:

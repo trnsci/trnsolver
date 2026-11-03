@@ -212,8 +212,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     op ("float64 on the neuron device is computed on the host for float64
     accuracy (device arithmetic is fp32); pass float32 to stay on device").
     **`TRNSOLVER_FP64_ON_DEVICE=1` keeps device aten (fp32 precision)** for
-    callers who prefer speed. Host-resident float64, backends `nki` /
-    `pytorch` and `TRNSOLVER_REQUIRE_NKI=1` are unchanged. One decorator
+    callers who prefer speed. Host-resident float64 and backends `nki` /
+    `pytorch` are unchanged. **Under `TRNSOLVER_REQUIRE_NKI=1` a float64 /
+    complex128 operand on the `neuron` device now raises
+    `NotImplementedError` at every public op** (backends `auto` and `nki`,
+    no host copy, ahead of `TRNSOLVER_FP64_ON_DEVICE=1`). Before, the routes
+    with no kernel (`solve_spd`, `inv_spd`, `pinv`, `cg`, `gmres`, ...) ran
+    device aten at fp32 precision with no error. One decorator
     (`nki.dispatch._fp64_host_guard`) holds the rule; the preconditioner
     constructors (`jacobi_` / `block_jacobi_` / `ssor_preconditioner`), which
     return closures, use `_fp64_host_preconditioner`: the closure computes on

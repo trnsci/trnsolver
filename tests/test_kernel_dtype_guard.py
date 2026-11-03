@@ -994,3 +994,75 @@ def test_fp64_on_device_cg_block_with_lowrank_preconditioner(monkeypatch):
     assert "trnsolver cg_block:" in " ".join(str(w.message) for w in _host_warnings(caught))
     assert X.dtype == torch.float64 and bool(info["converged"].all())
     torch.testing.assert_close(X, want, rtol=1e-10, atol=1e-12)
+
+
+# ── TRNSOLVER_REQUIRE_NKI=1 with float64 on the neuron device ────────────────
+# Every public op raises NotImplementedError, before any host copy or launch.
+# The routes with no kernel (solve_spd, inv_spd, pinv, cg, ...) used to run
+# device aten at fp32 precision with no error.
+
+
+@pytest.mark.parametrize("backend", ["auto", "nki"])
+@pytest.mark.parametrize("dt", FP64_DTYPES, ids=["float64", "complex128"])
+@pytest.mark.parametrize("name,env,fn", APIS, ids=_api_ids())
+def test_fp64_on_device_require_nki_raises_on_every_op(monkeypatch, name, env, fn, dt, backend):
+    _, ref_err = _pytorch_reference(monkeypatch, env, fn, dt)
+    if ref_err is not None:
+        pytest.skip(f"the pytorch backend raises for {name} {dt}: {ref_err}")
+    rec, _ = _install(monkeypatch, "native", backend, True)
+    tr = Transfers(monkeypatch)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(NotImplementedError, match="TRNSOLVER_REQUIRE_NKI") as err:
+            _run(monkeypatch, env, fn, dt)
+    assert str(err.value).startswith("trnsolver ") and "neuron device" in str(err.value)
+    assert not rec.launches and not tr.to_host and not tr.to_device
+    assert not _host_warnings(caught)
+
+
+@pytest.mark.parametrize("name", ["solve_spd", "inv_spd", "pinv"])
+def test_fp64_on_device_require_nki_no_kernel_routes(monkeypatch, name):
+    """The routes the device run found computing at fp32 with no error: they
+    raise, the message names the op, and FP64_ON_DEVICE=1 does not bypass it."""
+    A, B = _spd(5, torch.float64), torch.ones(5, 1, dtype=torch.float64)
+    call = {
+        "solve_spd": lambda: trnsolver.solve_spd(A, B),
+        "inv_spd": lambda: trnsolver.inv_spd(A),
+        "pinv": lambda: trnsolver.pinv(A),
+    }[name]
+    _install(monkeypatch, "native", "auto", True)
+    for override in (False, True):
+        monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", override)
+        with pytest.raises(NotImplementedError, match=f"trnsolver {name}: .*float64"):
+            call()
+
+
+def test_fp64_on_device_require_nki_block_routes(monkeypatch):
+    """cg_block, pivoted_cholesky and PivotedLowRankPreconditioner (whose
+    operands the guard cannot see) raise the same way."""
+    K = _spd(8, torch.float64)
+    L = torch.randn(8, 2, dtype=torch.float64)
+    _install(monkeypatch, "native", "auto", True)
+    cases = {
+        "cg_block": lambda: trnsolver.cg_block(K, torch.ones(8, 2, dtype=torch.float64)),
+        "pivoted_cholesky": lambda: trnsolver.pivoted_cholesky(
+            lambda: torch.diagonal(K).clone(), lambda idx: K[idx], 3
+        ),
+        "PivotedLowRankPreconditioner": lambda: trnsolver.PivotedLowRankPreconditioner(L, 0.5),
+    }
+    for name, call in cases.items():
+        with pytest.raises(NotImplementedError, match=f"trnsolver {name}: .*TRNSOLVER_REQUIRE"):
+            call()
+
+
+def test_fp64_require_nki_leaves_host_float64_and_pytorch(monkeypatch):
+    """Host-resident float64 on a route with no kernel still computes in host
+    torch under REQUIRE_NKI, and the pytorch backend ignores the variable."""
+    A, B = _spd(5, torch.float64), torch.ones(5, 1, dtype=torch.float64)
+    want = torch.linalg.solve(A, B)
+    _install(monkeypatch, "native", "pytorch", True)
+    torch.testing.assert_close(trnsolver.solve_spd(A, B), want, rtol=1e-12, atol=1e-12)
+    _install(monkeypatch, "native", "auto", True)
+    monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "neuron")  # CPU is the host again
+    torch.testing.assert_close(trnsolver.solve_spd(A, B), want, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(trnsolver.pinv(A), torch.linalg.inv(A), rtol=1e-10, atol=1e-12)

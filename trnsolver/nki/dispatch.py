@@ -426,8 +426,13 @@ def _kernel_operands(
 # the result comes back on the original device, still float64. One
 # UserWarning per op says so. ``TRNSOLVER_FP64_ON_DEVICE=1`` keeps device
 # aten (fp32 precision) for callers who prefer speed. Host-resident float64
-# is unchanged. Backends "nki" (fp32 cast) and "pytorch", and
-# ``TRNSOLVER_REQUIRE_NKI=1`` (raises), are unchanged too.
+# is unchanged. Backends "nki" (fp32 cast) and "pytorch" are unchanged too.
+# ``TRNSOLVER_REQUIRE_NKI=1`` (backends "auto" and "nki") raises
+# NotImplementedError for float64 / complex128 on the neuron device at every
+# public op, with no host copy and ahead of ``TRNSOLVER_FP64_ON_DEVICE``
+# (`_refuse_device_fp64`): no kernel computes them at float64 accuracy, and
+# the routes without a kernel (solve_spd, inv_spd, pinv, cg, ...) would run
+# device aten at fp32 precision with no error.
 _FP64_ON_DEVICE = os.environ.get("TRNSOLVER_FP64_ON_DEVICE", "").lower() in ("1", "true", "yes")
 _FP64_HOST_DTYPES = (torch.float64, torch.complex128)
 _HOST = torch.device("cpu")
@@ -496,6 +501,29 @@ def _warn_fp64_host_once(what: str) -> None:
     )
 
 
+def _refuse_device_fp64(what: str, args, kwargs) -> None:
+    """Under ``TRNSOLVER_REQUIRE_NKI=1`` (NKI backends), NotImplementedError for
+    a float64 / complex128 operand on the neuron device (see above)."""
+    if not _REQUIRE_NKI or not _use_nki():
+        return
+    if torch.compiler.is_compiling() or getattr(_fp64_host_active, "on", False):
+        return
+    dts = sorted(
+        {
+            str(t.dtype)
+            for t in _tensors((args, kwargs))
+            if t.dtype in _FP64_HOST_DTYPES and _on_neuron_device(t)
+        }
+    )
+    if dts:
+        raise NotImplementedError(
+            f"trnsolver {what}: no NKI kernel computes {_dtype_names(dts)} on the neuron "
+            "device at float64 accuracy (device arithmetic is fp32). Unset "
+            "TRNSOLVER_REQUIRE_NKI to compute on the host at float64 accuracy, or pass "
+            "float32."
+        )
+
+
 def _fp64_host_device(args, kwargs) -> torch.device | None:
     """The neuron device to return the result to if this call computes on the
     host (backend "auto", a float64 / complex128 operand on the neuron device,
@@ -534,6 +562,7 @@ def _fp64_host_guard(what: str):
     def deco(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
+            _refuse_device_fp64(what, args, kwargs)
             device = _fp64_host_device(args, kwargs)
             if device is None:
                 return fn(*args, **kwargs)
@@ -573,6 +602,7 @@ def _fp64_host_preconditioner(what: str):
     def deco(build):
         @functools.wraps(build)
         def wrapper(*args, **kwargs):
+            _refuse_device_fp64(what, args, kwargs)
             if _fp64_host_device(args, kwargs) is None:
                 return build(*args, **kwargs)
             _warn_fp64_host_once(what)
