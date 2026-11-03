@@ -228,6 +228,11 @@ def load_system_fields(path: str) -> dict:
 def _shell_row_blocks(ao_loc, nbas: int, naux: int, block_bytes: int):
     """Shell ranges [i0, i1) whose packed rows times naux float64 fit ``block_bytes``
     (at least one shell per block)."""
+    # Python ints: PySCF's ao_loc is int32, and 3 * rows * naux * 8 wraps
+    # past 2**31 (at cc-pVTZ, n_ao 2522, one shell takes a block from under
+    # block_bytes to over 2**31 bytes), so the test passed and the largest
+    # row block was 13 GB instead of <= 1 GiB (OOM on the 124 GB host).
+    ao_loc = [int(x) for x in ao_loc]
     blocks = []
     i0 = 0
     while i0 < nbas:

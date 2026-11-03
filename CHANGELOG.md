@@ -331,6 +331,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still held. At alkane43 / cc-pVTZ over 4 cores (19.2 GB per core), the second
   upload failed with NRT_RESOURCE. The new `DFJK.close()` is called at the end of
   `run_scf` and after the canonical Fock build in `scf_df_mp2.py`.
+- **Streamed J/K: the default resident budget leaves room for chunks in flight (trnsci/trnsci#115).**
+  If some chunks stream, the default per-device resident budget is now
+  `DEVICE_RESIDENT_GB` minus (prefetch + 2) chunks: the uploads in flight plus one
+  chunk of `df_exchange` working memory. Before, it was the full 20 GB, and a 24 GiB
+  Trn2 core ran out of memory (NRT_RESOURCE) in the second SCF iteration in two cases:
+  C40H82 / aug-cc-pVDZ on one core at 20 GB resident (16 GB ran), and
+  alkane69 / cc-pVDZ (nocc 277) at 15.7 GB (13 GB converged in 6 iterations).
+  Fully resident layouts (B fits the budget) are unchanged.
+- **`df_store` row blocks no longer overflow on int32 `ao_loc` (trnsci/trnsci#115).**
+  PySCF's `ao_loc` is int32, so the block-size test `3 · rows · naux · 8` wrapped
+  past 2³¹ once one shell pushed a block from under `block_bytes` to over 2 GiB.
+  That happens at cc-pVTZ, n_ao ≈ 2500. The test then passed when it should have
+  stopped. At alkane43 / cc-pVTZ (n_ao 2522) the largest row block came out at 13.0 GB
+  of float64 int3c2e, about 39 GB with its solve copies, against the 1 GiB budget,
+  and the box build was among the processes OOM-killed. With Python ints the sizes give 495 blocks of
+  ≤ 0.61 GB (previously 344).
+- **Host float64 J/K over an fp32 store no longer raises at n_ao ≳ 2050 (trnsci/trnsci#115).**
+  The canonical Fock in `scf_df_mp2.py` streams the fp32 store in float64 on the host.
+  The store's 128-column chunks double to more than 2 GiB there, so `DFJK` re-split B
+  under the device's 2 GiB bound. At n_ao 2522 not even 128 float64 columns fit, and
+  `aux_chunk_width` raised. On the host the store's own chunks are now used as they
+  are, since that bound applies only to the device matmul.
 - **float64, integer and bool operands reached the FP32 NKI kernels (#83,
   trnsci/trnsci#35).** One dtype table (`KERNEL_DTYPES` in
   `trnsolver/nki/dispatch.py`) now lists what each kernel takes, and
