@@ -436,6 +436,24 @@ def test_chunk_width_is_128_multiple_under_limit():
     assert w % 128 == 0 and npair * w * 4 <= df_store.DEFAULT_CHUNK_BYTES < 1 << 32
 
 
+def test_shell_row_blocks_int32_ao_loc():
+    """PySCF's ao_loc is int32: the block-size test must not wrap past 2**31
+    (alkane43 / cc-pVTZ, n_ao 2522: a 13 GB row block, OOM)."""
+    import numpy as np
+
+    # 360 f-like shells of 7 functions (n_ao 2520), naux 6037, 1 GiB blocks.
+    ao_loc = np.arange(0, 7 * 361, 7, dtype=np.int32)
+    nbas, naux, cap = 360, 6037, 1 << 30
+    blocks = df_store._shell_row_blocks(ao_loc, nbas, naux, cap)
+    assert blocks[0][0] == 0 and blocks[-1][1] == nbas
+    assert all(a[1] == b[0] for a, b in zip(blocks[:-1], blocks[1:], strict=True))
+    for i0, i1 in blocks:
+        m0, m1 = int(ao_loc[i0]), int(ao_loc[i1])
+        rows = m1 * (m1 + 1) // 2 - m0 * (m0 + 1) // 2
+        # at most one shell over the cap (a single shell is always allowed)
+        assert i1 - i0 == 1 or 3 * rows * naux * 8 <= cap
+
+
 def test_h2_lattice_store_matches_in_memory(tmp_path):
     mem = scf.h2_lattice(6)
     disk = scf.h2_lattice(6, store=str(tmp_path / "h2"), store_dtype=torch.float64)
