@@ -226,6 +226,10 @@ def _install(monkeypatch, path, backend, require):
     monkeypatch.setattr(eigen, "_NATIVE_DEVICE_TYPE", "cpu")
     for mod, attr, op in KERNEL_ATTRS:
         monkeypatch.setattr(mod, attr, FakeKernel(rec, op), raising=False)
+    # Record the real state first, so teardown removes the stub-backed `_native`
+    # imported below (a later test in the session would otherwise get stub ops).
+    monkeypatch.setitem(sys.modules, "trnsolver.nki._native", None)
+    monkeypatch.setattr(trnsolver.nki, "_native", None, raising=False)
     monkeypatch.delitem(sys.modules, "trnsolver.nki._native", raising=False)
     monkeypatch.delattr(trnsolver.nki, "_native", raising=False)
     monkeypatch.setattr(nj, "_DEVICE_CONSTS", {})
