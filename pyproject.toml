@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trnsolver"
-version = "0.20.0"
+version = "0.21.0"
 description = "Linear solvers and eigendecomposition for AWS Trainium via NKI"
 readme = "README.md"
 license = "Apache-2.0"
@@ -59,7 +59,10 @@ dev = [
     "scipy>=1.11",
     # examples/scf_df_rhf.py (tests/test_scf_df_rhf.py) composes the suite.
     "trnblas>=0.9",
-    "trntensor>=0.20",
+    # trntensor.AuxStream (trntensor#102) streams the DF integrals; it is not
+    # in a release yet, so the tests that use it skip (importorskip / hasattr)
+    # until it ships. Raise this floor to that release then.
+    "trntensor>=0.23",
 ]
 
 [project.urls]

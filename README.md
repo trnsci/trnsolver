@@ -117,6 +117,8 @@ Demonstrates the self-consistent-field iteration: build Fock matrix → solve ge
 python examples/scf_df_rhf.py --system h2-lattice:16
 python scripts/bench_scf.py --systems h2-lattice:16 --modes cpu,cpu64
 python scripts/bench_scf.py --systems pyscf:alkane20 --modes cpu,neuron,neuron-nosync   # on Trn2
+python examples/scf_df_mp2.py --system pyscf:water --reference   # DF-MP2 on the converged SCF
+python scripts/bench_scf_ladder.py --dry-run   # 500-3500 AO ladder: memory, cores / chips, window plan
 ```
 
 ## Status
@@ -212,6 +214,15 @@ python scripts/bench_scf.py --systems pyscf:alkane20 --modes cpu,neuron,neuron-n
 ## Benchmarks
 
 CPU baselines (torch.linalg, scipy.linalg, trnsolver PyTorch path) run on every CI build; CUDA baselines (`benchmarks/bench_cuda.py`, cuSOLVER via torch.linalg) run on a vintage-matched g5.xlarge A10G instance; Trn2 numbers (batched Jacobi `eigh`, DF-RHF SCF) are measured by `scripts/bench_jacobi_multicore.py` and `scripts/bench_scf.py`. See the [benchmarks page](https://trnsci.dev/trnsolver/benchmarks/) for the latest table and vintage-matching rationale.
+
+## Known issues in earlier releases
+
+Silent wrong-result bugs fixed in the 2026-10-31 to 2026-11-02 releases. Details are in the [CHANGELOG](CHANGELOG.md).
+
+| Bug | Affected | Fixed in |
+|---|---|---|
+| `eigh` on the NKI Householder path (`TRNSOLVER_REQUIRE_NKI=1` or a non-native NKI device): float64 input gave garbage results, and n = 1 returned `(1, 1)` eigenvalues; `eigh_generalized` inherited both (#83) | through 0.20.0 (n = 1 shape: 0.4.0–0.20.0) | 0.21.0 |
+| Complex Hermitian and batched input to `cholesky(upper=True)`, `solve_spd`, `inv_spd`, `inv_sqrt_spd`, `eigh_generalized`, `eigh_randomized`, `pinv` and `ssor_preconditioner` used `.T` instead of `.mH` (#64) | every release through 0.20.0 (`pinv` since 0.5.0, `ssor_preconditioner` since 0.8.0) | 0.21.0 |
 
 ## Related projects in the trnsci suite
 

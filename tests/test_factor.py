@@ -195,6 +195,51 @@ class TestSolveSPD:
         assert torch.linalg.norm(residual, ord="fro").item() < 1e-3
 
 
+class TestSolveSPDBatchedVectors:
+    """B (*, n) with B.shape == A.shape[:-1] is a batch of vectors (#79).
+
+    Reference: numpy.linalg.solve per matrix (LAPACK), independent of torch.
+    """
+
+    @staticmethod
+    def _spd_batch(batch, n, seed=0, complex_=False):
+        rng = np.random.default_rng(seed)
+        X = rng.standard_normal((*batch, n, n))
+        if complex_:
+            X = X + 1j * rng.standard_normal((*batch, n, n))
+        return X @ np.conj(np.swapaxes(X, -1, -2)) + n * np.eye(n)
+
+    @pytest.mark.parametrize("batch", [(3,), (1,), (2, 3)])
+    @pytest.mark.parametrize("complex_", [False, True])
+    @pytest.mark.parametrize("ir", [False, True])
+    def test_batch_of_vectors(self, batch, complex_, ir):
+        n = 5
+        A = self._spd_batch(batch, n, complex_=complex_)
+        rng = np.random.default_rng(1)
+        B = rng.standard_normal((*batch, n)) + (
+            1j * rng.standard_normal((*batch, n)) if complex_ else 0
+        )
+        ref = np.linalg.solve(A, B[..., None])[..., 0]
+        X = trnsolver.solve_spd(torch.from_numpy(A), torch.from_numpy(B), iterative_refinement=ir)
+        assert X.shape == B.shape
+        np.testing.assert_allclose(X.numpy(), ref, rtol=0, atol=1e-10)
+
+    def test_issue_repro(self):
+        A = torch.eye(4, dtype=torch.float64).expand(3, 4, 4)
+        B = torch.ones(3, 4, dtype=torch.float64)
+        np.testing.assert_allclose(trnsolver.solve_spd(A, B).numpy(), np.ones((3, 4)))
+
+    def test_batch_equals_n_keeps_matrix_reading(self):
+        # A (n, n, n), B (n, n): B also reads as one shared (n, k) right-hand
+        # side, which solve_spd has always done. Unchanged (#79, needs-decision).
+        n = 4
+        A = self._spd_batch((n,), n, seed=2)
+        B = np.random.default_rng(3).standard_normal((n, n))
+        X = trnsolver.solve_spd(torch.from_numpy(A), torch.from_numpy(B))
+        assert X.shape == (n, n, n)
+        np.testing.assert_allclose(X.numpy(), np.linalg.solve(A, B), rtol=0, atol=1e-10)
+
+
 class TestInvSqrtSPD:
     def test_identity(self):
         A = torch.eye(4)

@@ -135,6 +135,48 @@ def ssor_preconditioner(
     return apply
 
 
+def _inner(u: torch.Tensor, v: torch.Tensor) -> float:
+    """Real part of the conjugated inner product ``u^H v``, accumulated in fp64.
+
+    CG's ``r^H z`` and ``p^H A p`` are real for a Hermitian (positive
+    definite) ``A`` and ``M``. ``u.dot(v)`` neither conjugates ``u`` nor
+    keeps the imaginary part through ``float()``, which made ``cg`` wrong
+    for complex input (#100). For real input this is ``u.dot(v)``.
+    """
+    wide = torch.complex128 if (u.is_complex() or v.is_complex()) else torch.float64
+    return torch.vdot(u.to(wide), v.to(wide)).real.item()
+
+
+def _needs_implicit_grad(*ts) -> bool:
+    return torch.is_grad_enabled() and any(
+        isinstance(t, torch.Tensor) and t.requires_grad for t in ts
+    )
+
+
+class _ImplicitSolve(torch.autograd.Function):
+    """x = A^{-1} b from an iterative ``solve(A, b)``, differentiated implicitly.
+
+    Backward solves the adjoint system A^H λ = ∂x with the same solver, so
+    ∂b = λ and ∂A = -λ x^H (#76). The adjoint solve goes through this
+    Function again, which makes the backward itself differentiable
+    (double backward).
+    """
+
+    @staticmethod
+    def forward(ctx, A, b, solve):
+        x = solve(A, b)
+        ctx.solve = solve
+        ctx.save_for_backward(A, x)
+        return x
+
+    @staticmethod
+    def backward(ctx, gx):
+        A, x = ctx.saved_tensors
+        lam = _ImplicitSolve.apply(A.mH.resolve_conj(), gx, ctx.solve)
+        gA = -torch.outer(lam, x.conj()) if ctx.needs_input_grad[0] else None
+        return gA, lam, None
+
+
 @torch.compiler.disable
 def cg(
     A: torch.Tensor | Callable,
@@ -144,10 +186,12 @@ def cg(
     maxiter: int = 1000,
     M: torch.Tensor | Callable | None = None,
 ) -> tuple[torch.Tensor, int, float]:
-    """Conjugate Gradient solver for A @ x = b (A must be SPD).
+    """Conjugate Gradient solver for A @ x = b (A must be SPD or complex HPD).
 
     Args:
-        A: SPD matrix (n, n) or callable matvec A(x) → A@x
+        A: SPD, or complex Hermitian positive definite, matrix (n, n), or
+            callable matvec A(x) → A@x. Inner products are conjugated
+            (``r^H z``), so complex systems are solved as such (#100).
         b: Right-hand side (n,)
         x0: Initial guess (default: zeros)
         tol: Convergence tolerance on relative residual
@@ -166,10 +210,42 @@ def cg(
     are Python numbers. The function is wrapped in ``torch.compiler.disable``,
     so inside a compiled region it runs eagerly behind a single graph break
     (an error under ``fullgraph=True``) instead of fragmenting the graph (#41).
+
+    Autograd: with a tensor ``A``, ``x`` is differentiated implicitly. The
+    backward pass solves the adjoint system ``A^H λ = ∂x`` with ``cg`` (same
+    ``tol``, ``maxiter`` and ``M``) and returns ``∂b = λ``,
+    ``∂A = -λ x^H``; ``x0`` and a tensor ``M`` get no gradient (the solution
+    does not depend on them). This is the exact gradient of ``A^{-1} b``
+    when the solve has converged, and costs one extra solve per backward
+    pass (#76). With a callable ``A`` the iteration is differentiated as
+    unrolled, which is right for ``b`` at convergence but not for any
+    parameters the callable closes over.
     """
     b, orig = _to_fp32(b)
     if not callable(A):
+        if A.is_complex() and not b.is_complex():
+            # A complex A with a real b has a complex solution; casting A to
+            # b's dtype dropped A's imaginary part (#100).
+            b = b.to(torch.promote_types(b.dtype, A.dtype))
         A = A.to(b.dtype)
+        if _needs_implicit_grad(A, b, x0):
+            info: dict = {}
+
+            def solve(A_, b_):
+                x_, info["iters"], info["res"] = _cg_impl(
+                    A_, b_, x0 if A_ is A else None, tol, maxiter, M
+                )
+                return x_
+
+            x = _ImplicitSolve.apply(A, b, solve)
+            return _restore(x, orig), info["iters"], info["res"]
+    return _cg_impl(A, b, x0, tol, maxiter, M, orig)
+
+
+def _cg_impl(A, b, x0, tol, maxiter, M, orig=None):
+    """CG iteration proper; see :func:`cg`. ``b`` is already fp32-or-wider."""
+    if orig is None:
+        orig = b.dtype
     if x0 is not None:
         x0 = x0.to(b.dtype)
     n = b.shape[0]
@@ -195,11 +271,11 @@ def cg(
     z = precond(r) if precond is not None else r.clone()
 
     p = z.clone()
-    rz = float(r.to(torch.float64).dot(z.to(torch.float64)))
+    rz = _inner(r, z)
 
     for k in range(maxiter):
         Ap = matvec(p)
-        pAp = float(p.to(torch.float64).dot(Ap.to(torch.float64)))
+        pAp = _inner(p, Ap)
         # Exact breakdown only: an absolute threshold (1e-30) stopped
         # small-scale problems (A, b ~ 1e-16) before the first step.
         if pAp == 0.0:
@@ -215,7 +291,7 @@ def cg(
 
         z = precond(r) if precond is not None else r.clone()
 
-        rz_new = float(r.to(torch.float64).dot(z.to(torch.float64)))
+        rz_new = _inner(r, z)
         beta = rz_new / rz
         p = z + beta * p
         rz = rz_new
@@ -252,10 +328,40 @@ def gmres(
         residual: Final relative residual norm
 
     Eager-only (``torch.compiler.disable``); see :func:`cg` (#41).
+
+    Autograd: with a tensor ``A``, ``x`` is differentiated implicitly. The
+    backward pass solves ``A^H λ = ∂x`` with ``gmres`` (same ``tol``,
+    ``maxiter``, ``restart``) and returns ``∂b = λ``, ``∂A = -λ x^H``;
+    ``x0`` gets no gradient (#76). A callable ``A`` cannot be
+    differentiated (there is no adjoint matvec): ``gmres`` raises
+    ``RuntimeError`` if ``b`` or ``x0`` requires grad.
     """
     b, orig = _to_fp32(b)
     if not callable(A):
         A = A.to(b.dtype)
+        if _needs_implicit_grad(A, b, x0):
+            info: dict = {}
+
+            def solve(A_, b_):
+                x_, info["iters"], info["res"] = _gmres_impl(
+                    A_, b_, x0 if A_ is A else None, tol, maxiter, restart
+                )
+                return x_
+
+            x = _ImplicitSolve.apply(A, b, solve)
+            return _restore(x, orig), info["iters"], info["res"]
+    elif _needs_implicit_grad(b, x0):
+        raise RuntimeError(
+            "gmres: cannot differentiate with a callable A (no adjoint matvec); "
+            "pass A as a tensor, or call under torch.no_grad()"
+        )
+    return _gmres_impl(A, b, x0, tol, maxiter, restart, orig)
+
+
+def _gmres_impl(A, b, x0, tol, maxiter, restart, orig=None):
+    """Restarted GMRES proper; see :func:`gmres`. ``b`` is already fp32-or-wider."""
+    if orig is None:
+        orig = b.dtype
     if x0 is not None:
         x0 = x0.to(b.dtype)
     n = b.shape[0]

@@ -72,6 +72,80 @@ class TestCG:
         assert res < 1e-5
 
 
+class TestCGComplex:
+    """Complex Hermitian systems (#100): conjugated inner products.
+
+    Reference: numpy.linalg.solve in complex128 (LAPACK), independent of torch.
+    """
+
+    @staticmethod
+    def _hpd(n, seed=0):
+        rng = np.random.default_rng(seed)
+        X = rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))
+        return X @ X.conj().T + n * np.eye(n)
+
+    @pytest.mark.parametrize("n", [1, 6, 40])
+    def test_complex_hermitian(self, n):
+        A = self._hpd(n)
+        rng = np.random.default_rng(1)
+        b = rng.standard_normal(n) + 1j * rng.standard_normal(n)
+        ref = np.linalg.solve(A, b)
+        x, iters, res = trnsolver.cg(torch.from_numpy(A), torch.from_numpy(b), tol=1e-12)
+        assert x.is_complex()
+        assert res < 1e-11
+        assert iters <= n + 5  # CG converges in ~n steps in exact arithmetic
+        np.testing.assert_allclose(x.numpy(), ref, rtol=0, atol=1e-10 * np.abs(ref).max())
+
+    def test_complex_callable_and_jacobi(self):
+        n = 24
+        A = self._hpd(n, seed=2)
+        b = np.random.default_rng(3).standard_normal(n) + 0j
+        b = b + 1j * np.random.default_rng(4).standard_normal(n)
+        ref = np.linalg.solve(A, b)
+        At = torch.from_numpy(A)
+        M = trnsolver.jacobi_preconditioner(At)
+        x, iters, res = trnsolver.cg(lambda v: At @ v, torch.from_numpy(b), tol=1e-12, M=M)
+        assert res < 1e-11
+        assert iters <= n + 5  # CG converges in ~n steps in exact arithmetic
+        np.testing.assert_allclose(x.numpy(), ref, rtol=0, atol=1e-10 * np.abs(ref).max())
+
+    def test_complex_A_real_b(self):
+        n = 12
+        A = self._hpd(n, seed=5)
+        b = np.random.default_rng(6).standard_normal(n)
+        ref = np.linalg.solve(A, b)
+        x, _, res = trnsolver.cg(torch.from_numpy(A), torch.from_numpy(b), tol=1e-12)
+        assert x.is_complex()
+        np.testing.assert_allclose(x.numpy(), ref, rtol=0, atol=1e-10 * np.abs(ref).max())
+
+    def test_complex64(self):
+        n = 16
+        A = self._hpd(n, seed=7)
+        b = np.random.default_rng(8).standard_normal(n) + 1j
+        ref = np.linalg.solve(A, b)
+        x, iters, _ = trnsolver.cg(
+            torch.from_numpy(A).to(torch.complex64),
+            torch.from_numpy(b).to(torch.complex64),
+            tol=1e-6,
+        )
+        assert x.dtype == torch.complex64
+        assert iters <= n + 5
+        np.testing.assert_allclose(x.numpy(), ref, rtol=0, atol=1e-4 * np.abs(ref).max())
+
+    def test_complex_grad_b(self):
+        # x = A^{-1} b is linear in b; d(sum |x|^2)/d conj(b) has the closed form
+        # A^{-H} x = A^{-1} x for Hermitian A (torch's convention: grad = 2 * that).
+        n = 8
+        A = self._hpd(n, seed=9)
+        b = np.random.default_rng(10).standard_normal(n) + 1j
+        x_ref = np.linalg.solve(A, b)
+        g_ref = 2 * np.linalg.solve(A.conj().T, x_ref)
+        bt = torch.from_numpy(b).requires_grad_()
+        x, _, _ = trnsolver.cg(torch.from_numpy(A), bt, tol=1e-13)
+        (x.abs() ** 2).sum().backward()
+        np.testing.assert_allclose(bt.grad.numpy(), g_ref, rtol=0, atol=1e-9 * np.abs(g_ref).max())
+
+
 class TestBlockJacobiPreconditioner:
     def test_reduces_iterations_vs_diagonal(self):
         # Block-tridiagonal-dominant matrix with 4×4 coupling blocks —
@@ -254,9 +328,9 @@ class TestGmresIr:
 
         _, _iters_plain, res_plain = trnsolver.gmres(A, b, tol=1e-6, maxiter=200, restart=n)
         _, _iters_ir, res_ir = trnsolver.gmres_ir(A, b, tol=1e-8)
-        assert res_ir <= res_plain + 1e-8, (
-            f"GMRES-IR residual {res_ir:.2e} should not exceed plain GMRES {res_plain:.2e}"
-        )
+        assert (
+            res_ir <= res_plain + 1e-8
+        ), f"GMRES-IR residual {res_ir:.2e} should not exceed plain GMRES {res_plain:.2e}"
 
     def test_bf16_input(self):
         """BF16 A and b: output is BF16 (dtype round-trip via _to_fp32/_restore)."""

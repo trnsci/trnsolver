@@ -160,9 +160,9 @@ def relerr(x, ref):
 
 def assert_close(x, ref, tol, what):
     x = host(x)
-    assert tuple(x.shape) == tuple(ref.shape), (
-        f"{what}: shape {tuple(x.shape)} != {tuple(ref.shape)}"
-    )
+    assert tuple(x.shape) == tuple(
+        ref.shape
+    ), f"{what}: shape {tuple(x.shape)} != {tuple(ref.shape)}"
     if x.numel():
         assert torch.isfinite(x.to(ref.dtype)).all(), f"{what}: non-finite output"
     e = relerr(x, ref)
@@ -184,9 +184,9 @@ def guarded(fn, *inputs):
         if isinstance(o, torch.Tensor) and o.numel():
             for t in tin:
                 if t.numel():
-                    assert o.untyped_storage().data_ptr() != t.untyped_storage().data_ptr(), (
-                        "output shares storage with an input"
-                    )
+                    assert (
+                        o.untyped_storage().data_ptr() != t.untyped_storage().data_ptr()
+                    ), "output shares storage with an input"
     return out
 
 
@@ -218,10 +218,6 @@ def P(id_, *values, marks=()):
 
 def _pending(issue, pr, what):
     return pytest.mark.xfail(strict=False, reason=f"trnsci/trnsolver#{issue}, fix in #{pr}: {what}")
-
-
-def _decide(what):
-    return pytest.mark.xfail(strict=True, reason=f"trnsci/trnsolver#76 needs decision: {what}")
 
 
 KNOWN: dict[str, pytest.MarkDecorator] = {}  # filled in next to each case table
@@ -266,18 +262,18 @@ def chk_qr(A, tol, dt):
         A64 = up(A)
         Q, R = host(Q).to(A64.dtype), host(R).to(A64.dtype)
         Qr, Rr = torch.linalg.qr(A64)
-        assert Q.shape == Qr.shape and R.shape == Rr.shape, (
-            f"Q{tuple(Q.shape)} R{tuple(R.shape)} (reduced)"
-        )
+        assert (
+            Q.shape == Qr.shape and R.shape == Rr.shape
+        ), f"Q{tuple(Q.shape)} R{tuple(R.shape)} (reduced)"
         assert_close(Q @ R, A64, tol, "Q @ R vs A")
         k = Q.shape[-1]
         assert_close(
             Q.mH @ Q, torch.eye(k, dtype=A64.dtype).expand(*Q.shape[:-2], k, k), tol, "Qᴴ Q vs I"
         )
         if R.numel():
-            assert not (torch.tril(R, -1).abs() > tol * max(R.abs().max().item(), 1)).any(), (
-                "R not upper triangular"
-            )
+            assert not (
+                torch.tril(R, -1).abs() > tol * max(R.abs().max().item(), 1)
+            ).any(), "R not upper triangular"
 
     return f
 
@@ -291,9 +287,9 @@ def chk_svd(A, tol, dt, full=False):
         A64 = up(A)
         U, s, Vh = host(U).to(A64.dtype), host(s).to(real_of(A64.dtype)), host(Vh).to(A64.dtype)
         Ur, sr, Vhr = torch.linalg.svd(A64, full_matrices=full)
-        assert U.shape == Ur.shape and Vh.shape == Vhr.shape, (
-            f"U{tuple(U.shape)} Vh{tuple(Vh.shape)}"
-        )
+        assert (
+            U.shape == Ur.shape and Vh.shape == Vhr.shape
+        ), f"U{tuple(U.shape)} Vh{tuple(Vh.shape)}"
         assert_close(s, sr, tol, "s vs svdvals")
         k = s.shape[-1]
         Us, Vhs = (U[..., :, :k], Vh[..., :k, :]) if full else (U, Vh)
@@ -382,9 +378,9 @@ def chk_schur(A, tol, dt):
         assert_close(Q @ T @ Q.mH, A64, tol * 10, "Q T Qᴴ vs A")
         assert_close(Q.mH @ Q, torch.eye(n, dtype=A64.dtype), tol * 10, "Qᴴ Q vs I")
         if n > 2:
-            assert not (torch.tril(T, -2).abs() > 1e-6 * T.abs().max()).any(), (
-                "T not quasi-upper-triangular"
-            )
+            assert not (
+                torch.tril(T, -2).abs() > 1e-6 * T.abs().max()
+            ).any(), "T not quasi-upper-triangular"
             # No two consecutive nonzero subdiagonals (2x2 blocks only).
             sub = (torch.diagonal(T, -1).abs() > 1e-6 * T.abs().max()).int()
             assert not (sub[1:] * sub[:-1]).any(), "T has a 3x3 diagonal block"
@@ -538,13 +534,6 @@ def _expect_raise_or(fn):
 
 # ---------------------------------------------------------------- axis 1: dtype x op
 
-for _dt in ("complex64", "complex128"):
-    KNOWN[f"eigh_jacobi-{_dt}"] = pytest.mark.xfail(
-        strict=False,
-        raises=NotImplementedError,
-        reason="trnsci/trnsolver#79 (loud): eigh(method='jacobi') rejects complex input",
-    )
-
 
 @pytest.mark.parametrize(
     "op,dt",
@@ -687,11 +676,6 @@ EDGE += [
     ("solve_spd_mat-Bnx1", "solve_spd_mat", (spd(5), rand(5, 1))),
     ("eigh-n128", "eigh", (herm(128),)),
 ]
-KNOWN["eigh_jacobi-0x0"] = pytest.mark.xfail(
-    strict=False,
-    raises=RuntimeError,
-    reason="trnsci/trnsolver#79 (loud): eigh(method='jacobi') cannot reshape a 0x0 input",
-)
 
 
 def _eigh_n129_mark():
@@ -904,9 +888,9 @@ def _check_iterative(A, b, out, tol, maxiter):
     bn = torch.linalg.norm(b64).item()
     true_res = (torch.linalg.norm(b64 - A64 @ xh) / bn).item() if bn else 0.0
     assert isinstance(iters, int) and 0 <= iters <= maxiter
-    assert abs(res - true_res) <= 1e-6 * max(true_res, 1e-10) + 1e-12, (
-        f"reported {res:.3g} != true {true_res:.3g}"
-    )
+    assert (
+        abs(res - true_res) <= 1e-6 * max(true_res, 1e-10) + 1e-12
+    ), f"reported {res:.3g} != true {true_res:.3g}"
     if res <= tol:
         x_ref = torch.linalg.solve(A64, b64)
         assert_close(xh, x_ref, max(20 * tol, 1e-12), "x vs torch.linalg.solve")
@@ -1043,9 +1027,9 @@ def test_gmres_ir(n, kw):
     assert 0 <= outer <= max_outer
     xh = host(x)
     true_res = (torch.linalg.norm(b - A @ xh) / torch.linalg.norm(b)).item()
-    assert abs(res - true_res) <= 1e-3 * max(true_res, 1e-15) + 1e-15, (
-        f"reported {res:.3g} != true {true_res:.3g}"
-    )
+    assert (
+        abs(res - true_res) <= 1e-3 * max(true_res, 1e-15) + 1e-15
+    ), f"reported {res:.3g} != true {true_res:.3g}"
     tol = kw.get("tol", 1e-10)
     if outer < max_outer:
         assert true_res <= tol * 1.01
@@ -1210,7 +1194,6 @@ GRAD = [
             )
         ),
     ),
-    ("schur-T", lambda A: ts.schur(A)[1], (spd(_n),), None),
     (
         "cg-b",
         lambda b: ts.cg(_A_s, b, tol=1e-14)[0],
@@ -1226,11 +1209,16 @@ GRAD = [
     ),
     ("gmres_ir-Ab", lambda A, b: ts.gmres_ir(A, b, tol=1e-14)[0], (_A_g, _b_r), torch.linalg.solve),
 ]
-KNOWN["schur-T"] = _decide("schur silently detaches (no gradient)")
-KNOWN["cg-A"] = _decide("cg gradient w.r.t. A is wrong")
-KNOWN["cg-A-gradgrad"] = _decide("cg gradient w.r.t. A is wrong")
-KNOWN["gmres-Ab"] = _decide("gmres backward raises (in-place op on a saved tensor)")
-KNOWN["gmres-Ab-gradgrad"] = _decide("gmres backward raises (in-place op on a saved tensor)")
+
+
+def test_schur_requires_grad_raises():
+    """schur is not differentiable: it raises rather than detach silently (#76)."""
+    A = dev(spd(_n)).requires_grad_(True)
+    with pytest.raises(RuntimeError, match="not differentiable"):
+        ts.schur(A)
+    with torch.no_grad():
+        Q, T = ts.schur(A)
+    assert_close(host(Q @ T @ Q.mT), host(A.detach()), 1e-8, "QTQ^T under no_grad")
 
 
 def _skip_grad_off_cpu():
@@ -1344,11 +1332,14 @@ for _op in OPS:
     BATCH_IDS.append(
         (f"{_op}-batch{N}", _op, (N,))
     )  # batch == n: a .T over all dims keeps the shape
-KNOWN["solve_spd_vec-batch2x3"] = pytest.mark.xfail(
-    strict=False, reason="trnsci/trnsolver#79 (loud): solve_spd rejects a batch of vectors B (*, n)"
+# Batch == n: B (n, n) also reads as one shared (n, k) right-hand side, which
+# solve_spd has always done; switching to torch's batch-of-vectors reading
+# would change those callers' results (trnsci/trnsolver#79, needs-decision).
+KNOWN[f"solve_spd_vec-batch{N}"] = pytest.mark.xfail(
+    strict=True,
+    reason="trnsci/trnsolver#79 (needs-decision): solve_spd reads B (n, n) with batch == n "
+    "as a shared (n, k) right-hand side, not a batch of vectors",
 )
-KNOWN["solve_spd_vec-batch1"] = KNOWN["solve_spd_vec-batch2x3"]
-KNOWN[f"solve_spd_vec-batch{N}"] = KNOWN["solve_spd_vec-batch2x3"]
 
 
 @pytest.mark.parametrize("op,batch", [P(i, op, b) for i, op, b in BATCH_IDS])
@@ -1388,7 +1379,6 @@ BCAST = [
         (torch.zeros(0, N, N, dtype=F64),),
     ),
 ]
-KNOWN["solve_spd-A3d-Bbatchvec"] = KNOWN["solve_spd_vec-batch2x3"]
 
 
 @pytest.mark.parametrize("f,ref,inputs", [P(c[0], *c[1:]) for c in BCAST])

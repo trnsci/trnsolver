@@ -942,3 +942,38 @@ class TestJacobiNeuron:
             [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=900
         )
         assert out.returncode == 0 and "OK" in out.stdout, out.stderr[-3000:]
+
+
+class TestJacobiComplexAndEmpty:
+    """eigh(method="jacobi") on complex Hermitian and 0x0 input (#79).
+
+    Reference: numpy.linalg.eigh (LAPACK), independent of torch.
+    """
+
+    @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+    @pytest.mark.parametrize("batch", [(), (3,)])
+    def test_complex_hermitian(self, dtype, batch):
+        n = 6
+        rng = np.random.default_rng(0)
+        X = rng.standard_normal((*batch, n, n)) + 1j * rng.standard_normal((*batch, n, n))
+        A = X + np.conj(np.swapaxes(X, -1, -2))
+        w_ref = np.linalg.eigh(A)[0]
+        At = torch.from_numpy(A).to(dtype)
+        w, V = trnsolver.eigh(At, method="jacobi")
+        tol = 1e-4 if dtype == torch.complex64 else 1e-10
+        assert V.dtype == dtype and w.dtype == dtype.to_real()
+        np.testing.assert_allclose(w.numpy(), w_ref, rtol=0, atol=tol * np.abs(w_ref).max())
+        # A V = V diag(w), and V unitary.
+        AV = At @ V
+        np.testing.assert_allclose(
+            AV.numpy(), (V * w.unsqueeze(-2).to(dtype)).numpy(), atol=tol * np.abs(w_ref).max()
+        )
+        eye = np.broadcast_to(np.eye(n), (*batch, n, n))
+        np.testing.assert_allclose((V.mH @ V).numpy(), eye, atol=tol * 10)
+
+    @pytest.mark.parametrize("batch", [(), (2,), (0,)])
+    def test_zero_size(self, batch):
+        A = torch.zeros(*batch, 0, 0, dtype=torch.float64)
+        w, V = trnsolver.eigh(A, method="jacobi")
+        assert w.shape == (*batch, 0) and V.shape == (*batch, 0, 0)
+        assert w.dtype == V.dtype == torch.float64

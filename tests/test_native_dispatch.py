@@ -34,6 +34,7 @@ EXPECTED_OPS = {
     "jacobi_sweeps",
     "jacobi_block",
     "subspace_filter",
+    "subspace_step",
 }
 
 
@@ -553,7 +554,11 @@ class TestEagerKernelTable:
         names = {k.value: v for k, v in zip(ops.keys, ops.values, strict=True)}
         bodies = self._single_kernel_bodies(tree)
         single = {k for k, v in names.items() if isinstance(v, ast.Name) and v.id in bodies}
-        assert set(self._table(tree)) == single
+        # Single-kernel ops deliberately left out of KERNELS (see the comment
+        # above KERNELS in _native.py): they keep the custom op for now.
+        not_listed = {"subspace_step"}
+        assert not_listed <= single
+        assert set(self._table(tree)) == single - not_listed
         assert set(names) - single == set()
 
 
@@ -736,3 +741,9 @@ class TestLazyRegistration:
         assert out.shape == (n, n) and out.dtype == torch.float32
         out = fake("subspace_filter")(meta(n, n), meta(n, k), meta(128, 3 * 8 + k), meta(8, 1))
         assert out.shape == (n + 6 * k + 1, k) and out.dtype == torch.float32
+        out = fake("subspace_filter")(meta(n, n), meta(n, k), meta(128, 3 * 8 + k), meta(8, 2))
+        assert out.shape == (2 * n + 6 * k + 1, k)
+        out = fake("subspace_step")(
+            meta(n, n), meta(2 * n + 6 * k + 1, k), meta(2 * k + 128, 3 * 8 + k), meta(8, 1)
+        )
+        assert out.shape == (2 * n + 6 * k + 1, k) and out.dtype == torch.float32

@@ -131,9 +131,11 @@ def test_subspace_solver_matches_eigh(dtype):
     assert sub.iterations <= base.iterations + slack
     info = sub.info["subspace"]
     assert info[0] == (0, 0)  # the cold start
-    assert all(p in (0, 2) for _, p in info)  # refreshed (0) or two passes
-    assert sum(p == 2 for _, p in info) >= len(info) // 2  # mostly on the filter
-    tol = 1e-8 if dtype == torch.float64 else 1e-4
+    # Adaptive passes (rtol / tol), and no full-eigh refresh after the cold start.
+    assert all(1 <= p <= 6 for _, p in info[1:])
+    # The last call's Ritz values, from a block refined to rtol of the
+    # call's starting residual: within the SCF's own d_tol (1e-7 in float64).
+    tol = 1e-7 if dtype == torch.float64 else 1e-4
     torch.testing.assert_close(sub.eps, base.eps[: system.nocc], rtol=0, atol=tol)
 
 
@@ -316,4 +318,278 @@ def test_make_system_basis_suffix(monkeypatch):
 
     monkeypatch.setattr(scf, "pyscf_system", fake)
     scf.make_system("pyscf:benzene@aug-cc-pvdz")
-    assert seen == {"name": "benzene", "basis": "aug-cc-pvdz", "auxbasis": "aug-cc-pvdz-jkfit"}
+    want = {"name": "benzene", "basis": "aug-cc-pvdz", "auxbasis": "aug-cc-pvdz-jkfit"}
+    assert {k: seen[k] for k in want} == want
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("devices", [None, ["cpu", "cpu"]])
+def test_host_pack_matches_device_pack(fused, devices):
+    """#87: packing P and unpacking J on the host gives the device-gather J."""
+    trntensor = pytest.importorskip("trntensor")
+    if fused and not hasattr(trntensor, "df_coulomb"):
+        pytest.skip("trntensor without df_coulomb")
+    system = scf.h2_lattice(2)
+    n = system.nao
+    g = torch.Generator().manual_seed(6)
+    C = torch.randn(n, system.nocc, generator=g, dtype=torch.float64)
+    P = 2 * C @ C.T
+    kw = dict(k_cache_bytes=0, k_block=7, fused=fused, devices=devices)
+    dev = scf.DFJK(system.B, n, host_pack=False, **kw)
+    host = scf.DFJK(system.B, n, host_pack=True, **kw)
+    assert host.host_pack and not dev.host_pack and host.tril.device.type == "cpu"
+    torch.testing.assert_close(host.j(P), dev.j(P), rtol=0, atol=0)
+    # Default: on the CPU the gathers stay where they are.
+    assert not scf.DFJK(system.B, n).host_pack
+
+
+def test_host_pack_default_threshold(monkeypatch):
+    system = scf.h2_lattice(2)
+    monkeypatch.setattr(scf, "HOST_PACK_NPAIR", 10)
+    # Still off on the CPU: there is no device gather to avoid.
+    assert not scf.DFJK(system.B, system.nao).host_pack
+    res = scf.run_scf(system, dtype=torch.float64, jk_host_pack=True)
+    base = scf.run_scf(system, dtype=torch.float64)
+    assert res.info["host_pack"] and not base.info["host_pack"]
+    assert res.energy == pytest.approx(base.energy, abs=1e-12)
+
+
+def test_noise_aware_convergence_fp32():
+    system = scf.h2_lattice(16)
+    ref = scf.run_scf(system, dtype=torch.float64)
+    assert ref.info["conv"] == "energy"  # auto: float64 keeps the energy test
+    res = scf.run_scf(system, dtype=torch.float32)
+    assert res.converged and res.info["conv"] == "density"
+    h = res.info["history"]
+    assert len(h["err_rms"]) == len(h["dp_rms"]) == len(h["dE"]) == res.iterations
+    assert h["err_rms"][-1] < 1e-5 and h["dp_rms"][-1] < 1e-5
+    assert h["dp_rms"][0] == float("inf")  # no previous density at iteration 1
+    # sigma_E: positive, and a few ulp of |E| or more.
+    assert res.info["e_noise"] > torch.finfo(torch.float32).eps * abs(res.energy)
+    assert abs(scf.energy_at_orbitals(system, res.C_occ) - ref.energy) < 1e-7
+
+
+class _JitteryEnergy(scf.System):
+    """A system whose reported energy jitters by +-3e-5 Eh every iteration,
+    standing in for fp32 rounding noise in E at large |E|."""
+
+    def __init__(self, base):
+        super().__init__(base.name, base.H, base.S, base.B, base.nocc, base.e_nuc)
+        self._e0, self._k = base.e_nuc, 0
+
+    @property
+    def e_nuc(self):
+        self._k += 1
+        return self._e0 + (3e-5 if self._k % 2 else -3e-5)
+
+    @e_nuc.setter
+    def e_nuc(self, v):
+        self._e0 = v
+
+
+def test_energy_delta_test_stalls_at_noise_floor_density_test_does_not():
+    system = _JitteryEnergy(scf.h2_lattice(16))
+    energy = scf.run_scf(system, dtype=torch.float32, conv="energy", e_rtol=0.0, max_iter=40)
+    density = scf.run_scf(system, dtype=torch.float32, conv="density", max_iter=40)
+    assert not energy.converged and energy.iterations == 40
+    assert density.converged and density.iterations < 40
+    # The density test stopped with the commutator and density change converged.
+    h = density.info["history"]
+    assert h["err_rms"][-1] < 1e-5 and h["dp_rms"][-1] < 1e-5
+
+
+def test_conv_validation():
+    with pytest.raises(ValueError, match="conv"):
+        scf.run_scf(scf.h2_lattice(1), conv="bogus")
+
+
+# ---------------------------------------------------------------------------
+# Out-of-core DF integrals (examples/df_store.py)
+# ---------------------------------------------------------------------------
+
+import df_store  # noqa: E402
+
+
+def test_store_roundtrip_and_slices(tmp_path):
+    system = scf.h2_lattice(4)
+    B = system.B
+    st = df_store.store_from_tensor(
+        B, system.nao, str(tmp_path / "s"), dtype=torch.float64, chunk_bytes=B.shape[0] * 8 * 20
+    )
+    assert st.widths[0] < st.naux and len(st.widths) > 1  # several chunks
+    assert st.shape == B.shape and st.dtype == torch.float64
+    torch.testing.assert_close(st.to_tensor(), B, rtol=0, atol=0)
+    q0, q1 = st.widths[0] - 3, st.widths[0] + 5  # across a chunk boundary
+    torch.testing.assert_close(st[:, q0:q1], B[:, q0:q1], rtol=0, atol=0)
+    with pytest.raises(IndexError):
+        st[0:3, :]
+    import pickle
+
+    assert pickle.loads(pickle.dumps(st)).naux == st.naux
+    assert df_store.store_complete(str(tmp_path / "s"))
+    assert not df_store.store_complete(str(tmp_path / "missing"))
+
+
+def test_chunk_width_is_128_multiple_under_limit():
+    npair = 1658 * 1659 // 2
+    w = df_store.chunk_width(npair, 6064, 4, df_store.DEFAULT_CHUNK_BYTES)
+    assert w % 128 == 0 and npair * w * 4 <= df_store.DEFAULT_CHUNK_BYTES < 1 << 32
+
+
+def test_h2_lattice_store_matches_in_memory(tmp_path):
+    mem = scf.h2_lattice(6)
+    disk = scf.h2_lattice(6, store=str(tmp_path / "h2"), store_dtype=torch.float64)
+    assert isinstance(disk.B, df_store.DFStore) and disk.build["outcore"]
+    torch.testing.assert_close(disk.B.to_tensor(), mem.B, rtol=0, atol=1e-15)
+    e_mem = scf.run_scf(mem, dtype=torch.float64).energy
+    e_disk = scf.run_scf(disk, dtype=torch.float64)
+    assert e_disk.converged and e_disk.energy == pytest.approx(e_mem, abs=1e-11)
+    # fp32 store: rounding of B only.
+    disk32 = scf.h2_lattice(6, store=str(tmp_path / "h2f"), store_dtype=torch.float32)
+    assert disk32.B.dtype == torch.float32
+    assert abs(scf.energy_at_orbitals(disk32, e_disk.C_occ) - e_mem) < 1e-6
+
+
+def test_make_system_outcore_threshold_and_reuse(tmp_path, monkeypatch):
+    root = str(tmp_path)
+    small = scf.make_system("h2-lattice:3", store_dir=root)
+    assert not small.build.get("outcore") and isinstance(small.B, torch.Tensor)
+    monkeypatch.setattr(scf, "OUTCORE_GB", 1e-6)
+    big = scf.make_system("h2-lattice:3", store_dir=root)
+    assert big.build["outcore"] and big.B.path.startswith(root)
+
+    def boom(*a, **k):
+        raise AssertionError("rebuilt instead of reusing the store")
+
+    monkeypatch.setattr(scf, "s_gaussian_system", boom)
+    again = scf.make_system("h2-lattice:3", store_dir=root)
+    assert isinstance(again.B, df_store.DFStore) and again.nocc == big.nocc
+    torch.testing.assert_close(again.H, big.H)
+
+
+def test_water_cluster_geometry():
+    atoms = scf._water_cluster_atoms(8)
+    assert [a for a, _ in atoms].count("O") == 8 and len(atoms) == 24
+    xyz = torch.tensor([c for _, c in atoms])
+    d = torch.cdist(xyz, xyz)
+    mol = torch.arange(24) // 3
+    inter = mol[:, None] != mol[None, :]
+    assert float(d[inter].min()) > 1.5
+    o = xyz[0::3]
+    for k in range(8):
+        oh = (xyz[3 * k + 1 : 3 * k + 3] - o[k]).norm(dim=1)
+        torch.testing.assert_close(oh, torch.full((2,), 0.9572, dtype=oh.dtype), atol=1e-6, rtol=0)
+
+
+def test_pyscf_store_matches_incore(tmp_path):
+    pytest.importorskip("pyscf")
+    from pyscf import df, lib
+
+    mol = scf.pyscf_mol("water", "cc-pvdz")
+    ref = torch.from_numpy(lib.transpose(df.incore.cholesky_eri(mol, auxbasis="cc-pvdz-jkfit")))
+    # Tiny row blocks and chunks: several of each.
+    st = df_store.build_pyscf_store(
+        mol,
+        "cc-pvdz-jkfit",
+        str(tmp_path / "w"),
+        dtype=torch.float64,
+        chunk_bytes=ref.shape[0] * 8 * 50,
+        block_bytes=3 * 8 * 116 * 40,
+    )
+    assert st.meta["build"]["row_blocks"] > 3 and len(st.widths) > 1
+    torch.testing.assert_close(st.to_tensor(), ref, rtol=0, atol=1e-12)
+
+
+def test_pyscf_system_outcore_matches_incore(tmp_path):
+    pytest.importorskip("pyscf")
+    inc = scf.pyscf_system("water", reference=True)
+    ooc = scf.pyscf_system(
+        "water", outcore=True, store=str(tmp_path / "w"), store_dtype=torch.float64
+    )
+    assert ooc.build["outcore"] and ooc.ref_energy is None  # reference off by default
+    res = scf.run_scf(ooc, dtype=torch.float64)
+    assert res.energy == pytest.approx(inc.ref_energy, abs=1e-8)
+    loaded = scf.load_store_system(str(tmp_path / "w"))
+    assert loaded.nocc == 5 and loaded.B.naux == ooc.B.naux
+
+
+# ---------------------------------------------------------------------------
+# Streamed J/K (trntensor.AuxStream)
+# ---------------------------------------------------------------------------
+
+
+def _need_aux_stream():
+    trntensor = pytest.importorskip("trntensor")
+    if not hasattr(trntensor, "AuxStream"):
+        pytest.skip("trntensor without AuxStream (trntensor#102)")
+
+
+@pytest.mark.parametrize("devices", [None, ["cpu", "cpu", "cpu"]])
+@pytest.mark.parametrize("resident", [0.0, 1e12])
+@pytest.mark.parametrize("host_pack", [False, True])
+def test_streamed_jk_matches_blocks(devices, resident, host_pack):
+    _need_aux_stream()
+    system = scf.h2_lattice(20)  # naux 320
+    n = system.nao
+    g = torch.Generator().manual_seed(7)
+    C = torch.randn(n, system.nocc, generator=g, dtype=torch.float64)
+    P = 2 * C @ C.T
+    ref = scf.DFJK(system.B, n, k_cache_bytes=0, k_block=100, fused=False)
+    # 128-column chunks: 128 + 128 + 64.
+    st = scf.DFJK(
+        system.B,
+        n,
+        stream=True,
+        devices=devices,
+        resident_bytes=resident,
+        chunk_bytes=n * (n + 1) // 2 * 8 * 128,
+        host_pack=host_pack,
+    )
+    assert st.stream is not None and st.stream.widths == [128, 128, 64]
+    J, K = st.jk(P, C)
+    torch.testing.assert_close(J, ref.j(P))
+    torch.testing.assert_close(K, ref.k(C))
+    torch.testing.assert_close(st.j(P), J)
+    torch.testing.assert_close(st.k(C), K)
+
+
+def test_streamed_scf_from_store(tmp_path):
+    _need_aux_stream()
+    mem = scf.h2_lattice(6)
+    disk = scf.h2_lattice(6, store=str(tmp_path / "h2"), store_dtype=torch.float64)
+    base = scf.run_scf(mem, dtype=torch.float64)
+    res = scf.run_scf(disk, dtype=torch.float64)  # streams by default (DFStore)
+    assert res.converged and res.energy == pytest.approx(base.energy, abs=1e-11)
+    si = res.info["stream"]
+    assert si is not None and si["resident"] == 0 and len(si["iters"]) == res.iterations
+    assert all(it["bytes"] == disk.B.nbytes for it in si["iters"])
+    # In-memory B, streamed on request: same energy, nothing streamed on the
+    # CPU when everything is resident.
+    res2 = scf.run_scf(mem, dtype=torch.float64, jk_stream=True, jk_resident_gb=1e3)
+    assert res2.energy == pytest.approx(base.energy, abs=1e-11)
+    assert res2.info["stream"]["iters"][-1]["bytes"] == 0
+    # fp32 run from the fp32 store, noise-aware convergence.
+    disk32 = scf.h2_lattice(6, store=str(tmp_path / "h2f"))
+    r32 = scf.run_scf(disk32, dtype=torch.float32)
+    assert r32.converged
+    assert abs(scf.energy_at_orbitals(disk32, r32.C_occ) - base.energy) < 1e-6
+
+
+def test_stream_off_for_in_memory_by_default():
+    system = scf.h2_lattice(2)
+    assert scf.DFJK(system.B, system.nao).stream is None
+
+
+def test_truncated_basis_converges_in_orthonormal_measure():
+    """With functions dropped by the orthogonalizer, the commutator and the
+    density change are measured in the kept orthonormal basis, where both can
+    reach zero (in the AO basis the commutator keeps a floor along the
+    dropped directions)."""
+    pytest.importorskip("pyscf")
+    system = scf.pyscf_system("alkane3", "aug-cc-pvdz", "aug-cc-pvdz-jkfit", reference=False)
+    r64 = scf.run_scf(system, dtype=torch.float64, orth="canonical", lindep=1e-3)
+    assert r64.info["rank"] < system.nao and r64.converged
+    assert r64.info["history"]["err_rms"][-1] < 1e-7
+    r32 = scf.run_scf(system, dtype=torch.float32, orth="canonical", lindep=1e-3)
+    assert r32.converged and r32.info["d_noise"] > 0
+    assert abs(scf.energy_at_orbitals(system, r32.C_occ) - r64.energy) < 1e-5

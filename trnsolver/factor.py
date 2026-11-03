@@ -521,9 +521,20 @@ def schur(
     Returns:
         Q: Orthogonal matrix (n, n) such that A = Q @ T @ Q.T.
         T: Quasi-upper triangular Schur form (n, n).
+
+    Raises:
+        RuntimeError: If ``A.requires_grad`` with grad mode on. ``schur`` is
+            not differentiable; it used to detach silently, so ``Q`` and
+            ``T`` contributed zero gradient in a larger graph (#76). Pass
+            ``A.detach()`` or call under ``torch.no_grad()`` to opt out.
     """
     if A.shape[0] != A.shape[1]:
         raise ValueError(f"schur: A must be square, got shape {tuple(A.shape)}")
+    if A.requires_grad and torch.is_grad_enabled():
+        raise RuntimeError(
+            "schur: not differentiable; A requires grad. Pass A.detach() or "
+            "call under torch.no_grad() to compute Q and T without a gradient"
+        )
     A, orig = _to_fp32(A)
     # Hessenberg reduction and the Francis iteration are scalar host code
     # (per-element reads for deflation and shifts, small reflector updates).
@@ -561,8 +572,12 @@ def solve_spd(
     Uses Cholesky factorization (faster than LU for SPD).
 
     Args:
-        A: SPD matrix (n, n).
-        B: Right-hand side (n,) or (n, k).
+        A: SPD matrix (n, n), or a batch (*, n, n).
+        B: Right-hand side (n,) or (n, k); for a batched A also (*, n, k),
+            or a batch of vectors (*, n) with ``B.shape == A.shape[:-1]``
+            (as ``torch.linalg.solve``; #79). When the last batch dim of A
+            equals n, a 2-D or higher B of that shape is read as (*, n, k),
+            as before.
         iterative_refinement: If True, perform one step of iterative
             refinement: compute the residual R = B - A @ X and apply a
             second Cholesky solve for the correction dX = chol_solve(R).
@@ -575,7 +590,12 @@ def solve_spd(
     A, orig = _to_fp32(_complex_if(A, B))
     B = B.to(A.dtype)
     L = cholesky(A)
-    squeeze = B.dim() == 1
+    n = A.shape[-1]
+    # A batch of vectors, B (*, n) with B.shape == A.shape[:-1] (#79). Only
+    # where B cannot be read as (*, n, k), so existing callers are unchanged.
+    squeeze = B.dim() == 1 or (
+        B.dim() >= 2 and B.dim() == A.dim() - 1 and B.shape == A.shape[:-1] and B.shape[-2] != n
+    )
     if squeeze:
         B = B.unsqueeze(-1)
     # A = L L^H: back substitution with L^H (``.mH``: conjugate for complex,

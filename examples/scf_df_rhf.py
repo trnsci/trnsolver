@@ -34,6 +34,15 @@ Systems:
     pyscf:<name>@<basis> the same in another basis, fitted with <basis>-jkfit
                          (e.g. pyscf:alkane40@aug-cc-pvdz, n_ao = 1658, whose
                          diffuse functions make S near-singular).
+    pyscf:water<k>       a synthetic cluster of k water molecules on a cubic
+                         lattice (3.1 Angstrom spacing, seeded orientations).
+
+Out-of-core integrals: above ``OUTCORE_GB`` of estimated build memory (or
+with ``--outcore``) ``make_system`` builds B to an on-disk store
+(``examples/df_store.py``: one (npair, nq) .npy file per aux chunk, written a
+block of AO rows at a time, no full in-memory copy) under ``--store-dir``
+(default ``$TRNSCI_DF_DIR`` or ~/.cache/trnsci/df) and reuses it on the
+next run. ``System.B`` is then a ``DFStore``.
 
 Usage:
     python examples/scf_df_rhf.py --system h2-lattice:4
@@ -49,13 +58,41 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 
 import torch
 
+try:  # examples/df_store.py, next to this file
+    import df_store
+except ImportError:  # imported as a module from elsewhere
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    import df_store
+
 STAGES = ("jk", "fock", "diis", "eigh", "density", "energy")
+
+# Above this many packed pairs, DFJK packs P and unpacks J on the host
+# (trnsolver#87). On a NeuronCore each is one gather with npair / n^2
+# indices; at n_ao = 1658 (npair 1.4e6) their compiles ran for over 40 min
+# each, while the host path is an 11 MB copy each way (a few ms, against a
+# 330 ms J/K stage).
+HOST_PACK_NPAIR = 1_000_000
+
+# Build the DF integrals to disk (df_store) when the in-memory build would
+# need more than this many GB of host memory: PySCF's in-core path holds
+# two float64 copies (133 GB at n_ao 1658, against a 124 GB host, #15).
+OUTCORE_GB = 16.0
+
+# Streamed J/K (trntensor.AuxStream): per-device bytes of integral chunks
+# kept resident. One Trn2 logical core (LNC=2) has 24 GiB of HBM; an
+# allocation probe failed at 24 GB, so leave room for the kernels' working
+# memory and the compiled graphs.
+DEVICE_RESIDENT_GB = 20.0
 
 
 # ---------------------------------------------------------------------------
@@ -65,15 +102,20 @@ STAGES = ("jk", "fock", "diis", "eigh", "density", "energy")
 
 @dataclass
 class System:
-    """One-electron matrices and packed DF integrals, float64 on the host."""
+    """One-electron matrices (float64, host) and packed DF integrals.
+
+    ``B`` is an in-memory (npair, naux) tensor or a ``df_store.DFStore``
+    (out of core, aux chunks on disk).
+    """
 
     name: str
     H: torch.Tensor  # (n, n) core Hamiltonian
     S: torch.Tensor  # (n, n) overlap
-    B: torch.Tensor  # (npair, naux) packed DF integrals, pack_tril order
+    B: torch.Tensor  # (npair, naux) packed DF integrals, pack_tril order (or a DFStore)
     nocc: int
     e_nuc: float
     ref_energy: float | None = None  # independent fp64 reference (PySCF), if any
+    build: dict = field(default_factory=dict)  # build time / memory / store path
 
     @property
     def nao(self) -> int:
@@ -150,8 +192,9 @@ def s_gaussian_system(
     aux_exps=_H_AUX_EXP,
     *,
     name: str = "s-gaussian",
-    aux_block: int = 64,
     lindep: float = 1e-10,
+    store: str | None = None,
+    store_dtype: torch.dtype = torch.float32,
 ) -> System:
     """Closed-form integrals for normalised primitive s Gaussians.
 
@@ -159,6 +202,8 @@ def s_gaussian_system(
     two-centre (P|Q) Coulomb integrals all reduce to the Boys function F0.
     The metric is inverted canonically (eigenvalues below ``lindep`` x max
     are dropped), so ``naux`` can come out below the fitting-set size.
+    With ``store`` (a directory) B is written there block by block
+    (``df_store``, in ``store_dtype``) and ``System.B`` is a ``DFStore``.
     """
     cen, a = _s_shells(centres, ao_exps)
     n = a.shape[0]
@@ -197,28 +242,33 @@ def s_gaussian_system(
     keep = w > lindep * w.max()
     Minv_half = U[:, keep] / torch.sqrt(w[keep])  # (naux_raw, naux)
 
-    # Packed three-centre integrals (mn|P), m >= n, blocked over P.
+    # Packed three-centre integrals (mn|P), m >= n, in blocks of pair rows:
+    # each block is (rows, naux_raw) @ Minv_half, so B is never needed whole.
     tri = torch.tril_indices(n, n)
     pm, pn = tri[0], tri[1]
     pp = p[pm, pn]
     pre = (nn * kab)[pm, pn]
     Pp = Pc[pm, pn]  # (npair, 3)
-    out = torch.zeros(pm.shape[0], int(keep.sum()), dtype=torch.float64)
-    for q0 in range(0, g.shape[0], aux_block):
-        gq_ = g[q0 : q0 + aux_block]
-        xq = xc[q0 : q0 + aux_block]
-        d2 = ((Pp[:, None, :] - xq[None, :, :]) ** 2).sum(-1)
-        rho = pp[:, None] * gq_[None, :] / (pp[:, None] + gq_[None, :])
+    del tri, pm, pn
+    naux = int(keep.sum())
+    npair = pp.shape[0]
+
+    def rows(p0, p1):
+        ppb, preb = pp[p0:p1, None], pre[p0:p1, None]
+        d2 = ((Pp[p0:p1, None, :] - xc[None, :, :]) ** 2).sum(-1)
+        rho = ppb * g[None, :] / (ppb + g[None, :])
         three = (
-            pre[:, None]
-            * ng[q0 : q0 + aux_block][None, :]
+            preb
+            * ng[None, :]
             * 2.0
             * math.pi**2.5
-            / (pp[:, None] * gq_[None, :] * torch.sqrt(pp[:, None] + gq_[None, :]))
+            / (ppb * g[None, :] * torch.sqrt(ppb + g[None, :]))
             * _boys0(rho * d2)
         )
-        out += three @ Minv_half[q0 : q0 + aux_block]
+        return three @ Minv_half
 
+    # ~4 float64 (rows, naux_raw) temporaries per block, about 256 MB.
+    row_block = max(1, (1 << 25) // (4 * g.shape[0]))
     zz = charges[:, None] * charges[None, :]
     rr = torch.cdist(centres, centres)
     iu = torch.triu_indices(len(charges), len(charges), 1)
@@ -226,7 +276,27 @@ def s_gaussian_system(
     nelec = int(round(float(charges.sum())))
     if nelec % 2:
         raise ValueError("closed-shell RHF needs an even electron count")
-    return System(name, H, S, out, nelec // 2, e_nuc)
+    fields = dict(name=name, H=H, S=S, nocc=nelec // 2, e_nuc=e_nuc)
+    if store is not None:
+        t0 = time.perf_counter()
+        B = df_store.build_rows_store(
+            n,
+            naux,
+            rows,
+            store,
+            dtype=store_dtype,
+            row_block=row_block,
+            system_fields=fields,
+            extra_meta={"spec": name},
+        )
+        build = dict(B.meta["build"], store=store, outcore=True)
+        build["build_s"] = time.perf_counter() - t0
+        return System(B=B, build=build, **fields)
+    out = torch.empty(npair, naux, dtype=torch.float64)
+    for p0 in range(0, npair, row_block):
+        p1 = min(npair, p0 + row_block)
+        out[p0:p1] = rows(p0, p1)
+    return System(B=out, **fields)
 
 
 def h2_lattice(n_mol: int, seed: int = 0, **kw) -> System:
@@ -267,6 +337,52 @@ _PYSCF_GEOMETRIES = {
 }
 
 
+def _water_cluster_atoms(k: int, spacing: float = 3.1, seed: int = 0):
+    """k water molecules on a cubic lattice (Angstrom), seeded random orientations.
+
+    A synthetic cluster: O at the lattice sites (``spacing`` apart), each
+    molecule rigidly rotated (O-H 0.9572, H-O-H 104.52 degrees) and redrawn
+    until no H is within 1.5 Angstrom of another molecule's atoms.
+    """
+    g = torch.Generator().manual_seed(seed)
+    side = math.ceil(k ** (1.0 / 3.0))
+    sites = [(i, j, m) for i in range(side) for j in range(side) for m in range(side)][:k]
+    half = math.radians(104.52) / 2
+    local = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [0.9572 * math.sin(half), 0.0, 0.9572 * math.cos(half)],
+            [-0.9572 * math.sin(half), 0.0, 0.9572 * math.cos(half)],
+        ],
+        dtype=torch.float64,
+    )
+    placed: list[torch.Tensor] = []
+    for site in sites:
+        o = torch.tensor(site, dtype=torch.float64) * spacing
+        for _ in range(100):
+            q, _r = torch.linalg.qr(torch.randn(3, 3, generator=g, dtype=torch.float64))
+            xyz = local @ q.T + o
+            if not placed or float(torch.cdist(xyz, torch.cat(placed)).min()) > 1.5:
+                break
+        placed.append(xyz)
+    atoms = []
+    for xyz in placed:
+        for sym, c in zip(("O", "H", "H"), xyz.tolist(), strict=True):
+            atoms.append((sym, tuple(c)))
+    return atoms
+
+
+def _molecule_atoms(name: str):
+    """Atom list (Angstrom) of a named example system."""
+    if name == "benzene":
+        return _benzene_atoms()
+    if name.startswith("alkane"):
+        return _alkane_atoms(int(name[len("alkane") :]))
+    if name.startswith("water") and name != "water":
+        return _water_cluster_atoms(int(name[len("water") :]))
+    return _PYSCF_GEOMETRIES[name]
+
+
 def _benzene_atoms():
     atoms = []
     for i in range(6):
@@ -276,53 +392,172 @@ def _benzene_atoms():
     return atoms
 
 
+def pyscf_mol(name: str, basis: str = "cc-pvdz"):
+    """The PySCF ``Mole`` of a named example system (no integrals computed)."""
+    from pyscf import gto
+
+    return gto.M(atom=_molecule_atoms(name), basis=basis, verbose=0)
+
+
+def pyscf_sizes(name: str, basis: str = "cc-pvdz", auxbasis: str | None = None) -> dict:
+    """n_ao, naux (before metric decomposition), nocc and atom count, from the basis only."""
+    from pyscf import df
+
+    mol = pyscf_mol(name, basis)
+    auxmol = df.addons.make_auxmol(mol, auxbasis or f"{basis}-jkfit")
+    return {"nao": mol.nao, "naux": auxmol.nao, "nocc": mol.nelectron // 2, "natm": mol.natm}
+
+
 def pyscf_system(
     name: str,
     basis: str = "cc-pvdz",
     auxbasis: str = "cc-pvdz-jkfit",
-    reference: bool = True,
+    reference: bool | None = None,
+    store: str | None = None,
+    store_dtype: torch.dtype = torch.float32,
+    outcore: bool | None = None,
+    outcore_gb: float | None = None,
 ) -> System:
     """Real-molecule integrals from PySCF; ``reference`` also runs PySCF's DF-RHF.
 
     For a basis other than cc-pVDZ the reference removes S's linear
     dependencies the PySCF way (``scf.addons.remove_linear_dep_``).
-    """
-    from pyscf import df, gto, lib, scf
 
-    if name == "benzene":
-        atom = _benzene_atoms()
-    elif name.startswith("alkane"):
-        atom = _alkane_atoms(int(name[len("alkane") :]))
-    else:
-        atom = _PYSCF_GEOMETRIES[name]
-    mol = gto.M(atom=atom, basis=basis, verbose=0)
+    Out of core (``outcore``; default: when PySCF's in-core build, two
+    float64 copies of B, would exceed ``outcore_gb``, default
+    :data:`OUTCORE_GB`), B is built block by block into the store directory
+    ``store`` (``df_store.build_pyscf_store``; the same B as
+    ``df.incore.cholesky_eri``) and the reference, when asked for, uses
+    PySCF's own DF build. ``reference`` defaults to in-core builds only.
+    """
+    from pyscf import df, lib, scf
+
+    t0 = time.perf_counter()
+    mol = pyscf_mol(name, basis)
+    naux_est = df.addons.make_auxmol(mol, auxbasis).nao
+    est = df_store.pyscf_incore_bytes(mol.nao, naux_est)
+    limit = 1e9 * (OUTCORE_GB if outcore_gb is None else outcore_gb)
+    if outcore is None:
+        outcore = est > limit
+    if reference is None:
+        reference = not outcore
     H = torch.from_numpy(mol.intor_symmetric("int1e_kin") + mol.intor_symmetric("int1e_nuc"))
     S = torch.from_numpy(mol.intor_symmetric("int1e_ovlp"))
-    cderi = df.incore.cholesky_eri(mol, auxbasis=auxbasis)  # (naux, npair)
+    tag = name if basis.lower() == "cc-pvdz" else f"{name}@{basis}"
+    fields = dict(
+        name=f"pyscf:{tag}", H=H, S=S, nocc=mol.nelectron // 2, e_nuc=float(mol.energy_nuc())
+    )
+    cderi = None
+    if outcore:
+        if store is None:
+            store = os.path.join(
+                df_store.default_store_root(), _store_tag(fields["name"], store_dtype)
+            )
+        B = df_store.build_pyscf_store(
+            mol,
+            auxbasis,
+            store,
+            dtype=store_dtype,
+            system_fields=fields,
+            extra_meta={"spec": fields["name"], "basis": basis},
+        )
+        build = dict(B.meta["build"], store=store, outcore=True, incore_estimate_bytes=est)
+    else:
+        cderi = df.incore.cholesky_eri(mol, auxbasis=auxbasis)  # (naux, npair)
+        B = torch.from_numpy(lib.transpose(cderi))  # (npair, naux)
+        build = {"outcore": False, "incore_estimate_bytes": est}
+    build["build_s"] = time.perf_counter() - t0
+    build["peak_rss_bytes"] = df_store.peak_rss_bytes()
     ref = None
     if reference:
         mf = scf.RHF(mol).density_fit(auxbasis=auxbasis)
-        mf.with_df._cderi = cderi
+        if cderi is not None:
+            mf.with_df._cderi = cderi
         mf.conv_tol = 1e-11
         if basis.lower() != "cc-pvdz":
             mf = scf.addons.remove_linear_dep_(mf)
         ref = float(mf.kernel())
-    B = torch.from_numpy(lib.transpose(cderi))  # (npair, naux)
-    tag = name if basis.lower() == "cc-pvdz" else f"{name}@{basis}"
-    return System(f"pyscf:{tag}", H, S, B, mol.nelectron // 2, float(mol.energy_nuc()), ref)
+    if outcore and ref is not None:
+        # Record the reference with the store so a cached load keeps it.
+        torch.save(dict(fields, ref_energy=ref), os.path.join(store, "system.pt"))
+    return System(B=B, ref_energy=ref, build=build, **fields)
 
 
-def make_system(spec: str, **kw) -> System:
+def _store_tag(name: str, dtype: torch.dtype) -> str:
+    return name.replace(":", "_").replace("@", "_") + "-" + str(dtype).replace("torch.", "")
+
+
+def load_store_system(path: str) -> System:
+    """A system from a finished store directory (``df_store``)."""
+    B = df_store.DFStore(path)
+    f = df_store.load_system_fields(path)
+    return System(B=B, build=dict(B.meta.get("build", {}), store=path, outcore=True), **f)
+
+
+def make_system(
+    spec: str,
+    *,
+    outcore: bool | None = None,
+    store_dir: str | None = None,
+    store_dtype: torch.dtype = torch.float32,
+    outcore_gb: float | None = None,
+    reuse: bool = True,
+    **kw,
+) -> System:
+    """The system ``spec`` (see the module docstring).
+
+    Out of core (``outcore=True``, or by default when the in-memory build
+    would need more than ``outcore_gb`` GB, :data:`OUTCORE_GB`), B goes to
+    ``<store_dir>/<spec>-<dtype>`` (``store_dir`` default
+    ``df_store.default_store_root()``) and a finished store there is reused
+    (``reuse``) without recomputing anything.
+    """
     kind, _, arg = spec.partition(":")
+    root = store_dir or df_store.default_store_root()
+    if outcore is not False and reuse:
+        path = os.path.join(root, _store_tag(_canonical_name(spec), store_dtype))
+        if df_store.store_complete(path, {"spec": _canonical_name(spec)}):
+            return load_store_system(path)
     if kind == "h2-lattice":
-        return h2_lattice(int(arg or 4))
+        n_mol = int(arg or 4)
+        if outcore is None:
+            # Two float64 (npair, naux) copies: the build and the System.
+            n = 8 * n_mol
+            est = 2 * df_store.df_bytes(n, 8 * 2 * n_mol, 8)
+            outcore = est > 1e9 * (OUTCORE_GB if outcore_gb is None else outcore_gb)
+        if outcore:
+            path = os.path.join(root, _store_tag(f"h2-lattice:{n_mol}", store_dtype))
+            return h2_lattice(n_mol, store=path, store_dtype=store_dtype)
+        return h2_lattice(n_mol)
     if kind == "pyscf":
         name, _, basis = (arg or "water").partition("@")
         if basis:
             kw.setdefault("basis", basis)
             kw.setdefault("auxbasis", f"{basis}-jkfit")
+        if outcore is not False:
+            kw.setdefault("outcore", outcore)
+            kw.setdefault("outcore_gb", outcore_gb)
+            kw.setdefault("store_dtype", store_dtype)
+            kw.setdefault(
+                "store", os.path.join(root, _store_tag(_canonical_name(spec), store_dtype))
+            )
+        else:
+            kw.setdefault("outcore", False)
         return pyscf_system(name, **kw)
     raise ValueError(f"unknown system {spec!r}")
+
+
+def _canonical_name(spec: str) -> str:
+    """``System.name`` of a spec: pyscf:x@cc-pvdz is pyscf:x."""
+    kind, _, arg = spec.partition(":")
+    if kind == "pyscf":
+        name, _, basis = (arg or "water").partition("@")
+        return (
+            f"pyscf:{name}" if not basis or basis.lower() == "cc-pvdz" else f"pyscf:{name}@{basis}"
+        )
+    if kind == "h2-lattice":
+        return f"h2-lattice:{int(arg or 4)}"
+    return spec
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +656,22 @@ class DFJK:
     cores run concurrently. One Python thread issues it all: at n_ao = 970
     the J/K stage went 213 -> 139 ms on 1 -> 4 logical cores with resident
     squares (Trn2, #15).
+
+    ``host_pack`` packs P (n^2 -> npair) and unpacks J (npair -> n^2) on
+    the host instead of with device gathers. The default (``None``) does so
+    off the CPU when npair exceeds :data:`HOST_PACK_NPAIR` (#87).
+
+    ``stream=True`` hands the integrals to ``trntensor.AuxStream``: aux
+    chunks under ``chunk_bytes`` (2 GiB, below the 4 GiB transposed-LHS limit
+    of aws-neuron-sdk#1457), dealt round-robin over ``devices``, resident up
+    to ``resident_bytes`` per device (default :data:`DEVICE_RESIDENT_GB` on
+    a NeuronCore, 0 on the CPU) and otherwise uploaded every iteration by a
+    loader thread, ``prefetch`` chunks ahead per device, while the device
+    works on the previous chunk. J and K come from one pass over the chunks
+    (``df_coulomb`` + ``df_exchange`` per chunk). The default (``None``)
+    streams an out-of-core ``df_store.DFStore`` B (from its chunk files,
+    memory-mapped) when trntensor has ``AuxStream``. Problem size is then
+    bounded by host memory or disk, not HBM.
     """
 
     def __init__(
@@ -434,6 +685,11 @@ class DFJK:
         devices=None,
         square: bool = False,
         fused: bool | None = None,
+        host_pack: bool | None = None,
+        stream: bool | None = None,
+        resident_bytes: float | None = None,
+        prefetch: int = 1,
+        chunk_bytes: int | None = None,
     ):
         import trntensor
 
@@ -453,9 +709,24 @@ class DFJK:
         w = torch.full((npair,), 2.0, dtype=dtype)
         r = torch.tril_indices(n, n)
         w[r[0] == r[1]] = 1.0
-        self.tril = tril.to(self.device)
-        self.pair_w = w.to(self.device)
-        self.sym = _sym_to_packed_index(n).to(self.device)
+        if host_pack is None:
+            host_pack = self.device.type != "cpu" and npair > HOST_PACK_NPAIR
+        self.host_pack = bool(host_pack)
+        # The gather indices live where the gathers run.
+        idx_dev = torch.device("cpu") if self.host_pack else self.device
+        self.tril = tril.to(idx_dev)
+        self.pair_w = w.to(idx_dev)
+        self.sym = _sym_to_packed_index(n).to(idx_dev)
+        self.stream = None
+        self.squares = None
+        self.B3 = None
+        if stream is None:
+            stream = (
+                isinstance(B, df_store.DFStore) and hasattr(trntensor, "AuxStream") and not square
+            )
+        if stream:
+            self._init_stream(B, dtype, resident_bytes, prefetch, chunk_bytes, square)
+            return
         full_bytes = n * n * naux * torch.finfo(dtype).bits // 8
         if k_block is None and self.fused:
             # No square is ever built: one block per device. Without
@@ -489,6 +760,54 @@ class DFJK:
                 self.squares.append(trntensor.unpack_tril(self.blocks[i], n))
                 self.blocks[i] = None
 
+    def _init_stream(self, B, dtype, resident_bytes, prefetch, chunk_bytes, square):
+        import trntensor
+
+        if not hasattr(trntensor, "AuxStream"):
+            raise RuntimeError("streamed J/K needs trntensor with AuxStream (trntensor#102)")
+        if square:
+            raise ValueError("stream and square are exclusive")
+        chunk_bytes = chunk_bytes or trntensor.stream.DEFAULT_CHUNK_BYTES
+        itemsize = torch.empty((), dtype=dtype).element_size()
+        npair = self.n * (self.n + 1) // 2
+        if isinstance(B, df_store.DFStore) and max(B.widths) * npair * itemsize <= chunk_bytes:
+            chunks = B.loaders()  # memory-mapped chunk files
+        else:
+            # Column views, made contiguous (and cast) as each is loaded.
+            w = trntensor.aux_chunk_width(npair, self.naux, chunk_bytes, itemsize)
+            chunks = [(lambda q0=q0, w=w: B[:, q0 : q0 + w]) for q0 in range(0, self.naux, w)]
+        if resident_bytes is None:
+            resident_bytes = 0.0 if self.device.type == "cpu" else DEVICE_RESIDENT_GB * 1e9
+        self.stream = trntensor.AuxStream(
+            chunks,
+            self.n,
+            devices=self.devices,
+            dtype=dtype,
+            resident_bytes=resident_bytes,
+            prefetch=prefetch,
+        )
+        self.fused = True
+        self.blocks = []
+        self.k_block = max(self.stream.widths)
+
+    def _stream_pw(self, P: torch.Tensor) -> torch.Tensor:
+        """Weighted packed density for the stream (on the host with ``host_pack``)."""
+        if self.host_pack:
+            return P.cpu().reshape(-1).index_select(0, self.tril) * self.pair_w
+        return P.reshape(-1).index_select(0, self.tril) * self.pair_w
+
+    def _stream_unpack(self, jp: torch.Tensor) -> torch.Tensor:
+        if self.host_pack:
+            jp = jp.cpu()
+        return jp.index_select(0, self.sym).reshape(self.n, self.n).to(self.device)
+
+    def _stream_jk(self, P, C_occ):
+        out = torch.device("cpu") if self.host_pack else self.device
+        pw = self._stream_pw(P) if P is not None else None
+        Jp, K = self.stream.jk(pw, C_occ, alpha=2.0, out_device=out)
+        J = self._stream_unpack(Jp) if Jp is not None else None
+        return J, (K.to(self.device) if K is not None else None)
+
     def _scatter(self, x: torch.Tensor) -> dict:
         """x on every device: itself on its own, through the host elsewhere."""
         if len(self.devices) == 1:
@@ -496,17 +815,34 @@ class DFJK:
         h = x.cpu()
         return {d: (x if d == x.device else h.to(d)) for d in self.devices}
 
-    def _gather(self, parts: dict) -> torch.Tensor:
-        """Sum of per-device partial results, on the primary device."""
+    def _gather(self, parts: dict, host: bool = False) -> torch.Tensor:
+        """Sum of per-device partial results, on the primary device (or the host)."""
+        dest = torch.device("cpu") if host else self.device
         if len(parts) == 1:
-            return next(iter(parts.values()))
-        host = [t.cpu() for t in parts.values()]
-        return torch.stack(host).sum(0).to(self.device)
+            return next(iter(parts.values())).to(dest)
+        vals = [t.cpu() for t in parts.values()]
+        return torch.stack(vals).sum(0).to(dest)
+
+    def _pack_p(self, P: torch.Tensor) -> dict:
+        """Weighted packed density on every device (packed on the host with ``host_pack``)."""
+        if self.host_pack:
+            p = P.cpu().reshape(-1).index_select(0, self.tril) * self.pair_w
+            return {d: p.to(d) for d in self.devices}
+        return self._scatter(P.reshape(-1).index_select(0, self.tril) * self.pair_w)
+
+    def _unpack_j(self, parts: dict) -> torch.Tensor:
+        """Symmetric J from per-device packed partials (unpacked on the host with ``host_pack``)."""
+        if self.host_pack:
+            jp = self._gather(parts, host=True)
+            return jp.index_select(0, self.sym).reshape(self.n, self.n).to(self.device)
+        return self._gather(parts).index_select(0, self.sym).reshape(self.n, self.n)
 
     def j(self, P: torch.Tensor) -> torch.Tensor:
         import trnblas
         import trntensor
 
+        if self.stream is not None:
+            return self._stream_jk(P, None)[0]
         if self.squares is not None:
             ps = self._scatter(P.reshape(-1))
             parts = {}
@@ -516,27 +852,27 @@ class DFJK:
                 jb = trnblas.gemv(1.0, Bm, d)
                 parts[B3.device] = jb if B3.device not in parts else parts[B3.device] + jb
             return self._gather(parts).reshape(self.n, self.n)
-        p = P.reshape(-1).index_select(0, self.tril) * self.pair_w
-        ps = self._scatter(p)
+        ps = self._pack_p(P)
         parts = {}
         if self.fused and hasattr(trntensor, "df_coulomb"):
             # trntensor#60: d and J each stream a block once (packed in, packed out).
             for Bb in self.blocks:
                 jb = trntensor.df_coulomb(Bb, ps[Bb.device])
                 parts[Bb.device] = jb if Bb.device not in parts else parts[Bb.device] + jb
-            return self._gather(parts).index_select(0, self.sym).reshape(self.n, self.n)
+            return self._unpack_j(parts)
         for Bb in self.blocks:
             d = trnblas.gemv(1.0, Bb, ps[Bb.device], trans=True)  # (nq,)
             jb = trnblas.gemv(1.0, Bb, d)  # (npair,)
             parts[Bb.device] = jb if Bb.device not in parts else parts[Bb.device] + jb
-        jp = self._gather(parts)
-        return jp.index_select(0, self.sym).reshape(self.n, self.n)
+        return self._unpack_j(parts)
 
     def k(self, C_occ: torch.Tensor) -> torch.Tensor:
         """K for P = 2 C_occ C_occ^T: K = 2 sum_{iQ} Y_{m,iQ} Y_{n,iQ}."""
         import trnblas
         import trntensor
 
+        if self.stream is not None:
+            return self._stream_jk(None, C_occ)[1]
         n, nocc = C_occ.shape
         cs = self._scatter(C_occ)
         parts = {}
@@ -569,6 +905,9 @@ class DFJK:
         is read once per iteration (by the half-transform GEMM) plus once by
         the J GEMV, instead of twice by J alone.
         """
+        if self.stream is not None:
+            # One pass: each streamed chunk is uploaded once for J and K.
+            return self._stream_jk(P, C_occ)
         if self.squares is None:
             return self.j(P), self.k(C_occ)
         import trnblas
@@ -770,12 +1109,20 @@ def run_scf(
     e_tol: float | None = None,
     e_rtol: float | None = None,
     d_tol: float | None = None,
+    conv: str = "auto",
+    p_tol: float | None = None,
+    e_noise_mult: float = 8.0,
+    d_noise_mult: float = 2.0,
     stage_sync: bool = True,
     k_cache_gb: float = 4.0,
     k_block: int | None = None,
     jk_devices=None,
     jk_square: bool = False,
     jk_fused: bool | None = None,
+    jk_host_pack: bool | None = None,
+    jk_stream: bool | None = None,
+    jk_resident_gb: float | None = None,
+    jk_prefetch: int = 1,
     subspace_opts: dict | None = None,
     verbose: bool = False,
 ) -> SCFResult:
@@ -797,19 +1144,49 @@ def run_scf(
     warm-started from the previous iteration's block (the first iteration
     is one full eigh; ``subspace_opts`` are passed through, and ``eps`` holds
     the nocc occupied orbital energies).
-    Convergence needs
-    |dE| < e_tol + e_rtol |E| and rms(FPS - SPF) < d_tol. The defaults
-    depend on dtype: float32 cannot resolve |dE| below a few ulp of |E|
-    (about 1e-4 Hartree at |E| = 1500), so its energy test is relative, and
-    its commutator test is 1e-5 (at 1e-4, n_ao = 970 stopped with orbitals
-    whose float64 energy was 1.2e-4 Eh high).
+    Convergence (``conv``; ``"auto"`` is ``"energy"`` in float64 and
+    ``"density"`` otherwise):
+
+    Both norms are taken in the orthonormal basis of the kept subspace
+    (X^T (FPS - SPF) X and X^T S (P_k - P_{k-1}) S X): with near-linear
+    dependencies dropped, the AO-basis commutator keeps a floor no orbital
+    update can remove.
+
+    - ``"energy"``: |dE| < e_tol + e_rtol |E| and rms(FPS - SPF) < d_tol.
+    - ``"density"`` (noise-aware): rms(FPS - SPF) < d_tol and rms(P_k -
+      P_{k-1}) < p_tol, with the energy only required to be still within
+      its own rounding noise, |dE| < max(e_tol, e_noise_mult · σ_E), where
+      σ_E = ε · ½ Σ |P| |H + F| bounds the rounding of the energy sum in
+      the working dtype (ε its machine epsilon; ``info["e_noise"]``). In
+      float32 a fixed energy delta sits at its noise floor: |E| = 1562 Eh
+      is 1.9e-4 Eh per ulp, and the sum over n² terms rounds well above
+      that, so dE alone either stops early or never stops (#15, n_ao 1658).
+      The commutator and the density change are the quantities DIIS drives
+      to zero and do not grow with the size of E. The commutator test is
+      noise-aware too: rms < max(d_tol, d_noise_mult · σ_d), σ_d = ε max|F|
+      max|X| (``info["d_noise"]``), because with near-linear dependencies
+      kept close to the threshold X amplifies F's rounding (fp32 floor
+      1.3e-4 at alkane12 / aug-cc-pVDZ, canonical 1e-6; the float64 energy
+      at those orbitals is 4e-5 Eh above the fp64 run's, the fp32
+      conditioning limit window 3 also met at n_ao 1658).
+
+    The defaults depend on dtype: float64 e_tol 1e-10, d_tol 1e-7, p_tol
+    1e-7; float32 e_tol 1e-6, e_rtol 2e-7 (``"energy"`` only), d_tol 1e-5
+    (at 1e-4, n_ao = 970 stopped with orbitals whose float64 energy was
+    1.2e-4 Eh high) and p_tol 1e-5. Per-iteration ``err_rms``, ``dp_rms``
+    and ``dE`` are in ``info["history"]``.
     ``stage_sync`` synchronises the device around every stage so the stage
     times add up; turn it off to time the loop as an application would.
     ``jk_devices`` splits the J/K build over several NeuronCores,
     ``jk_square`` keeps the unpacked integrals resident and ``jk_fused``
     picks the fused packed-integral K (:class:`DFJK`; default: on a neuron
-    device when trntensor has ``df_exchange``); everything else stays on
-    ``device``.
+    device when trntensor has ``df_exchange``) and ``jk_host_pack`` packs
+    P / unpacks J on the host (default: off the CPU above
+    :data:`HOST_PACK_NPAIR` pairs, #87); ``jk_stream`` streams the integrals
+    over aux chunks (``trntensor.AuxStream``; default: for an out-of-core
+    B) with ``jk_resident_gb`` per device kept resident (default
+    :data:`DEVICE_RESIDENT_GB` on a NeuronCore) and ``jk_prefetch`` uploads
+    in flight per device. Everything else stays on ``device``.
     """
     import trnblas
 
@@ -821,6 +1198,12 @@ def run_scf(
     e_tol = e_tol if e_tol is not None else (1e-10 if fp64 else 1e-6)
     e_rtol = e_rtol if e_rtol is not None else (0.0 if fp64 else 2e-7)
     d_tol = d_tol if d_tol is not None else (1e-7 if fp64 else 1e-5)
+    p_tol = p_tol if p_tol is not None else (1e-7 if fp64 else 1e-5)
+    if conv == "auto":
+        conv = "energy" if fp64 else "density"
+    if conv not in ("energy", "density"):
+        raise ValueError(f"conv must be 'auto', 'energy' or 'density'; got {conv!r}")
+    eps_mach = torch.finfo(dtype).eps
     n, nocc = system.nao, system.nocc
     setup = {}
 
@@ -833,6 +1216,16 @@ def run_scf(
     H = system.H.to(dtype).to(device)
     S = system.S.to(dtype).to(device)
     X = X64.to(dtype).to(device)
+    # Convergence is measured in the orthonormal basis of the kept subspace:
+    # the commutator as X^T (FPS - SPF) X, the density change as X^T S dP S X
+    # (the change of the occupied projector there). In the AO basis the
+    # commutator keeps components along S's dropped near-null directions, which
+    # no orbital update can remove (rms 4.7e-7 at a converged float64
+    # alkane12 / aug-cc-pVDZ, canonical 1e-6), and dP is amplified by X's
+    # 1 / sqrt(s_min) (fp32 noise ~4e-5 there).
+    XS = (X64.T @ system.S).to(dtype).to(device)
+    m = X.shape[1]
+    x_max = float(X64.abs().max())
     jk = DFJK(
         system.B,
         n,
@@ -843,6 +1236,10 @@ def run_scf(
         devices=jk_devices,
         square=jk_square,
         fused=jk_fused,
+        host_pack=jk_host_pack,
+        stream=jk_stream,
+        resident_bytes=None if jk_resident_gb is None else jk_resident_gb * 1e9,
+        prefetch=jk_prefetch,
     )
     sync()
     setup["upload"] = 1e3 * (time.perf_counter() - t0)
@@ -872,6 +1269,11 @@ def run_scf(
     energies: list[float] = []
     stage_ms: list[dict[str, float]] = []
     converged = False
+    history: dict[str, list[float]] = {"dE": [], "err_rms": [], "dp_rms": []}
+    stream_iters: list[dict] = []
+    e_noise = float("nan")
+    d_noise = float("nan")
+    P_prev = None
     t_loop = time.perf_counter()
     it = 0
     for it in range(1, max_iter + 1):
@@ -879,39 +1281,83 @@ def run_scf(
         tm.start("jk")
         J, K = jk.jk(P, C_occ)
         tm.stop()
+        if jk.stream is not None:
+            st = jk.stream.stats
+            stream_iters.append(
+                {"bytes": st.bytes_streamed, "wait_s": st.wait_s, "load_s": st.load_s}
+            )
 
         tm.start("fock")
         F = H + J - 0.5 * K
         tm.stop()
 
         tm.start("energy")
-        e_dev = 0.5 * (P * (H + F)).sum()
+        HF = H + F
+        e_dev = 0.5 * (P * HF).sum()
+        # Noise-aware test: the energy sum's rounding bound and the density change.
+        e_abs = 0.5 * (P.abs() * HF.abs()).sum() if conv == "density" else e_dev
+        f_max = F.abs().max()
+        if P_prev is not None:
+            dD = trnblas.gemm(1.0, trnblas.gemm(1.0, XS, P - P_prev), XS, transB=True)
+            dp2 = (dD * dD).sum()
+        else:
+            dp2 = e_dev.new_full((), -1.0)
+        del HF
         tm.stop()
 
         tm.start("diis")
         FPS = trnblas.gemm(1.0, F, trnblas.gemm(1.0, P, S))
         err = FPS - FPS.T
-        if mixer is not None:
-            row = mixer.push(F, err)
-            norm2 = row[mixer._slot]
-        else:
-            row = (err * err).sum().reshape(1)
-            norm2 = row[0]
-        # One device-to-host copy per iteration: energy, |e|^2 and the DIIS row.
-        host = torch.cat([e_dev.reshape(1), norm2.reshape(1), row]).double().cpu()
+        err_o = trnblas.gemm(1.0, X, trnblas.gemm(1.0, err, X), transA=True)
+        norm2 = (err_o * err_o).sum()
+        row = mixer.push(F, err) if mixer is not None else norm2.reshape(1)
+        # One device-to-host copy per iteration: energy, |e|^2, the energy's
+        # rounding bound, |dP|^2 and the DIIS row.
+        host = torch.cat(
+            [
+                e_dev.reshape(1),
+                norm2.reshape(1),
+                e_abs.reshape(1),
+                dp2.reshape(1),
+                f_max.reshape(1),
+                row,
+            ]
+        )
+        host = host.double().cpu()
         e = float(host[0]) + system.e_nuc
-        err_rms = math.sqrt(max(float(host[1]), 0.0) / (n * n))
+        err_rms = math.sqrt(max(float(host[1]), 0.0) / (m * m))
+        dp_rms = math.sqrt(float(host[3]) / (m * m)) if float(host[3]) >= 0 else float("inf")
         F_use = F
         if mixer is not None:
-            F_ex = mixer.extrapolate(host[2:])
+            F_ex = mixer.extrapolate(host[5:])
             F_use = F if F_ex is None else F_ex
         tm.stop()
 
         dE = abs(e - energies[-1]) if energies else float("inf")
         energies.append(e)
+        history["dE"].append(dE)
+        history["err_rms"].append(err_rms)
+        history["dp_rms"].append(dp_rms)
+        if conv == "density":
+            e_noise = eps_mach * float(host[2])
+            # Rounding floor of the orthonormal-basis commutator: F's rounding
+            # (eps |F|) carried through X (max |X| ~ 1 / sqrt(s_min)). Measured
+            # floor 1.3e-4 against this 1.1e-4 at alkane12 / aug-cc-pVDZ,
+            # canonical 1e-6, fp32; 2.2e-6 against 1.3e-5 at alkane6 / cc-pVDZ.
+            d_noise = eps_mach * float(host[4]) * x_max
+            done = (
+                err_rms < max(d_tol, d_noise_mult * d_noise)
+                and dp_rms < p_tol
+                and dE < max(e_tol, e_noise_mult * e_noise)
+            )
+        else:
+            done = dE < e_tol + e_rtol * abs(e) and err_rms < d_tol
         if verbose:
-            print(f"  it {it:3d}  E = {e:.10f}  dE = {dE:.2e}  rms(err) = {err_rms:.2e}")
-        if dE < e_tol + e_rtol * abs(e) and err_rms < d_tol:
+            print(
+                f"  it {it:3d}  E = {e:.10f}  dE = {dE:.2e}  rms(err) = {err_rms:.2e}"
+                f"  rms(dP) = {dp_rms:.2e}"
+            )
+        if done:
             converged = True
             stage_ms.append(tm.t)
             break
@@ -935,6 +1381,7 @@ def run_scf(
         tm.stop()
 
         tm.start("density")
+        P_prev = P
         P = trnblas.syrk(2.0, C_occ)
         tm.stop()
         stage_ms.append(tm.t)
@@ -957,6 +1404,19 @@ def run_scf(
         eps=eps.detach().to("cpu", torch.float64),
         info={
             "k_block": jk.k_block,
+            "host_pack": jk.host_pack,
+            "stream": None
+            if jk.stream is None
+            else {
+                "chunks": len(jk.stream.widths),
+                "width": jk.k_block,
+                "resident": jk.stream.stats.chunks_resident,
+                "iters": stream_iters,
+            },
+            "conv": conv,
+            "e_noise": e_noise,
+            "d_noise": d_noise,
+            "history": history,
             "naux": system.naux,
             "nao": n,
             "nocc": nocc,
@@ -1015,10 +1475,12 @@ def _energy_at_orbitals(system: System, C_occ: torch.Tensor) -> float:
     M = C.T @ system.S @ C
     C = C @ trnsolver.inv_sqrt_spd(0.5 * (M + M.T))
     P = 2.0 * C @ C.T
+    # An out-of-core B streams from its chunk files (float64 per chunk).
     jk = DFJK(
         system.B, system.nao, k_cache_bytes=0, k_block=min(256, system.naux), dtype=torch.float64
     )
-    F = system.H + jk.j(P) - 0.5 * jk.k(C)
+    J, K = jk.jk(P, C)
+    F = system.H + J - 0.5 * K
     return float(0.5 * (P * (system.H + F)).sum()) + system.e_nuc
 
 
@@ -1034,12 +1496,44 @@ def main():
     ap.add_argument("--lindep", type=float, default=1e-7)
     ap.add_argument("--no-diis", action="store_true")
     ap.add_argument("--max-iter", type=int, default=60)
+    ap.add_argument(
+        "--outcore",
+        default="auto",
+        choices=("auto", "on", "off"),
+        help=f"build B to an on-disk store (auto: above {OUTCORE_GB:g} GB of build memory)",
+    )
+    ap.add_argument("--store-dir", default=None, help="store root (default $TRNSCI_DF_DIR)")
+    ap.add_argument(
+        "--store-dtype", default="float32", choices=("float32", "float64"), help="store dtype"
+    )
+    ap.add_argument(
+        "--jk-stream",
+        default="auto",
+        choices=("auto", "on", "off"),
+        help="stream B over aux chunks (trntensor.AuxStream; auto: for an out-of-core B)",
+    )
+    ap.add_argument("--resident-gb", type=float, default=None, help="per-device resident chunks")
+    ap.add_argument("--jk-devices", default=None, help="comma-separated J/K devices")
+    ap.add_argument(
+        "--conv",
+        default="auto",
+        choices=("auto", "energy", "density"),
+        help="convergence test: energy delta + commutator, or the noise-aware "
+        "commutator + density change (auto: energy in float64, density otherwise)",
+    )
     args = ap.parse_args()
 
     if args.device.startswith("neuron"):
         import torch_neuronx  # noqa: F401
 
-    system = make_system(args.system)
+    system = make_system(
+        args.system,
+        outcore={"auto": None, "on": True, "off": False}[args.outcore],
+        store_dir=args.store_dir,
+        store_dtype=getattr(torch, args.store_dtype),
+    )
+    if system.build.get("outcore"):
+        print(f"# B out of core: {system.B!r}")
     print(
         f"{system.name}: n_ao={system.nao} naux={system.naux} nocc={system.nocc} "
         f"device={args.device} dtype={args.dtype} solver={args.solver}"
@@ -1053,6 +1547,10 @@ def main():
         lindep=args.lindep,
         diis=not args.no_diis,
         max_iter=args.max_iter,
+        conv=args.conv,
+        jk_stream={"auto": None, "on": True, "off": False}[args.jk_stream],
+        jk_resident_gb=args.resident_gb,
+        jk_devices=args.jk_devices.split(",") if args.jk_devices else None,
         verbose=True,
     )
     print(
@@ -1065,6 +1563,14 @@ def main():
         )
     med = res.stage_median_ms()
     print("median stage ms: " + "  ".join(f"{s}={med[s]:.2f}" for s in STAGES))
+    if res.info.get("stream"):
+        si = res.info["stream"]
+        last = si["iters"][-1] if si["iters"] else {}
+        print(
+            f"streamed J/K: {si['chunks']} chunks of {si['width']} aux, {si['resident']} resident; "
+            f"last iteration {last.get('bytes', 0) / 1e9:.2f} GB streamed, "
+            f"wait {last.get('wait_s', 0):.2f} s"
+        )
     print(
         f"loop {res.total_ms:.1f} ms; setup "
         + ", ".join(f"{k}={v:.1f}" for k, v in res.setup_ms.items())

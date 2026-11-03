@@ -21,9 +21,194 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from 0.123 to 0.032 ms (e2e 0.196 to 0.117 ms). `eigh` itself is host-bound
   and gains less: n=32 on the Householder kernels 86.7 to 76.1 ms, a 4x32x32
   Jacobi batch 6.10 to 5.95 ms. Results are bit-identical. `torch.compile`,
-  requires-grad, int64 and tensor-subclass inputs keep the custom op.
+  requires-grad, int64 and tensor-subclass inputs keep the custom op, as
+  does the folded `occupied_subspace` pass (`subspace_step`) for now.
   `TRNSOLVER_NKI_EAGER_HANDLE=0` turns this off;
   `scripts/bench_eager_handle.py` measures it.
+
+### Added
+
+- **`scripts/bench_scf_ladder.py`: a DF-RHF + DF-MP2 size ladder (#15).**
+  - **Systems.** Linear alkanes C_k H_{2k+2} and k-water clusters, both
+    synthetic geometries, in cc-pVDZ, aug-cc-pVDZ and cc-pVTZ with
+    -jkfit. k is picked for each basis to land nearest 500, 1000, 1658
+    (C40H82 / aug-cc-pVDZ), 2500 and 3500 AOs, which gives 30 systems.
+  - **`--dry-run`** computes no integrals. Per system it gives:
+    - sizes, the fp32 B, PySCF's in-core build memory and B_ia;
+    - logical cores and chips needed to hold B resident (20 GB per 24 GiB
+      core);
+    - the window plan: trn2.3xlarge resident, trn2.3xlarge streaming from
+      host RAM or NVMe, or trn2.48xlarge resident on N chips;
+    - rough per-iteration and MP2 times, scaled from the window-3
+      measurements.
+  - **Otherwise** each system up to `--max-nao` runs end to end:
+    - the out-of-core build (time, peak RSS);
+    - the fp32 SCF (noise-aware convergence; `--solver auto` picks
+      `subspace` with `refresh=None` above 1200 AOs, as window 3 found);
+    - the float64 E_HF at the SCF orbitals and DF-MP2;
+    - PySCF DF-RHF + DF-MP2 on the same jkfit basis, with a matched
+      linear-dependency threshold, up to `--ref-max-nao`.
+  - Output is a `RESULT` JSON line per system and a markdown table.
+    `--out` saves the rows.
+
+- **`examples/scf_df_mp2.py`: DF-MP2 on top of the converged DF-RHF (#15).**
+  - `canonical_orbitals` builds one Fock matrix at the SCF's occupied orbitals
+    (streamed J/K, float64 on the host by default) and diagonalises it in the
+    orthogonalizer's basis.
+  - `df_mp2` forms `B_ia^P` aux chunk by aux chunk with
+    `trntensor.AuxStream.ao_to_mo`, into host memory or a `.npy` memmap
+    (`bia_path`). The energy comes from `trntensor.mp2_energy` when `B_ia`
+    fits one device, else from `trntensor.mp2_energy_blocked` over occupied
+    blocks, with pairs dealt over `devices`.
+  - `run_mp2` chains them and returns E_HF (float64 at the SCF orbitals),
+    E_corr, E_total and stage times. `frozen` freezes the lowest occupied
+    orbitals.
+  - It uses the SCF's jkfit basis, the same one PySCF's `mp.dfmp2.DFMP2`
+    uses on a density-fitted mean field.
+  - Against PySCF: water/cc-pVDZ fp64 is within 1.1e-9 Eh of E_MP2. A fp32
+    SCF with a fp32 transform and energy is within 2.7e-7 Eh at C4H10
+    (`tests/test_scf_df_mp2.py`).
+  - A fp32 canonical Fock costs 4e-6 Eh there, which is why the float64
+    host Fock is the default (`--fock-on-device` to override).
+
+- **`examples/scf_df_rhf.py`: J/K streamed over aux chunks (#15).**
+  `DFJK(stream=True)` (and `run_scf(jk_stream=..., jk_resident_gb=...,
+  jk_prefetch=...)`) hands B to `trntensor.AuxStream` (trntensor#102).
+  - Aux chunks are under 2 GiB, below the 4 GiB transposed-LHS limit of
+    aws-neuron-sdk#1457, and dealt round-robin over `jk_devices`
+    (`neuron:0..3`).
+  - Chunks are kept resident up to `DEVICE_RESIDENT_GB` = 20 GB per
+    NeuronCore (one LNC=2 core has 24 GiB) and uploaded every iteration
+    otherwise. A loader thread works one chunk ahead per device, so the
+    upload overlaps the kernels on the previous chunk.
+  - J and K come from one pass: `df_coulomb` + `df_exchange` per chunk, with
+    each streamed chunk uploaded once.
+  - The default streams an out-of-core `DFStore` B from its memory-mapped
+    chunk files when trntensor has `AuxStream`. In-memory B keeps the
+    resident blocks as before.
+  - The float64 re-evaluation `energy_at_orbitals` streams too, so it no
+    longer needs a float64 copy of B.
+  - `info["stream"]` records the chunk count, width, resident count and the
+    bytes streamed / wait / load time per iteration.
+  - Flags: `--jk-stream`, `--resident-gb` and `--jk-devices` on the example;
+    `--jk-stream`, `--resident-gb` and `--prefetch` on `bench_scf.py`.
+  - J/K are identical to the block path on one and three devices,
+    all-streamed or all-resident, with or without host pack (CPU tests).
+    The tests skip without `AuxStream`.
+
+- **`examples/df_store.py`: out-of-core DF integrals (#15).** At n_ao 1658
+  PySCF's in-core build held two float64 copies of B (133 GB, over the 124 GB
+  host), and window 3 had to go through a 67 GB HDF5 file and a separate fp32
+  conversion.
+  - `build_pyscf_store` computes `B = (mn|P) L^{-T}` a block of AO shell rows
+    at a time (PySCF `int3c2e`, `aosym="s2ij"`, then a triangular solve with
+    the metric's Cholesky factor, or PySCF's eigen fallback) and writes each
+    block's packed rows straight into the chunk files. Peak host memory is
+    one row block (1 GiB by default) plus the metric. It is the same tensor as
+    `df.incore.cholesky_eri` (CPU test, 1e-12).
+  - The store is a directory: `meta.json`, `system.pt` (H, S, nocc, e_nuc,
+    reference) and one C-contiguous `(npair, nq)` `.npy` file per aux chunk.
+    The chunks are 128-multiples under 2 GiB, below the 4 GiB
+    transposed-LHS limit (aws-neuron-sdk#1457). Each is one sequential read,
+    and memory-mapped without a copy.
+  - `DFStore` serves `B.shape`, `B.dtype` and `B[:, q0:q1]`, so `DFJK`
+    takes it as is, plus per-chunk loaders for streaming. fp32 by default:
+    33.4 GB at n_ao 1658.
+  - The synthetic H2-lattice integrals are generated in pair-row blocks too
+    (`h2_lattice(n, store=...)`).
+- **`make_system` goes out of core by default above `OUTCORE_GB` = 16 GB of
+  estimated build memory** (`outcore=True|False|None`). Stores go under
+  `store_dir` (default `$TRNSCI_DF_DIR` or `~/.cache/trnsci/df`), and a
+  finished store is reused without recomputing anything. With an
+  out-of-core build the PySCF reference energy is off unless asked for, and
+  uses PySCF's own DF build. `--outcore`, `--store-dir` and `--store-dtype`
+  on the example; `--outcore` and `--store-dir` on `bench_scf.py`.
+- **`pyscf:water<k>`**: a synthetic cluster of k water molecules on a 3.1 Å
+  cubic lattice with seeded orientations. `pyscf_mol` / `pyscf_sizes` give
+  the molecule and its basis sizes without computing integrals.
+
+### Changed
+
+- **`examples/scf_df_rhf.py`: a noise-aware convergence test for fp32
+  (#15).** `run_scf(conv="auto"|"energy"|"density")`; `"auto"` keeps the
+  energy test in float64 and uses `"density"` otherwise.
+  - `"density"` stops when the commutator rms(FPS − SPF) < `d_tol` and the
+    density change rms(P_k − P_{k−1}) < `p_tol` (fp32 defaults 1e-5 and
+    1e-5). The energy only has to be inside its own rounding noise:
+    |dE| < max(`e_tol`, `e_noise_mult` · σ_E), with σ_E = ε · ½ Σ|P||H + F|
+    computed on the device each iteration, in the same single host copy.
+  - Why: at |E| = 1562 Eh one fp32 ulp is 1.9e-4 Eh, and the energy sum
+    rounds above that, so a fixed energy delta (the old relative 2e-7 test)
+    sat at its noise floor at n_ao 1658.
+  - On the CPU it converges as fast as or faster than the energy test, with
+    the float64 energy at the fp32 orbitals within 1.4e-8 Eh of the fp64
+    run (h2-lattice:16/32, benzene/cc-pVDZ). With ±3e-5 Eh of injected
+    energy jitter the energy test never stops and the density test does
+    (test).
+  - Both norms are taken in the orthonormal basis of the kept subspace,
+    `Xᵀ(FPS − SPF)X` and `XᵀS dP S X`. In the AO basis, with functions dropped
+    by the orthogonalizer, the commutator keeps a floor along the dropped
+    directions: 4.7e-7 at a converged float64 C12H26 / aug-cc-pVDZ
+    (canonical 1e-6), which never passed the float64 1e-7 test and ran to
+    `max_iter`. In fp32, X's 1/sqrt(s_min) amplified the AO dP noise to
+    4e-5. Now that system converges in 33 iterations in float64.
+  - The commutator threshold is noise-aware too:
+    max(`d_tol`, `d_noise_mult` · σ_d) with σ_d = ε max|F| max|X|. The fp32
+    floor there is 1.3e-4 against σ_d = 1.2e-4, and the float64 energy at
+    those orbitals is 4e-5 Eh above fp64. That is the fp32 conditioning
+    limit window 3 met at n_ao 1658.
+  - `info["history"]` holds per-iteration `dE`, `err_rms` and `dp_rms`;
+    `info["e_noise"]` the last σ_E. `--conv` on the example and
+    `bench_scf.py`.
+
+- **`examples/scf_df_rhf.py`: `DFJK` packs P and unpacks J on the host above
+  1e6 pairs (#87).** At n_ao = 1658 (npair 1.4e6) the two device gathers in
+  `DFJK.j` (`index_select` with npair and n² indices) compiled for over
+  40 min each, so window 3 patched them out in the driver. Now
+  `DFJK(host_pack=None)` (and `run_scf(jk_host_pack=...)`,
+  `bench_scf.py --host-pack auto|on|off`) does that by default off the CPU
+  when npair > `HOST_PACK_NPAIR` = 1e6: an 11 MB copy each way per iteration
+  at that size. The J values are bit-identical to the device-gather path
+  (CPU test).
+
+### Fixed
+
+- **`cg` dropped the imaginary part of complex input (#100).** Its inner
+  products were `float(u.dot(v))`: unconjugated, and cast to real, so a
+  complex Hermitian positive definite system iterated on the wrong
+  quantities and returned a wrong `x` (or ran to `maxiter`) with only a
+  UserWarning. A complex `A` with a real `b` also lost `A`'s imaginary
+  part. `cg` now uses conjugated inner products `r^H z`, `p^H A p`
+  (accumulated in complex128 / float64) and promotes a real `b` to complex
+  for a complex `A`. Real input is unchanged. Affected: every release
+  through 0.21.0.
+- **`eigh(method="jacobi")` raised on complex and 0×0 input; `solve_spd`
+  raised on a batch of vector right-hand sides (#79).** Jacobi is real-only:
+  complex Hermitian input (`NotImplementedError: "ge_cpu"`) now takes the
+  default `eigh` path, as `torch.linalg.eigh` does. An n = 0 input (any
+  batch) returns empty `w`, `V` instead of failing to reshape. `solve_spd`
+  now reads B (*, n) with `B.shape == A.shape[:-1]` as a batch of vectors,
+  following `torch.linalg.solve`, where it raised before. The one shape that
+  already worked, last batch dim of A equal to n, keeps its old (*, n, k)
+  reading. Affected: `eigh(method="jacobi")` 0.17.0 through 0.21.0;
+  `solve_spd` every release through 0.21.0.
+- **`cg` gave a wrong gradient with respect to `A`; `schur` detached
+  silently; `gmres` backward raised (#76).** `cg` read its step sizes as
+  Python floats, so autograd differentiated a fixed polynomial in `A`
+  (relative error 0.55 at n = 5, 7.2 at n = 20). `cg` and `gmres` with a
+  tensor `A` now differentiate implicitly: backward solves the adjoint
+  system `A^H λ = ∂x` with the same solver, giving `∂b = λ` and
+  `∂A = -λ x^H` (one extra solve per backward; double backward works).
+  `gmres` with a callable `A` raises `RuntimeError` when `b` or `x0`
+  requires grad. `schur` now raises `RuntimeError` when `A` requires grad
+  in grad mode, instead of returning `Q` and `T` that contributed zero
+  gradient. Affected: every release through 0.21.0.
+
+## [0.21.0] — 2026-11-02
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fixes — upgrade recommended.** Complex Hermitian and batched inputs used `.T` instead of `.mH` in `cholesky(upper)`, `solve_spd`, `inv_spd`, `inv_sqrt_spd`, `eigh_generalized`, `pinv` and `ssor` on every backend (#64); a real A with a complex B dropped its imaginary part (#66); `cg`/`gmres` returned `x0` for a zero or tiny b (#68); fp64 Householder `eigh` was wrong on device (#83); device matmuls now resolve lazy conjugates (aws-neuron-sdk#1455). New: `orthogonalizer` for near-singular overlaps (#72) and `occupied_subspace`, a Chebyshev-filtered subspace eigensolver for SCF (#78, #91).
 
 ### Fixed
 
@@ -75,6 +260,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Real B is unchanged. Affected: 0.7.0–0.20.0. `eigh_generalized(A, None,
   X=X)` (new on main, #72) likewise promotes a real A for a complex X.
 
+
+- **`TRNSOLVER_JACOBI_ONEZERO` is a kernel argument ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454)).**
+  `jacobi_sweeps_kernel` and `jacobi_block_kernel` read the `_ONEZERO`
+  module global from their body, which the persistent NKI trace cache does
+  not key on, so a process could run a trace made under the other setting.
+  The flag is now their `onezero` argument (a static `int` on the
+  `trnsolver::jacobi_sweeps` / `jacobi_block` ops; `dispatch._launch` takes
+  `static=`). Both settings compute the same result; only the Tensor
+  Engine pass count differs.
+
 ### Added
 
 - **`occupied_subspace(F, k, guess=state)`: lowest-k eigensolver for SCF
@@ -93,6 +288,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   aten `eigh`. The host Rayleigh-Ritz dominates at n = 970. In DF-RHF it
   did not beat the full `eigh` in time to convergence at any measured
   size (docs/api/eigen.md).
+- **`occupied_subspace`: a cheaper host Rayleigh-Ritz, the block update
+  folded into the next launch, and adaptive passes instead of `refresh`
+  (#85, #86).**
+  - The Rayleigh-Ritz keeps only the lowest kb pairs. A well-conditioned
+    Gram takes one Cholesky and one `eigh`: at n = 970 that is 14 ms per
+    pass, against 16 ms.
+  - Each launch after a call's first applies the previous update
+    X = [X, E] Q on chip (`subspace_step_kernel`). Q arrives in the same
+    copy as the filter scalars. `TRNSOLVER_SUBSPACE_FOLD=0` turns this
+    off.
+  - New defaults: `passes=6`, `rtol=0.05` (stop once the residual has
+    dropped 20x), `tol="auto"` (30 ulp: return a converged block
+    unchanged, so an FP32 energy test can see two equal energies) and
+    `refresh=None`.
+  - Per call (2 passes) on Trn2: 5.6 / 9.3 / 34 ms at n = 250 / 490 /
+    970, against 7.8 / 12 / 40 ms before.
+  - FP32 DF-RHF on Trn2 takes 11 / 14 / 15 / 18 iterations at n_ao =
+    114 / 250 / 490 / 970, against 11 / 14 / 16 / 17 with a full `eigh`.
+    That is 1.10x faster at 490, 3% slower at 970 and 15-21% slower at
+    250 and below.
 - **`orthogonalizer(S, method, lindep)` and `eigh_generalized(F, S, X=X)`:
   a tolerance for near-singular overlaps (#72, for #15).** `"symmetric"`
   (Loewdin S^-1/2, the default), `"canonical"` (keeps the eigenvalues of S
@@ -137,17 +352,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   365 -> 163 ms per iteration). At LNC=1, C40H82 runs in 7.7 s fused; the
   unpack path no longer fits there (12 GB per physical core). Older
   trntensor keeps the unpack path.
-
-### Fixed
-
-- **`TRNSOLVER_JACOBI_ONEZERO` is a kernel argument ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454)).**
-  `jacobi_sweeps_kernel` and `jacobi_block_kernel` read the `_ONEZERO`
-  module global from their body, which the persistent NKI trace cache does
-  not key on, so a process could run a trace made under the other setting.
-  The flag is now their `onezero` argument (a static `int` on the
-  `trnsolver::jacobi_sweeps` / `jacobi_block` ops; `dispatch._launch` takes
-  `static=`). Both settings compute the same result; only the Tensor
-  Engine pass count differs.
 
 ## [0.20.0] — 2026-10-31
 

@@ -109,7 +109,9 @@ def jacobi_block(
 @nki_op(
     "trnsolver::subspace_filter",
     mutates_args={},
-    fake_fn=lambda F, X, table, sched: F.new_empty((F.shape[0] + 6 * X.shape[1] + 1, X.shape[1])),
+    fake_fn=lambda F, X, table, sched: F.new_empty(
+        ((F.shape[0] if sched.shape[1] == 2 else 0) + F.shape[0] + 6 * X.shape[1] + 1, X.shape[1])
+    ),
 )
 def subspace_filter(
     F: torch.Tensor, X: torch.Tensor, table: torch.Tensor, sched: torch.Tensor
@@ -119,11 +121,30 @@ def subspace_filter(
     return _s.subspace_filter_kernel(F, X, table, sched)
 
 
+@nki_op(
+    "trnsolver::subspace_step",
+    mutates_args={},
+    fake_fn=lambda F, prev, qtab, sched: F.new_empty(
+        (2 * F.shape[0] + 6 * prev.shape[1] + 1, prev.shape[1])
+    ),
+)
+def subspace_step(
+    F: torch.Tensor, prev: torch.Tensor, qtab: torch.Tensor, sched: torch.Tensor
+) -> torch.Tensor:
+    from . import subspace as _s
+
+    return _s.subspace_step_kernel(F, prev, qtab, sched)
+
+
 # The kernel each single-kernel op's body calls, as (module, attribute) plus,
 # for ops whose body converts an argument (`int(onezero)`), the conversion per
 # argument position (None: passed as is). Used by the eager handle in
 # `dispatch._native_call`, which resolves the kernel at call time (the
 # attributes exist only when nki is importable) and applies the conversions.
+# `subspace_step` (the folded occupied-subspace pass, #85/#86) is a single
+# kernel call too but is not listed yet: it came in after this table was
+# validated on the device, so it keeps the custom op until its handle path
+# is (add `"subspace_step": (_s, "subspace_step_kernel")` to opt it in).
 KERNELS = {
     "matvec": (_d, "matvec_kernel"),
     "rank2_update": (_d, "rank2_update_kernel"),
@@ -145,4 +166,5 @@ OPS = {
     "jacobi_sweeps": jacobi_sweeps,
     "jacobi_block": jacobi_block,
     "subspace_filter": subspace_filter,
+    "subspace_step": subspace_step,
 }
