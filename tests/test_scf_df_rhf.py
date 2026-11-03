@@ -627,6 +627,8 @@ def test_diis_history_padded_and_exact():
         Fx = d.extrapolate(row.double())
         if Fx is not None:
             assert Fx.shape == (n, n) and torch.isfinite(Fx).all()
+
+
 def test_host_float64_stream_over_fp32_store_chunks(tmp_path):
     """A float64 host pass (the canonical Fock) over an fp32 store whose
     chunks double past chunk_bytes uses the store's chunks. The re-split
