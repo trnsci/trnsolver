@@ -28,8 +28,10 @@ import torch
 
 from .factor import _cholesky_lower, _complex_if, _mH, _restore, _to_fp32
 from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki, _use_simulator
+from .nki.dispatch import _fp64_host_guard
 
 
+@_fp64_host_guard("eigh")
 def eigh(
     A: torch.Tensor,
     tol: float = 1e-10,
@@ -88,12 +90,8 @@ def eigh(
     A, orig = _to_fp32(A)
     if _use_nki() and (_eigh_aten_cutover(A) or not _householder_fits(A)):
         w, V = _aten_eigh_on_device(A)
-    elif _use_nki():
+    elif _use_nki() and (Ak := _householder_operand(A)) is not None:
         try:
-            # The kernels compute in fp32. A float64 A reached them as is and
-            # came back as garbage (n=2: rel err ~1e17) or raised a dtype
-            # mismatch (#83): run in fp32 and return the caller's dtype.
-            Ak = A.float() if A.dtype == torch.float64 else A
             w, V = _householder_qr_eigh(Ak, tol)
             w, V = w.to(A.dtype), V.to(A.dtype)
         except Exception:
@@ -105,6 +103,7 @@ def eigh(
     return _restore(w, orig), _restore(V, orig)
 
 
+@_fp64_host_guard("eigh_generalized")
 def eigh_generalized(
     A: torch.Tensor,
     B: torch.Tensor | None,
@@ -206,6 +205,7 @@ def _eigh_generalized_orth(
     return _restore(w, orig), _restore(V, orig)
 
 
+@_fp64_host_guard("eigh_randomized")
 def eigh_randomized(
     A: torch.Tensor,
     k: int,
@@ -400,9 +400,11 @@ def _jacobi_auto(A: torch.Tensor) -> bool:
     """True iff ``method="auto"`` should run the Jacobi kernel for A.
 
     Only FP32 batches on the native ``neuron`` device whose (n, batch) lies
-    in `_jacobi_auto_region`, and only where the kernel can run.
+    in `_jacobi_auto_region`, and only where the kernel can run. float64
+    batches there follow :func:`_jacobi_kernel_dtype`: under backend
+    ``"auto"`` they take the default dispatch (aten eigh at float64).
     """
-    if A.device.type != _NATIVE_DEVICE_TYPE or A.dtype != torch.float32:
+    if A.device.type != _NATIVE_DEVICE_TYPE or A.dtype not in (torch.float32, torch.float64):
         return False
     if A.dim() < 3 or A.shape[-1] != A.shape[-2]:
         return False
@@ -411,13 +413,36 @@ def _jacobi_auto(A: torch.Tensor) -> bool:
     region = _jacobi_auto_region()
     if not any(lo <= n <= hi and batch >= b_min for lo, hi, b_min in region):
         return False
-    return _jacobi_device_ok(n, A.dtype)
+    return _jacobi_kernel_dtype(n, A.dtype) is not None
+
+
+_JACOBI_OPS = ("jacobi_sweeps", "jacobi_block")
+
+
+def _jacobi_kernel_dtype(n: int, dtype: torch.dtype) -> torch.dtype | None:
+    """The dtype the Jacobi kernel runs ``dtype`` input in, or None: torch Jacobi.
+
+    float32 where :func:`_jacobi_device_ok` holds. float64 there follows the
+    suite policy (#89): None (torch Jacobi at float64) under backend
+    ``"auto"``; float32 with one UserWarning under backend ``"nki"``;
+    NotImplementedError under ``TRNSOLVER_REQUIRE_NKI=1``. Other dtypes take
+    the torch Jacobi (unchanged).
+    """
+    if dtype == torch.float64 and _jacobi_device_ok(n, torch.float32):
+        from .nki.dispatch import _kernel_dtype
+
+        return _kernel_dtype(dtype, _JACOBI_OPS, "eigh(method='jacobi')")
+    return dtype if _jacobi_device_ok(n, dtype) else None
 
 
 def _jacobi_device_ok(n: int, dtype: torch.dtype) -> bool:
     """True iff the FP32 Jacobi NKI kernel can run: simulator, or the native path."""
-    if not (_use_nki() and HAS_NKI and 1 <= n <= 128 and dtype == torch.float32):
+    from .nki.dispatch import kernel_takes
+
+    if not (_use_nki() and HAS_NKI and 1 <= n <= 128):
         return False
+    if not kernel_takes(dtype, *_JACOBI_OPS):
+        return False  # see _jacobi_kernel_dtype for float64
     if _use_simulator():
         return True
     from .nki.dispatch import _get_dispatch_path
@@ -527,39 +552,62 @@ def _jacobi_eigh(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if X.shape[0] == 0 or n == 0:
         w = X.new_empty((0, n))
         V = X.new_empty((0, n, n))
-    elif _jacobi_device_ok(n, X.dtype):
+    elif (kdt := _jacobi_kernel_dtype(n, X.dtype)) is not None:
+        Xk = X.to(kdt)
         try:
             from .nki.jacobi import jacobi_eigh_device, jacobi_eigh_multicore
 
-            pool_cores, parts = _jacobi_pool_split(X)
-            devices = [X.device] if pool_cores else _jacobi_devices(X)
+            pool_cores, parts = _jacobi_pool_split(Xk)
+            devices = [Xk.device] if pool_cores else _jacobi_devices(Xk)
             if pool_cores:
                 from .nki.eigh_pool import jacobi_eigh_pool
 
                 try:
-                    w, V = jacobi_eigh_pool(X, pool_cores, parts)
+                    w, V = jacobi_eigh_pool(Xk, pool_cores, parts)
                 except Exception:
                     if _REQUIRE_NKI:
                         raise
-                    w, V = jacobi_eigh_device(X)
+                    w, V = jacobi_eigh_device(Xk)
             elif len(devices) > 1:
                 try:
-                    w, V = jacobi_eigh_multicore(X, devices)
+                    w, V = jacobi_eigh_multicore(Xk, devices)
                 except Exception:
                     if _REQUIRE_NKI:
                         raise
-                    w, V = jacobi_eigh_device(X)
+                    w, V = jacobi_eigh_device(Xk)
             else:
-                w, V = jacobi_eigh_device(X)
+                w, V = jacobi_eigh_device(Xk)
         except Exception:
             if _REQUIRE_NKI:
                 raise
             w, V, _ = _jacobi.jacobi_eigh_torch(X)
+        w, V = w.to(X.dtype), V.to(X.dtype)  # float64 under backend "nki"
     else:
         w, V, _ = _jacobi.jacobi_eigh_torch(X)
     w = w.reshape(*batch_shape, n)
     V = V.reshape(*batch_shape, n, n)
     return _restore(w, orig), _restore(V, orig)
+
+
+_HOUSEHOLDER_OPS = ("matvec", "rank2_update", "matmul", "apply_reflectors")
+
+
+def _householder_operand(A: torch.Tensor) -> torch.Tensor | None:
+    """A as the FP32 Householder kernels take it, or None: run torch eigh.
+
+    The kernels compute in FP32. A float64 A reached them as is and came
+    back as garbage (Trn2, n=2: rel err ~1e17) or raised a dtype mismatch
+    (#83). float64 follows the suite policy (#89): backend ``"auto"`` takes
+    torch eigh at float64; backend ``"nki"`` runs the kernels in FP32 (one
+    UserWarning) and returns float64; ``TRNSOLVER_REQUIRE_NKI=1`` raises
+    NotImplementedError. Integer and bool A take torch eigh, which raises
+    as the pytorch backend does, or raise NotImplementedError under
+    ``TRNSOLVER_REQUIRE_NKI``.
+    """
+    from .nki.dispatch import _kernel_operands
+
+    ops = _kernel_operands(A, ops=_HOUSEHOLDER_OPS, what="eigh")
+    return None if ops is None else ops[0]
 
 
 def _torch_eigh(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -663,13 +711,10 @@ def _call_matvec(A, v):
     No sync on the XLA path: the tridiagonalization driver syncs once per
     step. The result is on A's device.
     """
-    from .nki.dispatch import _launch, matvec_kernel
+    from .nki.dispatch import _launch, _simulate, matvec_kernel
 
     if _use_simulator():
-        import nki
-
-        w = nki.simulate(matvec_kernel)(A.detach().cpu().numpy(), v.detach().cpu().numpy())
-        return torch.from_numpy(w).to(A.device)
+        return _simulate(matvec_kernel, "matvec", A, v)
     return _launch(matvec_kernel, "matvec", A, v, sync=False)
 
 
@@ -679,15 +724,10 @@ def _call_rank2_update(A, u, v):
     No sync on the XLA path (see :func:`_call_matvec`). The result is on A's
     device.
     """
-    from .nki.dispatch import _launch, rank2_update_kernel
+    from .nki.dispatch import _launch, _simulate, rank2_update_kernel
 
     if _use_simulator():
-        import nki
-
-        out = nki.simulate(rank2_update_kernel)(
-            A.detach().cpu().numpy(), u.detach().cpu().numpy(), v.detach().cpu().numpy()
-        )
-        return torch.from_numpy(out).to(A.device)
+        return _simulate(rank2_update_kernel, "rank2_update", A, u, v)
     return _launch(rank2_update_kernel, "rank2_update", A, u, v, sync=False)
 
 
@@ -714,20 +754,27 @@ def _call_matmul(A, V):
     # The kernels are real; complex operands always take torch.matmul.
     if not _use_nki() or A.is_complex() or V.is_complex() or A.shape[0] > 128 or V.shape[1] > 128:
         return torch.matmul(A, V)
+    from .nki.dispatch import _kernel_operands
+
+    # FP32 only: float64 (eigh_randomized) reached the kernel as is and was
+    # garbage or a compile error on the device. It takes torch.matmul, at
+    # full precision (NotImplementedError under TRNSOLVER_REQUIRE_NKI).
+    ops = _kernel_operands(A, V, ops=("matmul",), what="eigh_randomized")
+    if ops is None:
+        return torch.matmul(A, V)
+    out_dtype = torch.promote_types(A.dtype, V.dtype)
+    A, V = ops
 
     orig_device = A.device
 
     if _use_simulator():
-        import nki
+        from .nki.dispatch import _simulate, matmul_kernel_sim
 
-        from .nki.dispatch import matmul_kernel_sim
-
-        C = nki.simulate(matmul_kernel_sim)(A.detach().cpu().numpy(), V.detach().cpu().numpy())
-        return torch.from_numpy(C).to(orig_device)
+        return _simulate(matmul_kernel_sim, "matmul", A, V).to(out_dtype)
 
     from .nki.dispatch import _launch, matmul_kernel
 
-    return _launch(matmul_kernel, "matmul", A, V, device=orig_device)
+    return _launch(matmul_kernel, "matmul", A, V, device=orig_device).to(out_dtype)
 
 
 def _call_matmul_fp32out(A: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
@@ -751,17 +798,14 @@ def _call_matmul_fp32out(A: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
 
     orig_device = A.device
 
-    if _use_simulator():
-        import nki
+    if A.is_complex() or V.is_complex():
+        return torch.matmul(A, V)
 
-        from .nki.dispatch import matmul_kernel_fp32out_sim
+    if _use_simulator():
+        from .nki.dispatch import _simulate, matmul_kernel_fp32out_sim
 
         # Upcast to FP32 for numpy: the simulator can't represent BF16 arrays.
-        C = nki.simulate(matmul_kernel_fp32out_sim)(
-            A.float().detach().cpu().numpy(),
-            V.float().detach().cpu().numpy(),
-        )
-        return torch.from_numpy(C).to(orig_device)
+        return _simulate(matmul_kernel_fp32out_sim, "matmul_fp32out", A.float(), V.float())
 
     from .nki.dispatch import _launch, matmul_kernel_fp32out
 
@@ -802,14 +846,10 @@ def _call_apply_reflectors(V_refs: torch.Tensor, Q: torch.Tensor) -> torch.Tenso
     orig_device = Q.device
 
     if _use_simulator():
-        import nki
+        from .nki.dispatch import _simulate, apply_reflectors_kernel_sim
 
-        from .nki.dispatch import apply_reflectors_kernel_sim
-
-        Q_T_out = nki.simulate(apply_reflectors_kernel_sim)(
-            V_refs.detach().cpu().numpy(), Q.detach().cpu().numpy()
-        )
-        return torch.from_numpy(Q_T_out).T.contiguous().to(orig_device)
+        Q_T_out = _simulate(apply_reflectors_kernel_sim, "apply_reflectors", V_refs, Q)
+        return Q_T_out.T.contiguous().to(orig_device)
 
     from .nki.dispatch import _launch, apply_reflectors_kernel
 

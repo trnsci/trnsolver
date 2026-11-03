@@ -421,10 +421,9 @@ def step_table(Q: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
 
 def _run(kernel, op_name: str, args, device) -> torch.Tensor:
     if _use_simulator():
-        import nki as _nki
+        from .dispatch import _simulate
 
-        res = _nki.simulate(kernel)(*(a.detach().cpu().contiguous().numpy() for a in args))
-        return torch.from_numpy(res).to(device)
+        return _simulate(kernel, op_name, *args, device=device)
     from .dispatch import _launch
 
     return _launch(kernel, op_name, *args, device=device)
