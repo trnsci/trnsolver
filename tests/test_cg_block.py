@@ -413,16 +413,18 @@ class TestProjectedApply:
         # Residual-like input: mostly along the captured subspace, where the
         # cancellation is worst.
         V = (L @ torch.randn(400, 3, dtype=torch.float64) + 1e-2 * torch.randn(n, 3)).float()
-        ref = torch.linalg.solve(dense, V.double())
 
         def err(mode):
+            # Residual ‖V − P z‖/‖V‖: weights the error along the captured
+            # directions by λ, which is what breaks CG (the norm-wise forward
+            # error hides it).
             out = trnsolver.PivotedLowRankPreconditioner(L.float(), noise, apply=mode)(V)
             assert out.dtype == torch.float32
-            return float((out.double() - ref).norm() / ref.norm())
+            return float((V.double() - dense @ out.double()).norm() / V.double().norm())
 
         e_proj, e_native = err("projected"), err("native")
-        assert e_proj < 5e-5
-        assert e_native > 5 * e_proj
+        assert e_proj < 1e-3
+        assert e_native > 100 * e_proj
 
     def test_fp32_converges_in_host64_iterations(self):
         n, noise = 1500, 1e-3
