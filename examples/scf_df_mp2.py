@@ -170,7 +170,7 @@ def df_mp2(
     if device_bytes is None:
         device_bytes = float("inf") if dev.type == "cpu" else scf.DEVICE_RESIDENT_GB * 1e9
     many = devices is not None and len(devices) > 1
-    if bia_bytes <= device_bytes and not many:
+    if bia_bytes <= device_bytes and not many and _resident_mp2_ok(dev, no, nv, system.naux):
         Bt = Bia if isinstance(Bia, torch.Tensor) else torch.from_numpy(np.asarray(Bia))
         e = trntensor.mp2_energy(Bt.to(dev), eo.to(dtype).to(dev), ev.to(dtype).to(dev))
         info["mp2_path"] = "resident"
@@ -187,6 +187,28 @@ def df_mp2(
     e_corr = float(e.double().cpu())
     info["mp2_s"] = time.perf_counter() - t0
     return e_corr, info
+
+
+def _resident_mp2_ok(dev: torch.device, nocc: int, nvir: int, naux: int) -> bool:
+    """Whether ``trntensor.mp2_energy`` on a device-resident B_ia is the better route.
+
+    On the host, it always is. On a NeuronCore it is only when trntensor's row
+    kernel fits in SBUF. Otherwise ``mp2_energy`` falls back to aten einsums
+    over T blocks, which sum into an fp32 scalar. At C40H82 / aug-cc-pVDZ
+    (nocc 161, nvir 1461) that route took 222 s on one core, against 184 s for
+    ``mp2_energy_blocked``, and came out 3.8e-6 Eh off it. At alkane43 / cc-pVTZ
+    it was 531 s against 258 s (trnsci/trnsci#115). ``mp2_energy_blocked``
+    sums its per-pair partials in float64.
+    """
+    if dev.type == "cpu":
+        return True
+    try:
+        from trntensor.nki import dispatch as d
+
+        dims = d._mp2_row_dims(nocc, nvir, naux)
+        return dims["sbuf_bytes"] <= d._MP2_ROW_SBUF_BUDGET
+    except (ImportError, AttributeError, KeyError):
+        return True
 
 
 def run_mp2(
