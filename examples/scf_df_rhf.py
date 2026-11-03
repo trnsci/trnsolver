@@ -101,13 +101,19 @@ def default_resident_bytes(
     """Default per-device resident budget for the streamed J/K.
 
     :data:`DEVICE_RESIDENT_GB` when every chunk dealt to a device fits it.
-    When some chunks stream, the budget also has to hold the chunks in flight:
-    ``prefetch`` uploads ahead plus the one being computed on. These are
-    subtracted, so resident and in-flight chunks together stay within
-    DEVICE_RESIDENT_GB. At n_ao 1658 on one core (2.1 GB chunks), 20 GB
-    resident plus two in flight ran the 24 GiB core out of memory in the
-    second iteration (NRT_RESOURCE). 16 GB ran (trnsci/trnsci#115).
-    0 on the CPU.
+    When some chunks stream, the budget also has to hold the chunks in
+    flight: ``prefetch`` uploads ahead plus the one being computed on. It
+    also needs room for one more chunk's worth of kernel working memory, the
+    ``df_exchange`` half-transform of nocc · n · w elements, which is at most
+    a chunk for nocc ≤ n/2. So ``prefetch + 2`` chunks are subtracted.
+
+    Measured on Trn2, where tensors failed at about 22.4 GB per 24 GiB core
+    (trnsci/trnsci#115):
+    - n_ao 1658, nocc 161, 2.1 GB chunks on one core: 20 GB resident died
+      with NRT_RESOURCE in iteration 2, and 16 GB ran.
+    - alkane69 / cc-pVDZ (n_ao 1666, nocc 277): 15.7 GB (7 chunks) died,
+      and 13 GB (6 chunks) converged.
+    Returns 0 on the CPU.
     """
     if device_type == "cpu":
         return 0.0
@@ -116,7 +122,7 @@ def default_resident_bytes(
     per_dev = [sum(sizes[i::ndev]) for i in range(ndev)]
     if max(per_dev) <= budget:
         return budget
-    return max(0.0, budget - (max(0, prefetch) + 1) * max(sizes))
+    return max(0.0, budget - (max(0, prefetch) + 2) * max(sizes))
 
 
 # ---------------------------------------------------------------------------

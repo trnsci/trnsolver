@@ -156,12 +156,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Streamed J/K: the default resident budget leaves room for chunks in flight (trnsci/trnsci#115).**
   If some chunks stream, the default per-device resident budget is now
-  `DEVICE_RESIDENT_GB` minus (prefetch + 1) chunks. Before, it was the full 20 GB, so
-  20 GB resident plus two 2.1 GB uploads in flight ran a 24 GiB Trn2 core out
-  of memory in the second SCF iteration at C40H82 / aug-cc-pVDZ on one core
-  (NRT_RESOURCE). With 15.8 GB resident it converges in 22 iterations at 6.7 s/it.
-  It is upload-bound at ~2.9 GB/s. Fully resident layouts (B fits the budget) are
-  unchanged.
+  `DEVICE_RESIDENT_GB` minus (prefetch + 2) chunks: the uploads in flight plus one
+  chunk of `df_exchange` working memory. Before, it was the full 20 GB, and a 24 GiB
+  Trn2 core ran out of memory (NRT_RESOURCE) in the second SCF iteration in two cases:
+  C40H82 / aug-cc-pVDZ on one core at 20 GB resident (16 GB ran), and
+  alkane69 / cc-pVDZ (nocc 277) at 15.7 GB (13 GB converged in 6 iterations).
+  Fully resident layouts (B fits the budget) are unchanged.
 
 - **`cg` dropped the imaginary part of complex input (#100).** Its inner
   products were `float(u.dot(v))`: unconjugated, and cast to real, so a

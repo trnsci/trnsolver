@@ -561,8 +561,8 @@ def test_default_resident_bytes_leaves_room_for_streamed_chunks():
     chunk = npair * 384 * 4
     budget = scf.DEVICE_RESIDENT_GB * 1e9
     one = scf.default_resident_bytes(widths, npair, 4, 1, 1, "neuron")
-    assert one == budget - 2 * chunk
-    assert scf.default_resident_bytes(widths, npair, 4, 1, 2, "neuron") == budget - 3 * chunk
+    assert one == budget - 3 * chunk
+    assert scf.default_resident_bytes(widths, npair, 4, 1, 2, "neuron") == budget - 4 * chunk
     # Over 4 cores, B (8.3 GB per core) is all resident: the full budget.
     assert scf.default_resident_bytes(widths, npair, 4, 4, 1, "neuron") == budget
     assert scf.default_resident_bytes(widths, npair, 4, 1, 1, "cpu") == 0.0
