@@ -80,6 +80,8 @@ for the architecture decision and #36 for the matmul resolution.
 
 from __future__ import annotations
 
+import dataclasses
+import functools
 import importlib.util
 import os
 import sys
@@ -279,6 +281,378 @@ def _step_sync() -> None:
     torch_xla.sync()
 
 
+# ── Kernel dtype guard ───────────────────────────────────────────────────────
+#
+# Operand dtypes each kernel takes, keyed by the op name `_launch` uses (and
+# `_native.OPS`). Every kernel computes in FP32 (or, for matmul_fp32out, BF16
+# in with FP32 accumulation). float64, integer, bool and complex operands used
+# to reach them as is and came back as garbage, non-finite, the wrong dtype or
+# a compile error (#83; trnsci/trnsci#35). `_launch` and `_simulate` enforce
+# this table on every launch, so no kernel is reached with another dtype even
+# if a wrapper forgets `_kernel_operands`.
+_F32 = (torch.float32,)
+KERNEL_DTYPES: dict[str, tuple[torch.dtype, ...]] = {
+    "matvec": _F32,
+    "rank2_update": _F32,
+    "matmul": _F32,
+    "matmul_fp32out": (torch.bfloat16,),
+    "apply_reflectors": _F32,
+    "jacobi_sweeps": _F32,
+    "jacobi_block": _F32,
+    "subspace_filter": _F32,
+    "subspace_step": _F32,
+}
+# The simulator takes numpy arrays, and BF16 has no numpy dtype: the
+# matmul_fp32out simulator variant gets FP32.
+SIM_KERNEL_DTYPES: dict[str, tuple[torch.dtype, ...]] = {
+    **KERNEL_DTYPES,
+    "matmul_fp32out": _F32,
+}
+
+
+def _dtype_names(dtypes) -> str:
+    return "/".join(str(d).removeprefix("torch.") for d in dtypes)
+
+
+def _check_kernel_dtypes(op_name: str, tensors, table=None) -> None:
+    """Raise TypeError unless every tensor operand has a dtype `op_name` takes."""
+    table = KERNEL_DTYPES if table is None else table
+    allowed = table.get(op_name)
+    if allowed is None:
+        raise TypeError(f"trnsolver::{op_name}: no entry in the kernel dtype table")
+    got = [t.dtype for t in tensors if isinstance(t, torch.Tensor)]
+    if any(d not in allowed for d in got):
+        raise TypeError(
+            f"trnsolver::{op_name} takes {_dtype_names(allowed)} operands, got "
+            f"{_dtype_names(got)}. This is a trnsolver bug: the caller must cast "
+            "or route to torch first."
+        )
+
+
+def kernel_takes(dtype: torch.dtype, *ops: str) -> bool:
+    """True iff every kernel in ``ops`` takes ``dtype`` operands."""
+    return all(dtype in KERNEL_DTYPES[op] for op in ops)
+
+
+# Ops already warned about float64 running at fp32 under backend "nki".
+_WARNED_FP32: set[str] = set()
+
+
+def _no_kernel_for_dtype(what: str, dtypes, ops: tuple[str, ...]) -> NotImplementedError:
+    """The ``TRNSOLVER_REQUIRE_NKI=1`` error for operands no kernel takes (trnblas#69)."""
+    dts = _dtype_names(sorted({str(d) for d in dtypes}))
+    allowed = _dtype_names(KERNEL_DTYPES[ops[0]])
+    return NotImplementedError(
+        f"trnsolver {what}: the NKI kernels take {allowed}, got {dts}. "
+        "Unset TRNSOLVER_REQUIRE_NKI to compute in torch."
+    )
+
+
+def _warn_fp32_once(what: str) -> None:
+    """One UserWarning per op: float64 computed by the FP32 kernels."""
+    if what in _WARNED_FP32:
+        return
+    _WARNED_FP32.add(what)
+    warnings.warn(
+        f"trnsolver {what}: backend 'nki' runs float64 input through the FP32 NKI "
+        "kernels; precision is reduced to fp32 (the result is float64). Use "
+        "backend 'auto' or 'pytorch' for float64 accuracy.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
+def _kernel_dtype(dtype: torch.dtype, ops: tuple[str, ...], what: str) -> torch.dtype | None:
+    """The dtype to hand the kernels ``ops`` for a ``dtype`` operand, or None: torch.
+
+    Call it only where an FP32 operand would run the kernels. The float64
+    policy (trnsolver#89, trnsci/trnsci#35):
+
+    - ``TRNSOLVER_REQUIRE_NKI=1``: NotImplementedError (takes precedence);
+    - backend ``"nki"``: float32, with one UserWarning per op (fp32 precision);
+    - backend ``"auto"``: None, so the caller computes in torch at float64.
+
+    float16 / bfloat16 go to float32 (lossless). Integer, bool and complex
+    give None (torch, which returns or raises what the pytorch backend does),
+    or NotImplementedError under ``TRNSOLVER_REQUIRE_NKI=1``.
+    """
+    if kernel_takes(dtype, *ops):
+        return dtype
+    fp32_ok = kernel_takes(torch.float32, *ops)
+    if fp32_ok and dtype in (torch.float16, torch.bfloat16):
+        return torch.float32
+    if _REQUIRE_NKI:
+        raise _no_kernel_for_dtype(what, (dtype,), ops)
+    if fp32_ok and dtype == torch.float64 and _backend == "nki":
+        _warn_fp32_once(what)
+        return torch.float32
+    return None
+
+
+def _kernel_operands(
+    *tensors: torch.Tensor, ops: tuple[str, ...], what: str
+) -> list[torch.Tensor] | None:
+    """The operands to hand the kernels ``ops``, or None: compute in torch.
+
+    Each operand follows :func:`_kernel_dtype`; None if any operand goes to
+    torch. Under ``TRNSOLVER_REQUIRE_NKI=1`` an operand no kernel takes
+    raises NotImplementedError naming all the operand dtypes.
+
+    The caller casts the kernel result to the pytorch backend's dtype.
+    """
+    if _REQUIRE_NKI and not all(
+        kernel_takes(t.dtype, *ops)
+        or (kernel_takes(torch.float32, *ops) and t.dtype in (torch.float16, torch.bfloat16))
+        for t in tensors
+    ):
+        raise _no_kernel_for_dtype(what, [t.dtype for t in tensors], ops)
+    out = []
+    for t in tensors:
+        dt = _kernel_dtype(t.dtype, ops, what)
+        if dt is None:
+            return None
+        out.append(t if dt == t.dtype else t.to(dt))
+    return out
+
+
+# ── float64 on the neuron device: computed on the host ───────────────────────
+#
+# Under backend "auto" float64 computes in torch. For a tensor already on the
+# ``neuron`` device, torch is device aten, and device aten computes float64
+# at fp32 precision (measured on Trn2), so "auto gives float64 accuracy"
+# would not hold for device-resident data. Every public op is therefore
+# wrapped in `_fp64_host_guard`: a float64 / complex128 operand on the neuron
+# device is copied to the host, the op runs there (the host torch route) and
+# the result comes back on the original device, still float64. One
+# UserWarning per op says so. ``TRNSOLVER_FP64_ON_DEVICE=1`` keeps device
+# aten (fp32 precision) for callers who prefer speed. Host-resident float64
+# is unchanged. Backends "nki" (fp32 cast) and "pytorch" are unchanged too.
+# ``TRNSOLVER_REQUIRE_NKI=1`` (backends "auto" and "nki") raises
+# NotImplementedError for float64 / complex128 on the neuron device at every
+# public op, with no host copy and ahead of ``TRNSOLVER_FP64_ON_DEVICE``
+# (`_refuse_device_fp64`): no kernel computes them at float64 accuracy, and
+# the routes without a kernel (solve_spd, inv_spd, pinv, cg, ...) would run
+# device aten at fp32 precision with no error.
+_FP64_ON_DEVICE = os.environ.get("TRNSOLVER_FP64_ON_DEVICE", "").lower() in ("1", "true", "yes")
+_FP64_HOST_DTYPES = (torch.float64, torch.complex128)
+_HOST = torch.device("cpu")
+_fp64_host_warned: set[str] = set()
+_fp64_host_active = threading.local()
+
+
+def _on_neuron_device(t) -> bool:
+    """True iff ``t`` is a tensor on the ``neuron`` device."""
+    return isinstance(t, torch.Tensor) and t.device.type == _NEURON_DEVICE
+
+
+def _walk(obj, fn):
+    """``obj`` with ``fn`` applied to every tensor in tuples, named tuples,
+    lists, dicts and dataclasses (a dataclass's ``_HOST_FIELDS`` are left as
+    they are)."""
+    if isinstance(obj, torch.Tensor):
+        return fn(obj)
+    if isinstance(obj, tuple):
+        items = [_walk(o, fn) for o in obj]
+        return type(obj)(*items) if hasattr(obj, "_fields") else tuple(items)
+    if isinstance(obj, list):
+        return [_walk(o, fn) for o in obj]
+    if isinstance(obj, dict):
+        return {k: _walk(v, fn) for k, v in obj.items()}
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        keep = getattr(obj, "_HOST_FIELDS", ())
+        return dataclasses.replace(
+            obj,
+            **{
+                f.name: _walk(getattr(obj, f.name), fn)
+                for f in dataclasses.fields(obj)
+                if f.init and f.name not in keep
+            },
+        )
+    return obj
+
+
+def _tensors(obj) -> list[torch.Tensor]:
+    found: list[torch.Tensor] = []
+    _walk(obj, lambda t: found.append(t) or t)
+    return found
+
+
+def _fp64_to_host(t: torch.Tensor) -> torch.Tensor:
+    """A neuron-resident operand copied to the host (differentiable)."""
+    return t.to(_HOST) if _on_neuron_device(t) else t
+
+
+def _fp64_to_device(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """A host result moved back to the operands' device (differentiable)."""
+    return t.to(device) if t.device == _HOST else t
+
+
+def _warn_fp64_host_once(what: str) -> None:
+    """One UserWarning per op: device-resident float64 computed on the host."""
+    if what in _fp64_host_warned:
+        return
+    _fp64_host_warned.add(what)
+    warnings.warn(
+        f"trnsolver {what}: float64 on the neuron device is computed on the host for "
+        "float64 accuracy (device arithmetic is fp32); pass float32 to stay on device, "
+        "or set TRNSOLVER_FP64_ON_DEVICE=1 to keep device aten at fp32 precision.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
+def _refuse_device_fp64(what: str, args, kwargs) -> None:
+    """Under ``TRNSOLVER_REQUIRE_NKI=1`` (NKI backends), NotImplementedError for
+    a float64 / complex128 operand on the neuron device (see above)."""
+    if not _REQUIRE_NKI or not _use_nki():
+        return
+    if torch.compiler.is_compiling() or getattr(_fp64_host_active, "on", False):
+        return
+    dts = sorted(
+        {
+            str(t.dtype)
+            for t in _tensors((args, kwargs))
+            if t.dtype in _FP64_HOST_DTYPES and _on_neuron_device(t)
+        }
+    )
+    if dts:
+        raise NotImplementedError(
+            f"trnsolver {what}: no NKI kernel computes {_dtype_names(dts)} on the neuron "
+            "device at float64 accuracy (device arithmetic is fp32). Unset "
+            "TRNSOLVER_REQUIRE_NKI to compute on the host at float64 accuracy, or pass "
+            "float32."
+        )
+
+
+def _fp64_host_device(args, kwargs) -> torch.device | None:
+    """The neuron device to return the result to if this call computes on the
+    host (backend "auto", a float64 / complex128 operand on the neuron device,
+    no REQUIRE_NKI / FP64_ON_DEVICE, not already inside the host path)."""
+    if _backend != "auto" or _REQUIRE_NKI or _FP64_ON_DEVICE:
+        return None
+    if torch.compiler.is_compiling():  # traced graphs keep their devices
+        return None
+    if getattr(_fp64_host_active, "on", False):  # a nested public op
+        return None
+    dev = [t for t in _tensors((args, kwargs)) if _on_neuron_device(t)]
+    if not any(t.dtype in _FP64_HOST_DTYPES for t in dev):
+        return None
+    return dev[0].device
+
+
+def _host_callable(f, device: torch.device):
+    """``f`` (a matvec or preconditioner written for device tensors) called
+    from the host path: it gets device tensors and hands host tensors back."""
+
+    def g(*a):
+        out = f(*(_walk(x, lambda t: t.to(device)) for x in a))
+        return _walk(out, lambda t: t.to(_HOST))
+
+    return g
+
+
+def _fp64_host_guard(what: str):
+    """Decorator for every public op: device-resident float64 computes on the host.
+
+    See the section comment above. The result (tensors in tuples, named
+    tuples and dataclasses) comes back on the operands' neuron device with
+    the dtype the op returns on the host.
+    """
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            _refuse_device_fp64(what, args, kwargs)
+            device = _fp64_host_device(args, kwargs)
+            if device is None:
+                return fn(*args, **kwargs)
+            _warn_fp64_host_once(what)
+
+            def to_host(a):
+                if callable(a) and not isinstance(a, (torch.Tensor, type)):
+                    return _host_callable(a, device)
+                return _walk(a, _fp64_to_host)
+
+            h_args = [to_host(a) for a in args]
+            h_kwargs = {k: to_host(v) for k, v in kwargs.items()}
+            _fp64_host_active.on = True
+            try:
+                out = fn(*h_args, **h_kwargs)
+            finally:
+                _fp64_host_active.on = False
+            return _walk(out, lambda t: _fp64_to_device(t, device))
+
+        return wrapper
+
+    return deco
+
+
+def _fp64_host_preconditioner(what: str):
+    """Decorator for a preconditioner constructor (it returns a closure).
+
+    Under the same condition as `_fp64_host_guard`, the constructor runs on
+    host copies of the neuron-resident operands, and the closure it returns
+    computes on the host for every input: a neuron-resident ``r`` is copied to
+    the host and the result goes back to ``r``'s device. Device aten would
+    compute the closure's float64 arithmetic at fp32 precision. Inside `cg` /
+    `gmres` the closure receives device tensors (`_host_callable`) and
+    behaves the same way.
+    """
+
+    def deco(build):
+        @functools.wraps(build)
+        def wrapper(*args, **kwargs):
+            _refuse_device_fp64(what, args, kwargs)
+            if _fp64_host_device(args, kwargs) is None:
+                return build(*args, **kwargs)
+            _warn_fp64_host_once(what)
+            h_args = [_walk(a, _fp64_to_host) for a in args]
+            h_kwargs = {k: _walk(v, _fp64_to_host) for k, v in kwargs.items()}
+            prev = getattr(_fp64_host_active, "on", False)
+            _fp64_host_active.on = True
+            try:
+                apply = build(*h_args, **h_kwargs)
+            finally:
+                _fp64_host_active.on = prev
+
+            def on_host(r):
+                device = r.device if _on_neuron_device(r) else None
+                prev = getattr(_fp64_host_active, "on", False)
+                _fp64_host_active.on = True
+                try:
+                    z = apply(_fp64_to_host(r))
+                finally:
+                    _fp64_host_active.on = prev
+                return z if device is None else _fp64_to_device(z, device)
+
+            return on_host
+
+        return wrapper
+
+    return deco
+
+
+def _simulate(
+    kernel,
+    op_name: str,
+    *tensors: torch.Tensor,
+    device: torch.device | None = None,
+    static: tuple = (),
+) -> torch.Tensor:
+    """Run one kernel under ``nki.simulate`` on host numpy copies.
+
+    The simulator twin of `_launch`: the same dtype table is enforced
+    (`SIM_KERNEL_DTYPES`). The result is returned on ``device`` (default: the
+    first input's device).
+    """
+    _check_kernel_dtypes(op_name, tensors, SIM_KERNEL_DTYPES)
+    out_device = tensors[0].device if device is None else device
+    import nki as _nki
+
+    res = _nki.simulate(kernel)(*(t.detach().cpu().contiguous().numpy() for t in tensors), *static)
+    return torch.from_numpy(res).to(out_device)
+
+
 # ── Eager call handles (native path) ─────────────────────────────────────────
 #
 # Same fix as trnblas#92. A `trnsolver::` custom-op call costs ~0.10 ms of host
@@ -396,7 +770,11 @@ def _launch(
     ``nki_op`` arguments on the native path). A value that specialises a
     kernel must arrive this way, not through a global or closure, so the NKI
     trace cache keys on it (aws-neuron/aws-neuron-sdk#1454).
+
+    Every tensor operand must have a dtype in ``KERNEL_DTYPES[op_name]``
+    (TypeError otherwise), on both paths.
     """
+    _check_kernel_dtypes(op_name, tensors)
     out_device = tensors[0].device if device is None else device
     if _get_dispatch_path() == "native":
         # Launch on the output's NeuronCore when it is one (``neuron:k``, so

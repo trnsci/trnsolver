@@ -217,6 +217,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **float64 policy for the NKI kernels (#89, trnsci/trnsci#35; the same rule
+  across the trnsci suite).** Every trnsolver kernel computes in FP32, and
+  Trainium computes float64 at FP32 precision on device. Where an FP32
+  input would run the kernels (`eigh` on the Householder path,
+  `eigh_generalized` through it, `eigh_randomized`, `eigh(method="jacobi")`,
+  the auto Jacobi region, `occupied_subspace`):
+  - **backend `auto`: float64 under `auto` now computes in torch at float64
+    accuracy (previously cast to fp32 on the NKI path).** `eigh` and
+    `eigh_generalized` take `torch.linalg.eigh`, the Jacobi entries the torch
+    Jacobi, the auto Jacobi region the default aten dispatch,
+    `occupied_subspace` its torch filter, `eigh_randomized` `torch.matmul`.
+    Affected: `eigh` / `eigh_generalized` float64 on the Householder path ran
+    the FP32 kernels in 0.21.0 (#84; before that, 0.4.0 through 0.20.0, it
+    gave garbage); this lands in 0.22.0.
+  - **backend `nki`: float64 runs the FP32 kernels and returns float64, with
+    one `UserWarning` per op** (the first call of each op) saying that
+    precision is reduced to fp32. This now also applies to the Jacobi
+    kernels and `occupied_subspace` (through 0.21.0 they took torch for
+    float64) and to `eigh_randomized` (a compile error on Trn2 through
+    0.21.0).
+  - **`TRNSOLVER_REQUIRE_NKI=1`: float64 raises `NotImplementedError` on every
+    kernel path**, under either backend, as trnblas does (trnblas#69). This
+    takes precedence over the `nki` cast. **Callers of
+    `eigh(method="jacobi")`, the auto Jacobi region and `occupied_subspace`
+    with float64 input under `TRNSOLVER_REQUIRE_NKI=1` now get
+    `NotImplementedError`** where through 0.21.0 they got a float64 torch
+    result; `eigh` / `eigh_generalized` float64 under it raise where 0.21.0
+    ran the FP32 kernels.
+  - **Result dtype:** always what the pytorch backend returns for the same
+    inputs, for float32, float64, bfloat16, float16 and mixed-dtype operands
+    (e.g. `eigh_generalized` with a float64 B), including after the FP32
+    kernels.
+  - **float64 on the `neuron` device is computed on the host under `auto`.**
+    Device aten computes float64 at fp32 precision (measured on Trn2), so
+    "torch at float64 accuracy" did not hold for device-resident input.
+    Every public op now copies a float64 / complex128 operand on the
+    `neuron` device to the host, computes there and returns the result on
+    the original device in float64 / complex128, with one `UserWarning` per
+    op ("float64 on the neuron device is computed on the host for float64
+    accuracy (device arithmetic is fp32); pass float32 to stay on device").
+    **`TRNSOLVER_FP64_ON_DEVICE=1` keeps device aten (fp32 precision)** for
+    callers who prefer speed. Host-resident float64 and backends `nki` /
+    `pytorch` are unchanged. **Under `TRNSOLVER_REQUIRE_NKI=1` a float64 /
+    complex128 operand on the `neuron` device now raises
+    `NotImplementedError` at every public op** (backends `auto` and `nki`,
+    no host copy, ahead of `TRNSOLVER_FP64_ON_DEVICE=1`). Before, the routes
+    with no kernel (`solve_spd`, `inv_spd`, `pinv`, `cg`, `gmres`, ...) ran
+    device aten at fp32 precision with no error. One decorator
+    (`nki.dispatch._fp64_host_guard`) holds the rule; the preconditioner
+    constructors (`jacobi_` / `block_jacobi_` / `ssor_preconditioner`), which
+    return closures, use `_fp64_host_preconditioner`: the closure computes on
+    the host and returns `z` on `r`'s device. The block CG routes (#97)
+    follow the same rule: `cg_block` is guarded; `pivoted_cholesky` builds
+    in float64 on the host for every input (#117, one row or batched with
+    `rows_fn` / `sub_fn`), so a device-resident float64 diagonal needs no
+    extra host route and L returns to its device; and
+    `PivotedLowRankPreconditioner`'s `apply="auto"` and `apply="projected"`
+    (#117, an on-device apply) pick `"host64"` for a float64 L on the device
+    (one `UserWarning`). `cg_block_ir` already refines in float64 on the host.
+  The library has no complex kernels; complex input keeps its aten / torch
+  routes (#65). Paths where an FP32 input would not run a kernel either (the
+  aten cutover, the XLA lineage for Jacobi) are unchanged.
+
 - **`examples/scf_df_rhf.py`: a noise-aware convergence test for fp32
   (#15).** `run_scf(conv="auto"|"energy"|"density")`; `"auto"` keeps the
   energy test in float64 and uses `"density"` otherwise.
@@ -260,6 +323,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (CPU test).
 
 ### Fixed
+
+- **float64, integer and bool operands reached the FP32 NKI kernels (#83,
+  trnsci/trnsci#35).** One dtype table (`KERNEL_DTYPES` in
+  `trnsolver/nki/dispatch.py`) now lists what each kernel takes, and
+  `_launch` (native and XLA) and the new `_simulate` (simulator) raise
+  `TypeError` for anything else, so no kernel is reached with another dtype.
+  The wrappers route first with one guard (`_kernel_dtype` /
+  `_kernel_operands`), which applies the float64 policy above. Integer and
+  bool input takes torch (which raises, as the pytorch backend does), or
+  raises `NotImplementedError` under `TRNSOLVER_REQUIRE_NKI=1`. float16 and
+  bfloat16 are cast to FP32 (lossless) and restored. Affected: every release
+  with the kernels.
 
 - **`cg` dropped the imaginary part of complex input (#100).** Its inner
   products were `float(u.dot(v))`: unconjugated, and cast to real, so a

@@ -34,6 +34,12 @@ from collections.abc import Callable
 import torch
 
 from .factor import _restore, _to_fp32
+from .nki.dispatch import (
+    _fp64_host_device,
+    _fp64_host_guard,
+    _refuse_device_fp64,
+    _warn_fp64_host_once,
+)
 
 _HOST = torch.device("cpu")
 
@@ -56,6 +62,7 @@ def _col_norm(X: torch.Tensor) -> torch.Tensor:
     return torch.linalg.vector_norm(X, dim=0)
 
 
+@_fp64_host_guard("cg_block")
 @torch.compiler.disable
 def cg_block(
     A: torch.Tensor | Callable,
@@ -373,6 +380,11 @@ def pivoted_cholesky(
     if not 0 < relax <= 1:
         raise ValueError(f"pivoted_cholesky: relax must be in (0, 1], got {relax}")
     d_in = diag_fn()
+    # float64 policy: the build runs in float64 on the host for every input
+    # (#117), so a float64 diagonal on the neuron device needs no host route
+    # here; `_fp64_host_guard` cannot see the tensors behind the callables, so
+    # TRNSOLVER_REQUIRE_NKI is applied here (NotImplementedError).
+    _refuse_device_fp64("pivoted_cholesky", (d_in,), {})
     out_dtype, out_device = d_in.dtype, d_in.device
     d = d_in.detach().to(device=_HOST, dtype=torch.float64).clone()
     n = d.shape[0]
@@ -510,6 +522,9 @@ class PivotedLowRankPreconditioner:
       perturbs the preconditioner only to second order. No host round
       trip; the (k,) diagonal stays on the device too.
     - ``"auto"`` (default): ``"native"`` for float64 L, else ``"host64"``.
+      A float64 L on the neuron device takes ``"host64"`` under backend
+      ``"auto"`` (device aten computes float64 at fp32 precision; one
+      UserWarning), unless ``TRNSOLVER_FP64_ON_DEVICE=1``.
 
     Attributes:
         L: (n, k) low-rank factor.
@@ -530,8 +545,22 @@ class PivotedLowRankPreconditioner:
             raise ValueError(
                 f"apply must be 'auto', 'host64', 'native' or 'projected', got {apply!r}"
             )
+        _refuse_device_fp64("PivotedLowRankPreconditioner", (L,), {})
+        orig_apply = apply
         if apply == "auto":
             apply = "native" if L.dtype == torch.float64 else "host64"
+        if (
+            apply in ("native", "projected")
+            and L.dtype == torch.float64
+            and (orig_apply == "auto" or apply == "projected")
+            and _fp64_host_device((L,), {}) is not None
+        ):
+            # float64 policy: device aten computes a float64 L at fp32
+            # precision, so under backend "auto" a device-resident float64 L
+            # applies on the host instead ("auto" and "projected"; an explicit
+            # "native" is the caller's fp32-precision choice).
+            _warn_fp64_host_once("PivotedLowRankPreconditioner")
+            apply = "host64"
         self.apply = apply
         self.L = L
         self.shift = shift
