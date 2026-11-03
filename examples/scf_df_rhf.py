@@ -832,6 +832,15 @@ class DFJK:
         self.blocks = []
         self.k_block = max(self.stream.widths)
 
+    def close(self) -> None:
+        """Release the device copies of the integrals (resident chunks or
+        blocks) and the stream's loader threads. The object is unusable after."""
+        if self.stream is not None:
+            self.stream.close()
+        self.blocks = []
+        self.squares = None
+        self.B3 = None
+
     def _stream_pw(self, P: torch.Tensor) -> torch.Tensor:
         """Weighted packed density for the stream (on the host with ``host_pack``)."""
         if self.host_pack:
@@ -980,10 +989,20 @@ class DIIS:
     host in float64.
     """
 
+    # History rows are padded to a multiple of this many elements (zeros, which
+    # change no dot product). On Trn2 the (space, n²) @ (n²,) GEMV at n = 1640
+    # (n² = 2,689,600) did not finish compiling in 21 min (walrus
+    # remat_optimization). Padded to 2,703,360 it compiled in 40 s
+    # (trnsci/trnsci#115).
+    PAD = 16384
+
     def __init__(self, n: int, space: int, dtype: torch.dtype, device: torch.device):
         self.space = space
-        self.F = torch.zeros(space, n * n, dtype=dtype, device=device)
-        self.e = torch.zeros(space, n * n, dtype=dtype, device=device)
+        self.n = n
+        self.length = -(-n * n // self.PAD) * self.PAD
+        self.F = torch.zeros(space, self.length, dtype=dtype, device=device)
+        self.e = torch.zeros(space, self.length, dtype=dtype, device=device)
+        self._epad = torch.zeros(self.length, dtype=dtype, device=device)
         self.order: list[int] = []  # buffer slots, oldest first
         self.Bm = torch.zeros(space, space, dtype=torch.float64)
 
@@ -991,10 +1010,12 @@ class DIIS:
         """Store (F, e); return the device row <e_k, e> over the slots (slot order)."""
         slot = self.order.pop(0) if len(self.order) == self.space else len(self.order)
         self.order.append(slot)
-        self.F[slot].copy_(F.reshape(-1))
-        self.e[slot].copy_(e.reshape(-1))
+        nn = self.n * self.n
+        self.F[slot, :nn].copy_(F.reshape(-1))
+        self.e[slot, :nn].copy_(e.reshape(-1))
+        self._epad[:nn].copy_(e.reshape(-1))
         self._slot = slot
-        return torch.mv(self.e, e.reshape(-1))
+        return torch.mv(self.e, self._epad)
 
     def extrapolate(self, row: torch.Tensor) -> torch.Tensor | None:
         """Given the host copy of :meth:`push`'s row, the DIIS Fock (None: use F)."""
@@ -1016,8 +1037,8 @@ class DIIS:
         coef = torch.zeros(self.space, dtype=torch.float64)
         coef[idx] = c
         coef = coef.to(self.F.dtype).to(self.F.device)
-        n = int(round(self.F.shape[1] ** 0.5))
-        return torch.mv(self.F.T, coef).reshape(n, n)
+        n = self.n
+        return torch.mv(self.F.T, coef)[: n * n].reshape(n, n)
 
 
 def _purify_steps(D: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1137,6 +1158,36 @@ def purify_occupied(
     return Z, steps
 
 
+def _pyscf_name_basis(system: System) -> tuple[str, str]:
+    kind, _, arg = system.name.partition(":")
+    if kind != "pyscf":
+        raise ValueError(f"the minao guess needs a pyscf: system; got {system.name!r}")
+    name, _, basis = arg.partition("@")
+    return name, basis or "cc-pvdz"
+
+
+def minao_density(system: System, key: str = "minao") -> torch.Tensor:
+    """PySCF's ``key`` initial-guess density (default ``"minao"``, superposed
+    atomic densities) for a ``pyscf:`` system: an (n, n) float64 AO matrix.
+    Host only, no integrals beyond PySCF's own atomic guess."""
+    from pyscf import scf as pscf
+
+    name, basis = _pyscf_name_basis(system)
+    mol = pyscf_mol(name, basis)
+    if mol.nao != system.nao:
+        raise ValueError(f"{system.name}: PySCF has {mol.nao} AOs, the system {system.nao}")
+    return torch.from_numpy(pscf.RHF(mol).get_init_guess(key=key))
+
+
+def guess_orbitals(D: torch.Tensor, S: torch.Tensor, X: torch.Tensor, nocc: int) -> torch.Tensor:
+    """(n, nocc) occupied orbitals closest to the density ``D``: the leading
+    natural orbitals in the orthonormal kept basis X (eigenvectors of
+    X^T S D S X), so dropped near-linear dependencies stay dropped."""
+    A = X.T @ S @ D @ S @ X
+    _, U = torch.linalg.eigh(0.5 * (A + A.T))
+    return (X @ U[:, -nocc:].flip(1)).contiguous()
+
+
 def run_scf(
     system: System,
     *,
@@ -1166,6 +1217,7 @@ def run_scf(
     jk_resident_gb: float | None = None,
     jk_prefetch: int = 1,
     subspace_opts: dict | None = None,
+    guess="core",
     verbose: bool = False,
 ) -> SCFResult:
     """Run DF-RHF to convergence; every tensor op runs on ``device`` in ``dtype``.
@@ -1217,6 +1269,15 @@ def run_scf(
     (at 1e-4, n_ao = 970 stopped with orbitals whose float64 energy was
     1.2e-4 Eh high) and p_tol 1e-5. Per-iteration ``err_rms``, ``dp_rms``
     and ``dE`` are in ``info["history"]``.
+    ``guess`` is ``"core"`` (the core Hamiltonian's orbitals, the default),
+    ``"minao"`` (PySCF's superposition-of-atomic-densities guess for
+    ``pyscf:`` systems, :func:`minao_density`, as natural orbitals in the
+    kept basis, :func:`guess_orbitals`) or an ``(n, nocc)`` tensor of
+    occupied orbitals (S-orthonormalised here; e.g. a previous run's
+    ``C_occ`` to restart). From the core guess, fp32 DIIS did not converge
+    for alkane69 / cc-pVDZ (n_ao 1666) in 40 iterations, with the energy
+    wandering between -1900 and +9500 Eh. From ``"minao"`` it converged in 6
+    (trnsci/trnsci#115).
     ``stage_sync`` synchronises the device around every stage so the stage
     times add up; turn it off to time the loop as an application would.
     ``jk_devices`` splits the J/K build over several NeuronCores,
@@ -1291,10 +1352,24 @@ def run_scf(
             return trnsolver.eigh_generalized(F, S)
         return trnsolver.eigh_generalized(F, None, X=X)
 
-    # Core guess.
+    # Initial guess: the core Hamiltonian's orbitals, or given occupied orbitals.
     t0 = time.perf_counter()
-    eps, C = solve(H)
-    C_occ = C[:, :nocc].contiguous()
+    if isinstance(guess, str) and guess == "minao":
+        guess = guess_orbitals(minao_density(system), system.S, X64, nocc)
+    if isinstance(guess, str):
+        if guess != "core":
+            raise ValueError(f"guess must be 'core', 'minao' or an (n, nocc) tensor; got {guess!r}")
+        eps, C = solve(H)
+        C_occ = C[:, :nocc].contiguous()
+    else:
+        Cg = torch.as_tensor(guess, dtype=torch.float64).cpu()
+        if Cg.shape != (n, nocc):
+            raise ValueError(f"guess orbitals must be ({n}, {nocc}); got {tuple(Cg.shape)}")
+        # S-orthonormalise in float64 (Loewdin), so P = 2 C C^T is idempotent.
+        M = Cg.T @ system.S @ Cg
+        Cg = Cg @ trnsolver.inv_sqrt_spd(0.5 * (M + M.T))
+        C_occ = Cg.to(dtype).to(device).contiguous()
+        eps = torch.zeros(nocc, dtype=dtype, device=device)
     P = trnblas.syrk(2.0, C_occ)
     Q_occ = None
     if solver == "purify":
@@ -1432,6 +1507,25 @@ def run_scf(
     if solver == "purify":
         # Orbital energies of the final Fock matrix: one eigh after the loop.
         eps, _ = solve(F_use)
+    jk_info = {
+        "k_block": jk.k_block,
+        "host_pack": jk.host_pack,
+        "stream": None
+        if jk.stream is None
+        else {
+            "chunks": len(jk.stream.widths),
+            "width": jk.k_block,
+            "resident": jk.stream.stats.chunks_resident,
+            "iters": stream_iters,
+        },
+    }
+    # Free the device copies of the integrals now. Left to the garbage
+    # collector, they were still held when a second run_scf on the same system
+    # uploaded its own. That is the ladder's warm-up then timed run, and at
+    # n_ao 2522 / cc-pVTZ over 4 cores (19.2 GB per core) the second upload hit
+    # NRT_RESOURCE (trnsci/trnsci#115).
+    jk.close()
+    del jk
 
     return SCFResult(
         energy=energies[-1],
@@ -1445,16 +1539,7 @@ def run_scf(
         C_occ=C_occ.detach().to("cpu", torch.float64),
         eps=eps.detach().to("cpu", torch.float64),
         info={
-            "k_block": jk.k_block,
-            "host_pack": jk.host_pack,
-            "stream": None
-            if jk.stream is None
-            else {
-                "chunks": len(jk.stream.widths),
-                "width": jk.k_block,
-                "resident": jk.stream.stats.chunks_resident,
-                "iters": stream_iters,
-            },
+            **jk_info,
             "conv": conv,
             "e_noise": e_noise,
             "d_noise": d_noise,
@@ -1538,6 +1623,7 @@ def main():
     ap.add_argument("--lindep", type=float, default=1e-7)
     ap.add_argument("--no-diis", action="store_true")
     ap.add_argument("--max-iter", type=int, default=60)
+    ap.add_argument("--guess", default="core", choices=("core", "minao"))
     ap.add_argument(
         "--outcore",
         default="auto",
@@ -1582,6 +1668,7 @@ def main():
     )
     res = run_scf(
         system,
+        guess=args.guess,
         device=args.device,
         dtype=getattr(torch, args.dtype),
         solver=args.solver,

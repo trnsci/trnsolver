@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`run_scf(guess=...)`: a minao initial guess, or given occupied orbitals (trnsci/trnsci#115).**
+  - `"core"` is the default and keeps the old behaviour.
+  - `"minao"` takes PySCF's superposed atomic densities (`minao_density`) as natural orbitals in the kept orthonormal basis (`guess_orbitals`).
+  - An `(n, nocc)` tensor is S-orthonormalised and used directly, for example to restart.
+  - Why: from the core guess, fp32 DIIS did not converge for alkane69 / cc-pVDZ (n_ao 1666) in 40 iterations, on either `subspace` or `orth`, with the energy wandering between -1900 and +9500 Eh. J and K matched the CPU to 5e-6 relative. From minao it converged in 6 iterations.
+  - `bench_scf_ladder.py` now defaults to `--guess minao`. `scf_df_rhf.py` and `scf_df_mp2.py` take `--guess`.
 - **`pivoted_cholesky(..., block=, sub_fn=, relax=)`: block row requests
   for the pivoted-Cholesky build (#114).**
   - A round takes the `block` largest remaining diagonals as candidates and
@@ -217,6 +223,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`bench_scf_ladder.py --dry-run` uses the window-4 Trn2 measurements (trnsci/trnsci#115).**
+  - The build is scaled by npair · naux² (the triangular solve), from 1215 s on 2 pinned host threads at n_ao 1658. Before, it was npair · naux from the Mac's 12 threads, about 10× low on the box.
+  - A streamed layout keeps the per-core budget less three chunks of headroom resident, about 60 GB per chip, not 80. That matches #109's `default_resident_bytes`.
+  - DF-MP2 is costed at the measured 5.8e13 multiply-adds/s per chip.
+  - At water61 / aug-cc-pVDZ the planner now gives 54 GB/it streamed (measured 49.7 under the earlier two-chunk rule), 4.9 s/it (measured ≈ 6), MP2 71 s (measured 69) and a 6290 s build (10051 s measured, sharing the CPUs).
+
 - **float64 policy for the NKI kernels (#89, trnsci/trnsci#35; the same rule
   across the trnsci suite).** Every trnsolver kernel computes in FP32, and
   Trainium computes float64 at FP32 precision on device. Where an FP32
@@ -324,6 +336,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`run_scf` releases its device integrals before it returns (trnsci/trnsci#115).**
+  The DFJK's resident chunks (or blocks) were left for the garbage collector.
+  A second `run_scf` on the same system, such as the ladder's `--warmup-iters` run
+  followed by the timed run, then uploaded a second copy of B while the first was
+  still held. At alkane43 / cc-pVTZ over 4 cores (19.2 GB per core), the second
+  upload failed with NRT_RESOURCE. The new `DFJK.close()` is called at the end of
+  `run_scf` and after the canonical Fock build in `scf_df_mp2.py`.
+- **DIIS history padded to a multiple of 16384 elements (trnsci/trnsci#115).** On Trn2 the
+  `(space, n²) @ (n²,)` GEMV for the DIIS row did not finish compiling in 21 min at n = 1640
+  (water40 / aug-cc-pVDZ; walrus `remat_optimization`). Two exclusive slots and two
+  single-core runs timed out inside it. Padded with zeros to 2,703,360 elements, it
+  compiles in 40 s. Dot products and the extrapolated Fock are unchanged.
+- **`df_mp2` on a NeuronCore takes the blocked energy unless trntensor's row kernel fits (trnsci/trnsci#115).**
+  Before, a B_ia under 20 GB always went to `trntensor.mp2_energy`. When the row kernel
+  doesn't fit SBUF, that call runs aten einsums summed into an fp32 scalar. At C40H82 /
+  aug-cc-pVDZ on one core it took 222 s, against 184 s for `mp2_energy_blocked`,
+  and landed 3.8e-6 Eh off it. At alkane43 / cc-pVTZ it took 531 s against 258 s, 5.2e-6 Eh
+  off. The blocked route sums per-pair partials in float64.
 - **Streamed J/K: the default resident budget leaves room for chunks in flight (trnsci/trnsci#115).**
   If some chunks stream, the default per-device resident budget is now
   `DEVICE_RESIDENT_GB` minus (prefetch + 2) chunks: the uploads in flight plus one

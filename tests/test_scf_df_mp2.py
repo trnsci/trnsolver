@@ -85,6 +85,21 @@ def test_df_mp2_matches_dense(h2, kw):
     )
 
 
+def test_resident_mp2_route_needs_the_row_kernel():
+    """On a NeuronCore the resident route is used only when trntensor's row
+    kernel fits SBUF; otherwise it is the aten fallback (fp32 sum, slower
+    than the blocked route at C40H82 / aug-cc-pVDZ, #115). Host: always."""
+    pytest.importorskip("trntensor.nki.dispatch")
+    assert mp2._resident_mp2_ok(torch.device("cpu"), 161, 1461, 6064)
+
+    class _Dev:  # a NeuronCore stand-in (only .type is read)
+        type = "neuron"
+
+    dev = _Dev()
+    assert not mp2._resident_mp2_ok(dev, 161, 1461, 6064)  # 663 KiB per partition
+    assert mp2._resident_mp2_ok(dev, 32, 224, 256)  # small: the row kernel fits
+
+
 def test_df_mp2_from_store_with_memmap(tmp_path, h2):
     system, res, eps, C, _ = h2
     disk = scf.h2_lattice(6, store=str(tmp_path / "s"), store_dtype=torch.float64)
