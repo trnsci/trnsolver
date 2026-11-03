@@ -328,9 +328,9 @@ class TestGmresIr:
 
         _, _iters_plain, res_plain = trnsolver.gmres(A, b, tol=1e-6, maxiter=200, restart=n)
         _, _iters_ir, res_ir = trnsolver.gmres_ir(A, b, tol=1e-8)
-        assert (
-            res_ir <= res_plain + 1e-8
-        ), f"GMRES-IR residual {res_ir:.2e} should not exceed plain GMRES {res_plain:.2e}"
+        assert res_ir <= res_plain + 1e-8, (
+            f"GMRES-IR residual {res_ir:.2e} should not exceed plain GMRES {res_plain:.2e}"
+        )
 
     def test_bf16_input(self):
         """BF16 A and b: output is BF16 (dtype round-trip via _to_fp32/_restore)."""

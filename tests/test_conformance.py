@@ -160,9 +160,9 @@ def relerr(x, ref):
 
 def assert_close(x, ref, tol, what):
     x = host(x)
-    assert tuple(x.shape) == tuple(
-        ref.shape
-    ), f"{what}: shape {tuple(x.shape)} != {tuple(ref.shape)}"
+    assert tuple(x.shape) == tuple(ref.shape), (
+        f"{what}: shape {tuple(x.shape)} != {tuple(ref.shape)}"
+    )
     if x.numel():
         assert torch.isfinite(x.to(ref.dtype)).all(), f"{what}: non-finite output"
     e = relerr(x, ref)
@@ -184,9 +184,9 @@ def guarded(fn, *inputs):
         if isinstance(o, torch.Tensor) and o.numel():
             for t in tin:
                 if t.numel():
-                    assert (
-                        o.untyped_storage().data_ptr() != t.untyped_storage().data_ptr()
-                    ), "output shares storage with an input"
+                    assert o.untyped_storage().data_ptr() != t.untyped_storage().data_ptr(), (
+                        "output shares storage with an input"
+                    )
     return out
 
 
@@ -262,18 +262,18 @@ def chk_qr(A, tol, dt):
         A64 = up(A)
         Q, R = host(Q).to(A64.dtype), host(R).to(A64.dtype)
         Qr, Rr = torch.linalg.qr(A64)
-        assert (
-            Q.shape == Qr.shape and R.shape == Rr.shape
-        ), f"Q{tuple(Q.shape)} R{tuple(R.shape)} (reduced)"
+        assert Q.shape == Qr.shape and R.shape == Rr.shape, (
+            f"Q{tuple(Q.shape)} R{tuple(R.shape)} (reduced)"
+        )
         assert_close(Q @ R, A64, tol, "Q @ R vs A")
         k = Q.shape[-1]
         assert_close(
             Q.mH @ Q, torch.eye(k, dtype=A64.dtype).expand(*Q.shape[:-2], k, k), tol, "Qᴴ Q vs I"
         )
         if R.numel():
-            assert not (
-                torch.tril(R, -1).abs() > tol * max(R.abs().max().item(), 1)
-            ).any(), "R not upper triangular"
+            assert not (torch.tril(R, -1).abs() > tol * max(R.abs().max().item(), 1)).any(), (
+                "R not upper triangular"
+            )
 
     return f
 
@@ -287,9 +287,9 @@ def chk_svd(A, tol, dt, full=False):
         A64 = up(A)
         U, s, Vh = host(U).to(A64.dtype), host(s).to(real_of(A64.dtype)), host(Vh).to(A64.dtype)
         Ur, sr, Vhr = torch.linalg.svd(A64, full_matrices=full)
-        assert (
-            U.shape == Ur.shape and Vh.shape == Vhr.shape
-        ), f"U{tuple(U.shape)} Vh{tuple(Vh.shape)}"
+        assert U.shape == Ur.shape and Vh.shape == Vhr.shape, (
+            f"U{tuple(U.shape)} Vh{tuple(Vh.shape)}"
+        )
         assert_close(s, sr, tol, "s vs svdvals")
         k = s.shape[-1]
         Us, Vhs = (U[..., :, :k], Vh[..., :k, :]) if full else (U, Vh)
@@ -378,9 +378,9 @@ def chk_schur(A, tol, dt):
         assert_close(Q @ T @ Q.mH, A64, tol * 10, "Q T Qᴴ vs A")
         assert_close(Q.mH @ Q, torch.eye(n, dtype=A64.dtype), tol * 10, "Qᴴ Q vs I")
         if n > 2:
-            assert not (
-                torch.tril(T, -2).abs() > 1e-6 * T.abs().max()
-            ).any(), "T not quasi-upper-triangular"
+            assert not (torch.tril(T, -2).abs() > 1e-6 * T.abs().max()).any(), (
+                "T not quasi-upper-triangular"
+            )
             # No two consecutive nonzero subdiagonals (2x2 blocks only).
             sub = (torch.diagonal(T, -1).abs() > 1e-6 * T.abs().max()).int()
             assert not (sub[1:] * sub[:-1]).any(), "T has a 3x3 diagonal block"
@@ -888,9 +888,9 @@ def _check_iterative(A, b, out, tol, maxiter):
     bn = torch.linalg.norm(b64).item()
     true_res = (torch.linalg.norm(b64 - A64 @ xh) / bn).item() if bn else 0.0
     assert isinstance(iters, int) and 0 <= iters <= maxiter
-    assert (
-        abs(res - true_res) <= 1e-6 * max(true_res, 1e-10) + 1e-12
-    ), f"reported {res:.3g} != true {true_res:.3g}"
+    assert abs(res - true_res) <= 1e-6 * max(true_res, 1e-10) + 1e-12, (
+        f"reported {res:.3g} != true {true_res:.3g}"
+    )
     if res <= tol:
         x_ref = torch.linalg.solve(A64, b64)
         assert_close(xh, x_ref, max(20 * tol, 1e-12), "x vs torch.linalg.solve")
@@ -1027,9 +1027,9 @@ def test_gmres_ir(n, kw):
     assert 0 <= outer <= max_outer
     xh = host(x)
     true_res = (torch.linalg.norm(b - A @ xh) / torch.linalg.norm(b)).item()
-    assert (
-        abs(res - true_res) <= 1e-3 * max(true_res, 1e-15) + 1e-15
-    ), f"reported {res:.3g} != true {true_res:.3g}"
+    assert abs(res - true_res) <= 1e-3 * max(true_res, 1e-15) + 1e-15, (
+        f"reported {res:.3g} != true {true_res:.3g}"
+    )
     tol = kw.get("tol", 1e-10)
     if outer < max_outer:
         assert true_res <= tol * 1.01
