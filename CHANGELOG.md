@@ -331,6 +331,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still held. At alkane43 / cc-pVTZ over 4 cores (19.2 GB per core), the second
   upload failed with NRT_RESOURCE. The new `DFJK.close()` is called at the end of
   `run_scf` and after the canonical Fock build in `scf_df_mp2.py`.
+- **DIIS history padded to a multiple of 16384 elements (trnsci/trnsci#115).** On Trn2 the
+  `(space, n²) @ (n²,)` GEMV for the DIIS row did not finish compiling in 21 min at n = 1640
+  (water40 / aug-cc-pVDZ; walrus `remat_optimization`). Two exclusive slots and two
+  single-core runs timed out inside it. Padded with zeros to 2,703,360 elements, it
+  compiles in 40 s. Dot products and the extrapolated Fock are unchanged.
 - **Streamed J/K: the default resident budget leaves room for chunks in flight (trnsci/trnsci#115).**
   If some chunks stream, the default per-device resident budget is now
   `DEVICE_RESIDENT_GB` minus (prefetch + 2) chunks: the uploads in flight plus one

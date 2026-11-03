@@ -628,6 +628,25 @@ def test_run_scf_releases_device_integrals(monkeypatch, tmp_path):
     assert closed == [True, True]
     assert r1.info["stream"]["resident"] > 0 and r2.info["stream"] is None
     assert r1.energy == pytest.approx(r2.energy, abs=1e-10)
+def test_diis_history_padded_and_exact():
+    """DIIS history rows are padded to a multiple of DIIS.PAD (a compile-time
+    workaround on Trn2, #115); the dot products and the extrapolated Fock are
+    those of the unpadded vectors."""
+    n, space = 7, 3
+    d = scf.DIIS(n, space, torch.float64, torch.device("cpu"))
+    assert d.length % scf.DIIS.PAD == 0 and d.length >= n * n
+    g = torch.Generator().manual_seed(0)
+    Fs = [torch.randn(n, n, generator=g, dtype=torch.float64) for _ in range(4)]
+    es = [torch.randn(n, n, generator=g, dtype=torch.float64) for _ in range(4)]
+    for k, (F, e) in enumerate(zip(Fs, es, strict=True)):
+        row = d.push(F, e)
+        kept = list(range(max(0, k - space + 1), k + 1))
+        ref = {d.order[j]: float((es[i] * e).sum()) for j, i in enumerate(kept)}
+        for slot, v in ref.items():
+            assert float(row[slot]) == pytest.approx(v, rel=1e-12)
+        Fx = d.extrapolate(row.double())
+        if Fx is not None:
+            assert Fx.shape == (n, n) and torch.isfinite(Fx).all()
 
 
 def test_host_float64_stream_over_fp32_store_chunks(tmp_path):
