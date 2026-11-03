@@ -593,6 +593,28 @@ def test_streamed_scf_from_store(tmp_path):
     assert abs(scf.energy_at_orbitals(disk32, r32.C_occ) - base.energy) < 1e-6
 
 
+def test_host_float64_stream_over_fp32_store_chunks(tmp_path):
+    """A float64 host pass (the canonical Fock) over an fp32 store whose
+    chunks double past chunk_bytes uses the store's chunks. The re-split
+    raised at n_ao 2522, where 128 float64 columns exceed 2 GiB (#115)."""
+    _need_aux_stream()
+    system = scf.h2_lattice(10)
+    n, (npair, naux) = system.nao, system.B.shape
+    cb = npair * 4 * 128
+    st = df_store.store_from_tensor(
+        system.B, n, str(tmp_path / "s"), dtype=torch.float32, chunk_bytes=cb
+    )
+    assert max(st.widths) == 128 and naux > 128
+    C = torch.linalg.qr(torch.randn(n, 6, dtype=torch.float64))[0]
+    P = 2 * C @ C.T
+    jk = scf.DFJK(st, n, device="cpu", dtype=torch.float64, stream=True, chunk_bytes=cb)
+    J, K = jk.jk(P, C)
+    ref = scf.DFJK(st.to_tensor().double(), n, device="cpu", dtype=torch.float64)
+    J0, K0 = ref.jk(P, C)
+    torch.testing.assert_close(J, J0)
+    torch.testing.assert_close(K, K0)
+
+
 def test_stream_off_for_in_memory_by_default():
     system = scf.h2_lattice(2)
     assert scf.DFJK(system.B, system.nao).stream is None
