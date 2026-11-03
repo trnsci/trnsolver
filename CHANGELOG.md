@@ -342,6 +342,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (water40 / aug-cc-pVDZ; walrus `remat_optimization`). Two exclusive slots and two
   single-core runs timed out inside it. Padded with zeros to 2,703,360 elements, it
   compiles in 40 s. Dot products and the extrapolated Fock are unchanged.
+- **`df_mp2` on a NeuronCore takes the blocked energy unless trntensor's row kernel fits (trnsci/trnsci#115).**
+  Before, a B_ia under 20 GB always went to `trntensor.mp2_energy`. When the row kernel
+  doesn't fit SBUF, that call runs aten einsums summed into an fp32 scalar. At C40H82 /
+  aug-cc-pVDZ on one core it took 222 s, against 184 s for `mp2_energy_blocked`,
+  and landed 3.8e-6 Eh off it. At alkane43 / cc-pVTZ it took 531 s against 258 s, 5.2e-6 Eh
+  off. The blocked route sums per-pair partials in float64.
 - **Streamed J/K: the default resident budget leaves room for chunks in flight (trnsci/trnsci#115).**
   If some chunks stream, the default per-device resident budget is now
   `DEVICE_RESIDENT_GB` minus (prefetch + 2) chunks: the uploads in flight plus one
