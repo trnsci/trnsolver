@@ -46,7 +46,11 @@ the Householder path and `eigh_generalized` through it, `eigh_randomized`,
   still receives device tensors. The `jacobi_preconditioner`,
   `block_jacobi_preconditioner` and `ssor_preconditioner` constructors take
   the same host path: built from device-resident float64 `A`, they return a
-  closure that computes on the host and returns `z` on `r`'s device. To keep device aten (fp32 precision, no
+  closure that computes on the host and returns `z` on `r`'s device. Block
+  CG follows the same rule: `cg_block` is guarded, `pivoted_cholesky` factors
+  a device-resident float64 diagonal on the host (L returns to the device),
+  and `PivotedLowRankPreconditioner(apply="auto")` applies a float64 L that
+  is on the device as `"host64"`. To keep device aten (fp32 precision, no
   host round trip), pass float32, or set `TRNSOLVER_FP64_ON_DEVICE=1`.
   Backends `"nki"` and `"pytorch"` and `TRNSOLVER_REQUIRE_NKI=1` are not
   affected.
@@ -80,6 +84,7 @@ The same rule holds across the trnsci suite (trnsci/trnsolver#89).
 | `TRNSOLVER_JACOBI_SWEEPS_PER_LAUNCH=<k>` | Scalar Jacobi kernel (padded n ≤ 32): run the first sweeps k per launch. Default 1. |
 | `TRNSOLVER_JACOBI_BLOCK=0` | Run the scalar Jacobi kernel for 33 ≤ n ≤ 128 instead of the block kernel (#48). |
 | `TRNSOLVER_EIGH_JACOBI_AUTO=off\|<rows>` | Region where `method="auto"` runs the Jacobi kernel (FP32 batches on `neuron`). `off`, or rows `n_min-n_max:B_min`, e.g. `1-32:512,33-64:256`. Default: the measured table in `eigen._JACOBI_AUTO_REGION`. |
+| `TRNSOLVER_NKI_EAGER_HANDLE=1\|0` | Native path only. `1` (default): eager NKI kernel calls on plain `neuron` tensors go through a `torch_neuronx.wrap_nki` handle built once per kernel instead of the `trnsolver::` custom op, which cuts host time per call from about 0.1 ms to 0.02-0.03 ms on trn2 (trnblas#92). `static=` arguments (the Jacobi `onezero`) pass through with the op body's `int()`. Under `torch.compile`, and for tensors that require grad, int64 tensors and tensor subclasses, the custom op runs as before; so do ops whose body is more than one kernel call. `0` always uses the custom op. |
 | `TRNSCI_NKI_DISPATCH=auto\|native\|xla\|cpu` | Suite-wide. Forces the native or XLA dispatch path; `auto` (default) detects. Forcing an unavailable path raises. |
 | `TRNSCI_XLA_DEPRECATION=1` | The XLA path emits one `DeprecationWarning`. Off by default. |
 | `NKI_ENABLE_TRACE_CACHE=0` | TorchNeuron (not trnsolver) setting. Turns off the cross-process NKI kernel cache, which cannot version editable installs. |

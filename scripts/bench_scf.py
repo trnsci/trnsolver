@@ -65,17 +65,25 @@ def _set_backends(name: str) -> None:
         lib.set_backend(name)
 
 
-def _load_system(spec: str, cache_dir: str | None) -> System:
+def _load_system(spec: str, cache_dir: str | None, args=None) -> System:
+    """The system ``spec``: from ``--cache-dir`` (a .pt file) if cached, else built.
+
+    Out-of-core systems (``--outcore``, examples/df_store.py) cache themselves
+    as a store directory per spec under ``--store-dir`` and are not saved as .pt.
+    """
     path = None
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
         path = os.path.join(cache_dir, spec.replace(":", "_") + ".pt")
         if os.path.exists(path):
             return System(**torch.load(path))
+    outcore = {"auto": None, "on": True, "off": False}[args.outcore] if args else None
     t = time.perf_counter()
-    system = make_system(spec)
+    system = make_system(spec, outcore=outcore, store_dir=args.store_dir if args else None)
     print(f"# built {spec} in {time.perf_counter() - t:.1f} s", flush=True)
-    if path:
+    if system.build.get("outcore"):
+        print(f"# {spec}: {system.B!r}", flush=True)
+    elif path:
         torch.save(system.__dict__, path)
     return system
 
@@ -92,6 +100,11 @@ def _run_mode(system: System, mode: str, args):
         k_cache_gb=args.k_cache_gb,
         jk_square=args.jk_square,
         jk_fused={"auto": None, "fused": True, "unpack": False}[args.jk_k],
+        jk_host_pack={"auto": None, "on": True, "off": False}[args.host_pack],
+        conv=args.conv,
+        jk_stream={"auto": None, "on": True, "off": False}[args.jk_stream],
+        jk_resident_gb=args.resident_gb,
+        jk_prefetch=args.prefetch,
     )
     if mode in ("cpu", "cpu64"):
         _set_backends("pytorch")
@@ -111,7 +124,7 @@ def _run_mode(system: System, mode: str, args):
 def bench_scf(args) -> None:
     rows = []
     for spec in args.systems.split(","):
-        system = _load_system(spec, args.cache_dir)
+        system = _load_system(spec, args.cache_dir, args)
         print(
             f"# {system.name}: n_ao={system.nao} naux={system.naux} nocc={system.nocc}",
             flush=True,
@@ -302,6 +315,7 @@ def main() -> None:
     ap.add_argument("--orth", default="symmetric", choices=("symmetric", "canonical", "cholesky"))
     ap.add_argument("--lindep", type=float, default=1e-7)
     ap.add_argument("--max-iter", type=int, default=60)
+    ap.add_argument("--conv", default="auto", choices=("auto", "energy", "density"))
     ap.add_argument("--warmup-iters", type=int, default=3)
     ap.add_argument("--k-cache-gb", type=float, default=4.0)
     ap.add_argument(
@@ -316,7 +330,33 @@ def main() -> None:
         help="K build: trntensor.df_exchange from packed rows (fused), the unpack + einsum "
         "+ syrk blocks (unpack), or fused on a device when available (auto)",
     )
+    ap.add_argument(
+        "--host-pack",
+        default="auto",
+        choices=("auto", "on", "off"),
+        help="pack P / unpack J on the host (auto: off the CPU above 1e6 pairs, #87)",
+    )
+    ap.add_argument(
+        "--jk-stream",
+        default="auto",
+        choices=("auto", "on", "off"),
+        help="stream B over aux chunks (trntensor.AuxStream); auto: for an out-of-core B",
+    )
+    ap.add_argument(
+        "--resident-gb",
+        type=float,
+        default=None,
+        help="per-device GB of streamed chunks kept resident (default 20 on a NeuronCore)",
+    )
+    ap.add_argument("--prefetch", type=int, default=1, help="uploads in flight per device")
     ap.add_argument("--cache-dir", default=None, help="cache built systems as .pt files")
+    ap.add_argument(
+        "--outcore",
+        default="auto",
+        choices=("auto", "on", "off"),
+        help="build B to an on-disk store (examples/df_store.py); auto: above OUTCORE_GB",
+    )
+    ap.add_argument("--store-dir", default=None, help="df_store root (default $TRNSCI_DF_DIR)")
     ap.add_argument(
         "--no-density-energy",
         dest="density_energy",

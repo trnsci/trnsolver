@@ -42,7 +42,8 @@ def eigh(
 
     Args:
         A: Symmetric matrix (n, n). With ``method="jacobi"``, also a batch
-           (..., n, n).
+           (..., n, n). Complex Hermitian input with ``method="jacobi"``
+           runs the default path (Jacobi is real-only; #79).
         tol: Convergence tolerance for QR iteration (NKI path only)
         method: ``"auto"`` (default) or ``"jacobi"``. ``None`` reads
            ``TRNSOLVER_EIGH_METHOD`` (default ``auto``).
@@ -82,7 +83,9 @@ def eigh(
     ``TRNSOLVER_REQUIRE_NKI=1`` disables the cutover so the kernels still run.
     """
     resolved = _eigh_method(method)
-    if resolved == "jacobi" or (resolved == "auto" and _jacobi_auto(A)):
+    # Jacobi is real-only (its rotations compare entries); complex Hermitian
+    # input takes the default path below, as torch.linalg.eigh does (#79).
+    if (resolved == "jacobi" and not A.is_complex()) or (resolved == "auto" and _jacobi_auto(A)):
         return _jacobi_eigh(A)
     A, orig = _to_fp32(A)
     if _use_nki() and (_eigh_aten_cutover(A) or not _householder_fits(A)):
@@ -544,8 +547,9 @@ def _jacobi_eigh(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         raise ValueError(f"eigh expects (..., n, n); got {tuple(A.shape)}")
     batch_shape = A.shape[:-2]
     n = A.shape[-1]
-    X = A.reshape(-1, n, n)
-    if X.shape[0] == 0:
+    # An explicit batch size: reshape(-1, 0, 0) is ambiguous and raised (#79).
+    X = A.reshape(math.prod(batch_shape), n, n)
+    if X.shape[0] == 0 or n == 0:
         w = X.new_empty((0, n))
         V = X.new_empty((0, n, n))
     elif (kdt := _jacobi_kernel_dtype(n, X.dtype)) is not None:

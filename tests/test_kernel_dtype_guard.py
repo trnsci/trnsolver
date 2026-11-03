@@ -367,9 +367,16 @@ APIS = [
     ("solve", {}, lambda dt: trnsolver.solve(_spd(5, dt), _as(torch.ones(5, 1), dt))),
     ("solve_spd", {}, lambda dt: trnsolver.solve_spd(_spd(5, dt), _as(torch.ones(5, 1), dt))),
     ("inv_sqrt_spd", {}, lambda dt: trnsolver.inv_sqrt_spd(_spd(5, dt))),
+    ("inv_spd", {}, lambda dt: trnsolver.inv_spd(_spd(5, dt))),
+    ("pinv", {}, lambda dt: trnsolver.pinv(_spd(5, dt))),
     ("cg", {}, lambda dt: trnsolver.cg(_spd(5, dt), _as(torch.ones(5), dt), maxiter=20)),
     ("gmres", {}, lambda dt: trnsolver.gmres(_spd(5, dt), _as(torch.ones(5), dt), maxiter=20)),
     ("gmres_ir", {}, lambda dt: trnsolver.gmres_ir(_spd(5, dt), _as(torch.ones(5), dt))),
+    (
+        "cg_block",
+        {},
+        lambda dt: trnsolver.cg_block(_spd(5, dt), _as(torch.ones(5, 2), dt), maxiter=20)[0],
+    ),
 ]
 
 
@@ -905,3 +912,85 @@ def test_fp64_host_resident_unchanged(monkeypatch):
             assert got == ref, name
     assert not tr.to_host and not tr.to_device
     assert not _host_warnings(caught)
+
+
+# ── block CG helpers (#97): the routes the guard cannot see ─────────────────
+
+
+def _lowrank_access(K):
+    return (lambda: torch.diagonal(K).clone()), (lambda idx: K[idx])
+
+
+def test_fp64_on_device_pivoted_cholesky_factors_on_host(monkeypatch):
+    """`pivoted_cholesky` takes callables, so it applies the rule itself: a
+    float64 diagonal on the neuron device is factored on the host and L comes
+    back to the device, matching the pytorch backend at float64 accuracy."""
+    K = _spd(12, torch.float64)
+    diag_fn, rows_fn = _lowrank_access(K)
+    with monkeypatch.context() as m:
+        m.setattr(dispatch, "_backend", "pytorch")
+        want = trnsolver.pivoted_cholesky(diag_fn, rows_fn, 5)
+    _install(monkeypatch, "native", "auto", False)
+    tr = Transfers(monkeypatch)
+    seen = []
+
+    def rows(idx):
+        seen.append(idx.device.type)
+        return rows_fn(idx)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        L = trnsolver.pivoted_cholesky(diag_fn, rows, 5)
+    msgs = _host_warnings(caught)
+    assert len(msgs) == 1 and "trnsolver pivoted_cholesky:" in str(msgs[0].message)
+    assert seen and set(seen) == {dispatch._NEURON_DEVICE}  # idx on the diagonal's device
+    assert L.dtype == torch.float64 and L.device.type == dispatch._NEURON_DEVICE
+    torch.testing.assert_close(L, want, rtol=1e-12, atol=1e-12)
+    assert not tr.to_host  # no guarded op involved
+
+
+def test_fp64_on_device_lowrank_preconditioner_applies_on_host(monkeypatch):
+    """apply="auto" picks "native" for a float64 L; on the neuron device under
+    backend "auto" that would be device aten at fp32 precision, so it takes
+    "host64" (one warning). The override and the other backends keep "native"."""
+    K = _spd(12, torch.float64)
+    L = trnsolver.pivoted_cholesky(*_lowrank_access(K), 5)
+    _install(monkeypatch, "native", "auto", False)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert trnsolver.PivotedLowRankPreconditioner(L, 0.5).apply == "host64"
+        assert trnsolver.PivotedLowRankPreconditioner(L, 0.5).apply == "host64"
+    assert len(_host_warnings(caught)) == 1
+    monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", True)
+    assert trnsolver.PivotedLowRankPreconditioner(L, 0.5).apply == "native"
+    monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", False)
+    for backend in ("nki", "pytorch"):
+        monkeypatch.setattr(dispatch, "_backend", backend)
+        assert trnsolver.PivotedLowRankPreconditioner(L, 0.5).apply == "native"
+    monkeypatch.setattr(dispatch, "_backend", "auto")
+    monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "neuron")  # L is host-resident again
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert trnsolver.PivotedLowRankPreconditioner(L, 0.5).apply == "native"
+    assert not _host_warnings(caught)
+
+
+def test_fp64_on_device_cg_block_with_lowrank_preconditioner(monkeypatch):
+    """cg_block on device-resident float64 with the low-rank M: computed on the
+    host (the callables still get device tensors), X back on the device."""
+    K = _spd(12, torch.float64)
+    B = torch.ones(12, 3, dtype=torch.float64)
+    with monkeypatch.context() as m:
+        m.setattr(dispatch, "_backend", "pytorch")
+        M = trnsolver.pivoted_lowrank_preconditioner(*_lowrank_access(K), 4, 1.0)
+        want, _ = trnsolver.cg_block(K, B, M, tol=1e-12)
+    _install(monkeypatch, "native", "auto", False)
+    tr = Transfers(monkeypatch)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        M = trnsolver.pivoted_lowrank_preconditioner(*_lowrank_access(K), 4, 1.0)
+        X, info = trnsolver.cg_block(K, B, M, tol=1e-12)
+    assert any(t is B for t in tr.to_host) and tr.to_device
+    assert "trnsolver cg_block:" in " ".join(str(w.message) for w in _host_warnings(caught))
+    assert X.dtype == torch.float64 and bool(info["converged"].all())
+    torch.testing.assert_close(X, want, rtol=1e-10, atol=1e-12)
