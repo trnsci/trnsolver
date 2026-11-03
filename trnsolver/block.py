@@ -423,11 +423,11 @@ def pivoted_cholesky(
             Sw -= torch.outer(col, col)
             taken[p] = True
             order.append(p)
-        if not order:  # roundoff: the largest Schur diagonal is not positive
+        if not order:  # pragma: no cover - roundoff: the largest Schur diagonal is not positive
             break
         perm = torch.tensor(order, dtype=torch.int64)
         C, bad = torch.linalg.cholesky_ex(Scc[perm][:, perm])
-        if int(bad) > 0:  # rounding: keep the leading positive-definite pivots
+        if int(bad) > 0:  # pragma: no cover - rounding: keep the leading positive-definite pivots
             perm, C = perm[: int(bad) - 1], C[: int(bad) - 1, : int(bad) - 1]
             if perm.numel() == 0:
                 break

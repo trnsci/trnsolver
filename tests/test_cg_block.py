@@ -405,6 +405,29 @@ class TestProjectedApply:
         assert torch.allclose(P(V[:, 0]), torch.linalg.solve(dense, V[:, 0]), atol=1e-8)
         assert P.logdet() == pytest.approx(torch.linalg.slogdet(dense)[1].item(), rel=1e-10)
 
+    def test_ill_conditioned_basis_gets_second_gram_pass(self):
+        # λ spans 1e6 .. 1e-6 with a tiny shift: eps · λmax/λmin > 1e-6, so
+        # the Gram basis is re-orthogonalised.
+        n, k, shift = 200, 12, 1e-12
+        g = torch.Generator().manual_seed(4)
+        U, _ = torch.linalg.qr(torch.randn(n, k, generator=g, dtype=torch.float64))
+        W, _ = torch.linalg.qr(torch.randn(k, k, generator=g, dtype=torch.float64))
+        L = (U * torch.logspace(3, -3, k, dtype=torch.float64)) @ W
+        P = trnsolver.PivotedLowRankPreconditioner(L, shift, apply="projected")
+        Q = P.Q
+        assert Q.shape == (n, k)
+        assert torch.allclose(Q.T @ Q, torch.eye(k, dtype=torch.float64), atol=1e-12)
+        lam = shift / P.g - shift
+        ref = torch.linalg.svdvals(L) ** 2
+        assert torch.allclose(lam.sort().values, ref.sort().values, rtol=1e-6)
+
+    def test_zero_factor_gives_empty_basis(self):
+        L = torch.zeros(50, 3, dtype=torch.float64)
+        P = trnsolver.PivotedLowRankPreconditioner(L, 0.5, apply="projected")
+        assert P.Q.shape == (50, 0)
+        V = torch.randn(50, 2, dtype=torch.float64)
+        assert torch.allclose(P(V), V / 0.5)
+
     def test_fp32_accurate_where_native_cancels(self):
         n, noise = 1500, 1e-3
         K, _ = _rbf(n, noise=noise)
