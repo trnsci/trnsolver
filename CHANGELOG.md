@@ -154,6 +154,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **DIIS history padded to a multiple of 16384 elements (trnsci/trnsci#115).** On Trn2 the
+  `(space, n²) @ (n²,)` GEMV for the DIIS row did not finish compiling in 21 min at n = 1640
+  (water40 / aug-cc-pVDZ; walrus `remat_optimization`). Two exclusive slots and two
+  single-core runs timed out inside it. Padded with zeros to 2,703,360 elements, it
+  compiles in 40 s. Dot products and the extrapolated Fock are unchanged.
+
 - **`cg` dropped the imaginary part of complex input (#100).** Its inner
   products were `float(u.dot(v))`: unconjugated, and cast to real, so a
   complex Hermitian positive definite system iterated on the wrong

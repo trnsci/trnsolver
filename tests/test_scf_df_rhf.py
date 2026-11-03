@@ -575,6 +575,27 @@ def test_streamed_scf_from_store(tmp_path):
     assert abs(scf.energy_at_orbitals(disk32, r32.C_occ) - base.energy) < 1e-6
 
 
+def test_diis_history_padded_and_exact():
+    """DIIS history rows are padded to a multiple of DIIS.PAD (a compile-time
+    workaround on Trn2, #115); the dot products and the extrapolated Fock are
+    those of the unpadded vectors."""
+    n, space = 7, 3
+    d = scf.DIIS(n, space, torch.float64, torch.device("cpu"))
+    assert d.length % scf.DIIS.PAD == 0 and d.length >= n * n
+    g = torch.Generator().manual_seed(0)
+    Fs = [torch.randn(n, n, generator=g, dtype=torch.float64) for _ in range(4)]
+    es = [torch.randn(n, n, generator=g, dtype=torch.float64) for _ in range(4)]
+    for k, (F, e) in enumerate(zip(Fs, es, strict=True)):
+        row = d.push(F, e)
+        kept = list(range(max(0, k - space + 1), k + 1))
+        ref = {d.order[j]: float((es[i] * e).sum()) for j, i in enumerate(kept)}
+        for slot, v in ref.items():
+            assert float(row[slot]) == pytest.approx(v, rel=1e-12)
+        Fx = d.extrapolate(row.double())
+        if Fx is not None:
+            assert Fx.shape == (n, n) and torch.isfinite(Fx).all()
+
+
 def test_stream_off_for_in_memory_by_default():
     system = scf.h2_lattice(2)
     assert scf.DFJK(system.B, system.nao).stream is None

@@ -938,10 +938,20 @@ class DIIS:
     host in float64.
     """
 
+    # History rows are padded to a multiple of this many elements (zeros, which
+    # change no dot product). On Trn2 the (space, n²) @ (n²,) GEMV at n = 1640
+    # (n² = 2,689,600) did not finish compiling in 21 min (walrus
+    # remat_optimization). Padded to 2,703,360 it compiled in 40 s
+    # (trnsci/trnsci#115).
+    PAD = 16384
+
     def __init__(self, n: int, space: int, dtype: torch.dtype, device: torch.device):
         self.space = space
-        self.F = torch.zeros(space, n * n, dtype=dtype, device=device)
-        self.e = torch.zeros(space, n * n, dtype=dtype, device=device)
+        self.n = n
+        self.length = -(-n * n // self.PAD) * self.PAD
+        self.F = torch.zeros(space, self.length, dtype=dtype, device=device)
+        self.e = torch.zeros(space, self.length, dtype=dtype, device=device)
+        self._epad = torch.zeros(self.length, dtype=dtype, device=device)
         self.order: list[int] = []  # buffer slots, oldest first
         self.Bm = torch.zeros(space, space, dtype=torch.float64)
 
@@ -949,10 +959,12 @@ class DIIS:
         """Store (F, e); return the device row <e_k, e> over the slots (slot order)."""
         slot = self.order.pop(0) if len(self.order) == self.space else len(self.order)
         self.order.append(slot)
-        self.F[slot].copy_(F.reshape(-1))
-        self.e[slot].copy_(e.reshape(-1))
+        nn = self.n * self.n
+        self.F[slot, :nn].copy_(F.reshape(-1))
+        self.e[slot, :nn].copy_(e.reshape(-1))
+        self._epad[:nn].copy_(e.reshape(-1))
         self._slot = slot
-        return torch.mv(self.e, e.reshape(-1))
+        return torch.mv(self.e, self._epad)
 
     def extrapolate(self, row: torch.Tensor) -> torch.Tensor | None:
         """Given the host copy of :meth:`push`'s row, the DIIS Fock (None: use F)."""
@@ -974,8 +986,8 @@ class DIIS:
         coef = torch.zeros(self.space, dtype=torch.float64)
         coef[idx] = c
         coef = coef.to(self.F.dtype).to(self.F.device)
-        n = int(round(self.F.shape[1] ** 0.5))
-        return torch.mv(self.F.T, coef).reshape(n, n)
+        n = self.n
+        return torch.mv(self.F.T, coef)[: n * n].reshape(n, n)
 
 
 def _purify_steps(D: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
