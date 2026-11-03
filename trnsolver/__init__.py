@@ -8,6 +8,17 @@ Part of the trnsci scientific computing suite.
 
 __version__ = "0.21.0"
 
+# Block CG on matrix-free operators, low-rank preconditioner, SLQ log-det (#97)
+from .block import (
+    PivotedLowRankPreconditioner,
+    cg_block,
+    cg_block_ir,
+    lanczos_tridiag_from_cg,
+    pivoted_cholesky,
+    pivoted_lowrank_preconditioner,
+    slq_logdet,
+)
+
 # Eigenvalue decomposition
 from .eigen import eigh, eigh_generalized, eigh_randomized
 
@@ -75,6 +86,13 @@ __all__ = [
     "jacobi_preconditioner",
     "block_jacobi_preconditioner",
     "ssor_preconditioner",
+    "cg_block",
+    "cg_block_ir",
+    "pivoted_cholesky",
+    "pivoted_lowrank_preconditioner",
+    "PivotedLowRankPreconditioner",
+    "lanczos_tridiag_from_cg",
+    "slq_logdet",
     # Backend
     "HAS_NKI",
     "set_backend",
