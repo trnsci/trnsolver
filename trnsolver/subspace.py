@@ -51,11 +51,12 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 import torch
 
 from .nki import _REQUIRE_NKI, HAS_NKI, _use_nki, _use_simulator
+from .nki.dispatch import _fp64_host_guard
 
 # Filter degrees the driver picks from: one compiled kernel per (n, kb, m).
 DEGREES = (2, 4, 6, 8, 12, 16, 24, 32, 48, 64)
@@ -81,6 +82,10 @@ class SubspaceState:
     and ``residual`` holds ``|F x_j - theta_j x_j|`` of the block that entered
     its last pass (before that pass; None after a cold start).
     """
+
+    # Stay on the host when a result is moved to F's device (the float64
+    # host path for device-resident F, `nki.dispatch._fp64_host_guard`).
+    _HOST_FIELDS: ClassVar[tuple[str, ...]] = ("theta", "residual")
 
     X: torch.Tensor
     theta: torch.Tensor
@@ -304,9 +309,31 @@ def rayleigh_ritz(
     return theta, B @ W
 
 
-def _subspace_device_ok(F: torch.Tensor, kb: int) -> bool:
-    """True iff the filter runs as the NKI kernel for F and a kb-column block."""
-    if F.dtype != torch.float32 or not (_use_nki() and HAS_NKI):
+_SUBSPACE_OPS = ("subspace_filter", "subspace_step")
+
+
+def _subspace_kernel_dtype(F: torch.Tensor, kb: int) -> torch.dtype:
+    """The dtype the warm passes run F in: F's, or float32 for the kernel.
+
+    float64 F where an FP32 F would run the kernel follows the suite policy
+    (#89): float64 (filter_reference) under backend ``"auto"``; float32 with
+    one UserWarning under backend ``"nki"``; NotImplementedError under
+    ``TRNSOLVER_REQUIRE_NKI=1``.
+    """
+    if F.dtype != torch.float64 or not _subspace_device_ok(F, kb, torch.float32):
+        return F.dtype
+    from .nki.dispatch import _kernel_dtype
+
+    return _kernel_dtype(F.dtype, _SUBSPACE_OPS, "occupied_subspace") or F.dtype
+
+
+def _subspace_device_ok(F: torch.Tensor, kb: int, dtype: torch.dtype | None = None) -> bool:
+    """True iff the filter runs as the NKI kernel for F (as ``dtype``) and a kb-column block."""
+    from .nki.dispatch import kernel_takes
+
+    # FP32 only; float64 F is cast first or not at all (_subspace_kernel_dtype).
+    dtype = F.dtype if dtype is None else dtype
+    if not kernel_takes(dtype, *_SUBSPACE_OPS) or not (_use_nki() and HAS_NKI):
         return False
     if os.environ.get("TRNSOLVER_SUBSPACE_KERNEL", "1").strip() == "0":
         return False
@@ -316,7 +343,9 @@ def _subspace_device_ok(F: torch.Tensor, kb: int) -> bool:
         return False
     if _use_simulator():
         return True
-    if F.device.type != "neuron":
+    from .nki.dispatch import _NEURON_DEVICE
+
+    if F.device.type != _NEURON_DEVICE:
         return False
     from .nki.dispatch import _get_dispatch_path
 
@@ -428,6 +457,7 @@ def _rr_block(F: torch.Tensor, X: torch.Tensor, kb: int):
     return _complete(X @ _to(Q, X.device, X.dtype), theta, kb, seed=kb)
 
 
+@_fp64_host_guard("occupied_subspace")
 @torch.compiler.disable
 def occupied_subspace(
     F: torch.Tensor,
@@ -496,7 +526,10 @@ def occupied_subspace(
     The filter, the correction and the Gram blocks run as one NKI launch for
     FP32 F on the native ``neuron`` device (and under
     ``TRNSOLVER_USE_SIMULATOR=1``); elsewhere as :func:`filter_reference`.
-    The Rayleigh-Ritz is float64 on the host.
+    float64 F there runs :func:`filter_reference` at float64 under backend
+    ``"auto"``, the FP32 kernel (one UserWarning; float64 result) under
+    backend ``"nki"``, and raises NotImplementedError under
+    ``TRNSOLVER_REQUIRE_NKI=1``. The Rayleigh-Ritz is float64 on the host.
     """
     if F.dim() != 2 or F.shape[0] != F.shape[1]:
         raise ValueError(f"occupied_subspace expects (n, n); got {tuple(F.shape)}")
@@ -517,6 +550,8 @@ def occupied_subspace(
         state = SubspaceState(X=X, theta=theta, upper=bound)
         return SubspaceResult(_to(theta[:k], F.device, F.dtype), X[:, :k], state)
 
+    out_dtype = F.dtype
+    F = F.to(_subspace_kernel_dtype(F, kb))  # float32 for the kernel under backend "nki"
     cached = None
     if isinstance(guess, SubspaceState):
         X, theta, cached = guess.X.to(F.device, F.dtype), guess.theta, guess.upper
@@ -595,7 +630,9 @@ def occupied_subspace(
         pk = _to(torch.cat([Q[:, :w], theta[:w].reshape(1, w)], 0), F.device, F.dtype)
         Q, w_dev = pk[:-1], (pk[-1, :k] if w >= k else None)
         X, theta = _complete(X @ Q[:kb] + out[r0 : r0 + n] @ Q[kb:], theta[:kb], kb, seed=done)
-    state = SubspaceState(X=X, theta=theta, upper=b, degree=m, passes=done, residual=resid)
     if w_dev is None:
         w_dev = _to(theta[:k], F.device, F.dtype)
+    if out_dtype != F.dtype:  # float64 F through the FP32 kernel: float64 result
+        X, w_dev = X.to(out_dtype), w_dev.to(out_dtype)
+    state = SubspaceState(X=X, theta=theta, upper=b, degree=m, passes=done, residual=resid)
     return SubspaceResult(w_dev, X[:, :k], state)
