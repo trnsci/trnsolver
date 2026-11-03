@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] — 2026-11-04
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: `cg_block` / `cg_block_ir` block CG and pivoted-Cholesky low-rank preconditioners for matrix-free operators (#97, #114); out-of-core and streamed DF-RHF + DF-MP2 at large basis on Trn2 (#15, trnsci/trnsci#115); cached eager NKI handles; and the trnsci float64 policy with a dtype guard at the kernel boundary. The `[dev]` extra now requires trntensor>=0.24 (`AuxStream`, trntensor#102).
+
 ### Performance
 
 - **Eager NKI kernel calls skip the per-call handle rebuild and the custom-op

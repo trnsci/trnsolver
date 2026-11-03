@@ -6,7 +6,7 @@ computing on Trainium. Complements trnblas (BLAS) and trnfft (FFT).
 Part of the trnsci scientific computing suite.
 """
 
-__version__ = "0.21.0"
+__version__ = "0.22.0"
 
 # Block CG on matrix-free operators, low-rank preconditioner, SLQ log-det (#97)
 from .block import (
