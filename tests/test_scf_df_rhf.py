@@ -628,6 +628,8 @@ def test_run_scf_releases_device_integrals(monkeypatch, tmp_path):
     assert closed == [True, True]
     assert r1.info["stream"]["resident"] > 0 and r2.info["stream"] is None
     assert r1.energy == pytest.approx(r2.energy, abs=1e-10)
+
+
 def test_diis_history_padded_and_exact():
     """DIIS history rows are padded to a multiple of DIIS.PAD (a compile-time
     workaround on Trn2, #115); the dot products and the extrapolated Fock are
@@ -647,6 +649,8 @@ def test_diis_history_padded_and_exact():
         Fx = d.extrapolate(row.double())
         if Fx is not None:
             assert Fx.shape == (n, n) and torch.isfinite(Fx).all()
+
+
 def test_guess_orbitals_and_restart():
     """A given (n, nocc) guess is S-orthonormalised and used in place of the
     core guess: restarting from a converged C_occ converges at once."""
