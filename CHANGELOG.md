@@ -324,6 +324,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Streamed J/K: the default resident budget leaves room for chunks in flight (trnsci/trnsci#115).**
+  If some chunks stream, the default per-device resident budget is now
+  `DEVICE_RESIDENT_GB` minus (prefetch + 2) chunks: the uploads in flight plus one
+  chunk of `df_exchange` working memory. Before, it was the full 20 GB, and a 24 GiB
+  Trn2 core ran out of memory (NRT_RESOURCE) in the second SCF iteration in two cases:
+  C40H82 / aug-cc-pVDZ on one core at 20 GB resident (16 GB ran), and
+  alkane69 / cc-pVDZ (nocc 277) at 15.7 GB (13 GB converged in 6 iterations).
+  Fully resident layouts (B fits the budget) are unchanged.
 - **`df_store` row blocks no longer overflow on int32 `ao_loc` (trnsci/trnsci#115).**
   PySCF's `ao_loc` is int32, so the block-size test `3 · rows · naux · 8` wrapped
   past 2³¹ once one shell pushed a block from under `block_bytes` to over 2 GiB.

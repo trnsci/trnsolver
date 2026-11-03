@@ -95,6 +95,36 @@ OUTCORE_GB = 16.0
 DEVICE_RESIDENT_GB = 20.0
 
 
+def default_resident_bytes(
+    widths, npair: int, itemsize: int, ndev: int, prefetch: int, device_type: str
+) -> float:
+    """Default per-device resident budget for the streamed J/K.
+
+    :data:`DEVICE_RESIDENT_GB` when every chunk dealt to a device fits it.
+    When some chunks stream, the budget also has to hold the chunks in
+    flight: ``prefetch`` uploads ahead plus the one being computed on. It
+    also needs room for one more chunk's worth of kernel working memory, the
+    ``df_exchange`` half-transform of nocc · n · w elements, which is at most
+    a chunk for nocc ≤ n/2. So ``prefetch + 2`` chunks are subtracted.
+
+    Measured on Trn2, where tensors failed at about 22.4 GB per 24 GiB core
+    (trnsci/trnsci#115):
+    - n_ao 1658, nocc 161, 2.1 GB chunks on one core: 20 GB resident died
+      with NRT_RESOURCE in iteration 2, and 16 GB ran.
+    - alkane69 / cc-pVDZ (n_ao 1666, nocc 277): 15.7 GB (7 chunks) died,
+      and 13 GB (6 chunks) converged.
+    Returns 0 on the CPU.
+    """
+    if device_type == "cpu":
+        return 0.0
+    budget = DEVICE_RESIDENT_GB * 1e9
+    sizes = [npair * w * itemsize for w in widths]
+    per_dev = [sum(sizes[i::ndev]) for i in range(ndev)]
+    if max(per_dev) <= budget:
+        return budget
+    return max(0.0, budget - (max(0, prefetch) + 2) * max(sizes))
+
+
 # ---------------------------------------------------------------------------
 # Systems
 # ---------------------------------------------------------------------------
@@ -780,12 +810,16 @@ class DFJK:
             # doubles each chunk's bytes, and at n_ao 2522 not even 128 float64
             # columns fit 2 GiB, so the re-split raised (trnsci/trnsci#115).
             chunks = B.loaders()
+            widths = list(B.widths)
         else:
             # Column views, made contiguous (and cast) as each is loaded.
             w = trntensor.aux_chunk_width(npair, self.naux, chunk_bytes, itemsize)
             chunks = [(lambda q0=q0, w=w: B[:, q0 : q0 + w]) for q0 in range(0, self.naux, w)]
+            widths = [min(w, self.naux - q0) for q0 in range(0, self.naux, w)]
         if resident_bytes is None:
-            resident_bytes = 0.0 if self.device.type == "cpu" else DEVICE_RESIDENT_GB * 1e9
+            resident_bytes = default_resident_bytes(
+                widths, npair, itemsize, len(self.devices), prefetch, self.device.type
+            )
         self.stream = trntensor.AuxStream(
             chunks,
             self.n,
