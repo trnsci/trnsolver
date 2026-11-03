@@ -921,17 +921,24 @@ def _lowrank_access(K):
     return (lambda: torch.diagonal(K).clone()), (lambda idx: K[idx])
 
 
-def test_fp64_on_device_pivoted_cholesky_factors_on_host(monkeypatch):
-    """`pivoted_cholesky` takes callables, so it applies the rule itself: a
-    float64 diagonal on the neuron device is factored on the host and L comes
-    back to the device, matching the pytorch backend at float64 accuracy."""
+@pytest.mark.parametrize(
+    "kw", [{}, {"block": 3}, {"block": 3, "sub": True}], ids=["one-row", "block", "block+sub_fn"]
+)
+def test_fp64_on_device_pivoted_cholesky_builds_on_host(monkeypatch, kw):
+    """`pivoted_cholesky` builds in float64 on the host for every input (#117),
+    one row per pivot or batched with `rows_fn` / `sub_fn`: a float64
+    diagonal and rows on the neuron device are read into host float64, no
+    device arithmetic runs, so there is no host-path warning, and L comes back
+    to the diagonal's device matching the pytorch backend."""
     K = _spd(12, torch.float64)
     diag_fn, rows_fn = _lowrank_access(K)
+    kw = dict(kw)
+    if kw.pop("sub", False):
+        kw["sub_fn"] = lambda idx: K[idx][:, idx]
     with monkeypatch.context() as m:
         m.setattr(dispatch, "_backend", "pytorch")
-        want = trnsolver.pivoted_cholesky(diag_fn, rows_fn, 5)
+        want = trnsolver.pivoted_cholesky(diag_fn, rows_fn, 5, **kw)
     _install(monkeypatch, "native", "auto", False)
-    tr = Transfers(monkeypatch)
     seen = []
 
     def rows(idx):
@@ -940,13 +947,11 @@ def test_fp64_on_device_pivoted_cholesky_factors_on_host(monkeypatch):
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        L = trnsolver.pivoted_cholesky(diag_fn, rows, 5)
-    msgs = _host_warnings(caught)
-    assert len(msgs) == 1 and "trnsolver pivoted_cholesky:" in str(msgs[0].message)
-    assert seen and set(seen) == {dispatch._NEURON_DEVICE}  # idx on the diagonal's device
+        L = trnsolver.pivoted_cholesky(diag_fn, rows, 5, **kw)
+    assert not _host_warnings(caught)
+    assert seen and set(seen) == {"cpu"}  # host int64 indices (#117)
     assert L.dtype == torch.float64 and L.device.type == dispatch._NEURON_DEVICE
     torch.testing.assert_close(L, want, rtol=1e-12, atol=1e-12)
-    assert not tr.to_host  # no guarded op involved
 
 
 def test_fp64_on_device_lowrank_preconditioner_applies_on_host(monkeypatch):
@@ -960,9 +965,21 @@ def test_fp64_on_device_lowrank_preconditioner_applies_on_host(monkeypatch):
         warnings.simplefilter("always")
         assert trnsolver.PivotedLowRankPreconditioner(L, 0.5).apply == "host64"
         assert trnsolver.PivotedLowRankPreconditioner(L, 0.5).apply == "host64"
+        # "projected" (#117) is an on-device apply too: host64 for float64 L.
+        M = trnsolver.PivotedLowRankPreconditioner(L, 0.5, apply="projected")
+        assert M.apply == "host64"
+        assert trnsolver.PivotedLowRankPreconditioner(L, 0.5, apply="native").apply == "native"
     assert len(_host_warnings(caught)) == 1
+    with monkeypatch.context() as m:
+        m.setattr(dispatch, "_backend", "pytorch")
+        want = trnsolver.PivotedLowRankPreconditioner(L, 0.5, apply="host64")
+    V = torch.randn(12, 2, dtype=torch.float64)
+    torch.testing.assert_close(M(V), want(V), rtol=1e-12, atol=1e-12)
+    L32 = L.float()
+    assert trnsolver.PivotedLowRankPreconditioner(L32, 0.5, apply="projected").apply == "projected"
     monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", True)
     assert trnsolver.PivotedLowRankPreconditioner(L, 0.5).apply == "native"
+    assert trnsolver.PivotedLowRankPreconditioner(L, 0.5, apply="projected").apply == "projected"
     monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", False)
     for backend in ("nki", "pytorch"):
         monkeypatch.setattr(dispatch, "_backend", backend)
@@ -1050,6 +1067,21 @@ def test_fp64_on_device_require_nki_block_routes(monkeypatch):
         ),
         "PivotedLowRankPreconditioner": lambda: trnsolver.PivotedLowRankPreconditioner(L, 0.5),
     }
+    batched = {
+        "pivoted_cholesky": lambda: trnsolver.pivoted_cholesky(
+            lambda: torch.diagonal(K).clone(),
+            lambda idx: K[idx],
+            3,
+            block=2,
+            sub_fn=lambda idx: K[idx][:, idx],
+        ),
+        "PivotedLowRankPreconditioner": lambda: trnsolver.PivotedLowRankPreconditioner(
+            L, 0.5, apply="projected"
+        ),
+    }
+    for name, call in batched.items():
+        with pytest.raises(NotImplementedError, match=f"trnsolver {name}: .*TRNSOLVER_REQUIRE"):
+            call()
     for name, call in cases.items():
         with pytest.raises(NotImplementedError, match=f"trnsolver {name}: .*TRNSOLVER_REQUIRE"):
             call()

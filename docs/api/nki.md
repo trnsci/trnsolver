@@ -47,10 +47,10 @@ the Householder path and `eigh_generalized` through it, `eigh_randomized`,
   `block_jacobi_preconditioner` and `ssor_preconditioner` constructors take
   the same host path: built from device-resident float64 `A`, they return a
   closure that computes on the host and returns `z` on `r`'s device. Block
-  CG follows the same rule: `cg_block` is guarded, `pivoted_cholesky` factors
-  a device-resident float64 diagonal on the host (L returns to the device),
-  and `PivotedLowRankPreconditioner(apply="auto")` applies a float64 L that
-  is on the device as `"host64"`. To keep device aten (fp32 precision, no
+  CG follows the same rule: `cg_block` is guarded, `pivoted_cholesky` builds
+  in float64 on the host for every input (L returns to the diagonal's
+  device), and `PivotedLowRankPreconditioner(apply="auto"` or
+  `"projected")` applies a float64 L that is on the device as `"host64"`. To keep device aten (fp32 precision, no
   host round trip), pass float32, or set `TRNSOLVER_FP64_ON_DEVICE=1`.
   Backends `"nki"` and `"pytorch"` are not affected. Under
   `TRNSOLVER_REQUIRE_NKI=1` (backends `"auto"` and `"nki"`), a float64 /
