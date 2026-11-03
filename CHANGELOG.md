@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Eager NKI kernel calls skip the per-call handle rebuild and the custom-op
+  layer (same fix as trnblas#92).** On the native path a `trnsolver::`
+  custom-op call cost about 0.1 ms of host time before the kernel was queued,
+  against 0.016 ms for aten. Most of it went to nki's `Kernel.__call__`,
+  which rebuilds the torch handle on every call, plus the `torch.library`
+  layer. `dispatch._launch` now calls a `torch_neuronx.wrap_nki` handle built
+  once per kernel; `static=` arguments (the Jacobi `onezero`) get the op
+  body's `int()`. On trn2 (LNC=2), a `matvec` launch drops from 0.121 to
+  0.032 ms of issue time (e2e 0.203 to 0.130 ms) and a 128x128x32 `matmul`
+  from 0.123 to 0.032 ms (e2e 0.196 to 0.117 ms). `eigh` itself is host-bound
+  and gains less: n=32 on the Householder kernels 86.7 to 76.1 ms, a 4x32x32
+  Jacobi batch 6.10 to 5.95 ms. Results are bit-identical. `torch.compile`,
+  requires-grad, int64 and tensor-subclass inputs keep the custom op, as
+  does the folded `occupied_subspace` pass (`subspace_step`) for now.
+  `TRNSOLVER_NKI_EAGER_HANDLE=0` turns this off;
+  `scripts/bench_eager_handle.py` measures it.
+
 ### Added
 
 - **`pivoted_cholesky(..., block=, sub_fn=, relax=)`: block row requests
@@ -242,6 +261,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cg` dropped the imaginary part of complex input (#100).** Its inner
+  products were `float(u.dot(v))`: unconjugated, and cast to real, so a
+  complex Hermitian positive definite system iterated on the wrong
+  quantities and returned a wrong `x` (or ran to `maxiter`) with only a
+  UserWarning. A complex `A` with a real `b` also lost `A`'s imaginary
+  part. `cg` now uses conjugated inner products `r^H z`, `p^H A p`
+  (accumulated in complex128 / float64) and promotes a real `b` to complex
+  for a complex `A`. Real input is unchanged. Affected: every release
+  through 0.21.0.
+- **`eigh(method="jacobi")` raised on complex and 0×0 input; `solve_spd`
+  raised on a batch of vector right-hand sides (#79).** Jacobi is real-only:
+  complex Hermitian input (`NotImplementedError: "ge_cpu"`) now takes the
+  default `eigh` path, as `torch.linalg.eigh` does. An n = 0 input (any
+  batch) returns empty `w`, `V` instead of failing to reshape. `solve_spd`
+  now reads B (*, n) with `B.shape == A.shape[:-1]` as a batch of vectors,
+  following `torch.linalg.solve`, where it raised before. The one shape that
+  already worked, last batch dim of A equal to n, keeps its old (*, n, k)
+  reading. Affected: `eigh(method="jacobi")` 0.17.0 through 0.21.0;
+  `solve_spd` every release through 0.21.0.
 - **`cg` gave a wrong gradient with respect to `A`; `schur` detached
   silently; `gmres` backward raised (#76).** `cg` read its step sizes as
   Python floats, so autograd differentiated a fixed polynomial in `A`
