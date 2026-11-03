@@ -328,6 +328,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at that size. The J values are bit-identical to the device-gather path
   (CPU test).
 
+### Changed
+
+- **`bench_scf_ladder.py --dry-run` uses the window-4 Trn2 measurements (trnsci/trnsci#115).**
+  - The build is scaled by npair · naux² (the triangular solve), from 1215 s on 2 pinned host threads at n_ao 1658. Before, it was npair · naux from the Mac's 12 threads, about 10× low on the box.
+  - A streamed layout keeps the per-core budget less three chunks of headroom resident, about 60 GB per chip, not 80. That matches #109's `default_resident_bytes`.
+  - DF-MP2 is costed at the measured 5.8e13 multiply-adds/s per chip.
+  - At water61 / aug-cc-pVDZ the planner now gives 47 GB/it streamed (measured 49.7), 4.5 s/it (measured ≈ 6), MP2 71 s (measured 69) and a 6290 s build (10051 s measured, sharing the CPUs).
+
 ### Fixed
 
 - **`run_scf` releases its device integrals before it returns (trnsci/trnsci#115).**
