@@ -154,6 +154,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Host float64 J/K over an fp32 store no longer raises at n_ao ≳ 2050 (trnsci/trnsci#115).**
+  The canonical Fock in `scf_df_mp2.py` streams the fp32 store in float64 on the host.
+  The store's 128-column chunks double to more than 2 GiB there, so `DFJK` re-split B
+  under the device's 2 GiB bound. At n_ao 2522 not even 128 float64 columns fit, and
+  `aux_chunk_width` raised. On the host the store's own chunks are now used as they
+  are, since that bound applies only to the device matmul.
+
 - **`cg` dropped the imaginary part of complex input (#100).** Its inner
   products were `float(u.dot(v))`: unconjugated, and cast to real, so a
   complex Hermitian positive definite system iterated on the wrong
