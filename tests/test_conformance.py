@@ -534,13 +534,6 @@ def _expect_raise_or(fn):
 
 # ---------------------------------------------------------------- axis 1: dtype x op
 
-for _dt in ("complex64", "complex128"):
-    KNOWN[f"eigh_jacobi-{_dt}"] = pytest.mark.xfail(
-        strict=False,
-        raises=NotImplementedError,
-        reason="trnsci/trnsolver#79 (loud): eigh(method='jacobi') rejects complex input",
-    )
-
 
 @pytest.mark.parametrize(
     "op,dt",
@@ -683,11 +676,6 @@ EDGE += [
     ("solve_spd_mat-Bnx1", "solve_spd_mat", (spd(5), rand(5, 1))),
     ("eigh-n128", "eigh", (herm(128),)),
 ]
-KNOWN["eigh_jacobi-0x0"] = pytest.mark.xfail(
-    strict=False,
-    raises=RuntimeError,
-    reason="trnsci/trnsolver#79 (loud): eigh(method='jacobi') cannot reshape a 0x0 input",
-)
 
 
 def _eigh_n129_mark():
@@ -1344,11 +1332,14 @@ for _op in OPS:
     BATCH_IDS.append(
         (f"{_op}-batch{N}", _op, (N,))
     )  # batch == n: a .T over all dims keeps the shape
-KNOWN["solve_spd_vec-batch2x3"] = pytest.mark.xfail(
-    strict=False, reason="trnsci/trnsolver#79 (loud): solve_spd rejects a batch of vectors B (*, n)"
+# Batch == n: B (n, n) also reads as one shared (n, k) right-hand side, which
+# solve_spd has always done; switching to torch's batch-of-vectors reading
+# would change those callers' results (trnsci/trnsolver#79, needs-decision).
+KNOWN[f"solve_spd_vec-batch{N}"] = pytest.mark.xfail(
+    strict=True,
+    reason="trnsci/trnsolver#79 (needs-decision): solve_spd reads B (n, n) with batch == n "
+    "as a shared (n, k) right-hand side, not a batch of vectors",
 )
-KNOWN["solve_spd_vec-batch1"] = KNOWN["solve_spd_vec-batch2x3"]
-KNOWN[f"solve_spd_vec-batch{N}"] = KNOWN["solve_spd_vec-batch2x3"]
 
 
 @pytest.mark.parametrize("op,batch", [P(i, op, b) for i, op, b in BATCH_IDS])
@@ -1388,7 +1379,6 @@ BCAST = [
         (torch.zeros(0, N, N, dtype=F64),),
     ),
 ]
-KNOWN["solve_spd-A3d-Bbatchvec"] = KNOWN["solve_spd_vec-batch2x3"]
 
 
 @pytest.mark.parametrize("f,ref,inputs", [P(c[0], *c[1:]) for c in BCAST])
