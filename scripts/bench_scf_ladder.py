@@ -17,8 +17,8 @@ memory each stage needs, and what that means for a Trn2 window:
     cores / chips   logical NeuronCores (LNC=2, 24 GiB each, 20 GB usable
                     for resident chunks) to hold B resident; chips = cores / 4
     plan            trn2.3xlarge (1 chip, 96 GB HBM, ~124 GB host RAM)
-                    resident, or streamed: per core the 20 GB budget less two
-                    in-flight chunks (~66 GB per chip), the rest uploaded
+                    resident, or streamed: per core the 20 GB budget less three
+                    chunks of headroom (~60 GB per chip), the rest uploaded
                     every iteration from host RAM (or NVMe once B exceeds
                     host RAM); else trn2.48xlarge (16 chips) resident
     B_ia fp32       the DF-MP2 three-index MO tensor (nocc x nvir x naux)
@@ -144,9 +144,10 @@ def estimate(row: dict, host_threads: int = 2, iters: int = 25) -> dict:
     e["mp2_s_1chip"] = nocc * nocc * nvir * nvir * naux / _A_MP2_MACS_PER_S_CHIP
     chip_resident = CORES_PER_CHIP * CORE_RESIDENT_GB
     if e["B32_GB"] > chip_resident:
-        # Streaming: each core keeps two chunks in flight within its budget.
+        # Streaming: each core keeps (prefetch + 2) = 3 chunks of headroom
+        # within its budget (scf_df_rhf.default_resident_bytes).
         w = df_store.chunk_width(npair, naux, 4, df_store.DEFAULT_CHUNK_BYTES)
-        chip_resident = CORES_PER_CHIP * max(0.0, CORE_RESIDENT_GB - 2 * npair * w * 4 / 1e9)
+        chip_resident = CORES_PER_CHIP * max(0.0, CORE_RESIDENT_GB - 3 * npair * w * 4 / 1e9)
     streamed = max(0.0, e["B32_GB"] - chip_resident)
     ram = HOST_RAM_GB["trn2.3xlarge"] - 8  # leave room for the process
     e["stream_src"] = "" if streamed == 0 else ("host RAM" if e["B32_GB"] <= ram else "NVMe")
