@@ -23,6 +23,7 @@ trnsolver/
 │   ├── factor.py            # cholesky, lu, qr, solve, solve_spd, inv_sqrt_spd
 │   ├── orthogonalize.py     # orthogonalizer(S): symmetric / canonical / pivoted Cholesky
 │   ├── iterative.py         # cg, gmres
+│   ├── block.py             # cg_block(_ir), pivoted low-rank preconditioner, SLQ
 │   └── nki/
 │       ├── __init__.py
 │       ├── dispatch.py      # NKI kernels, launch helper, dispatch-path selection
