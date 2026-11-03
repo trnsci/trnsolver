@@ -637,6 +637,8 @@ def test_minao_guess_converges_faster_than_core():
     assert minao.iterations < core.iterations
     with pytest.raises(ValueError, match="pyscf"):
         scf.run_scf(scf.h2_lattice(2), guess="minao")
+
+
 def test_host_float64_stream_over_fp32_store_chunks(tmp_path):
     """A float64 host pass (the canonical Fock) over an fp32 store whose
     chunks double past chunk_bytes uses the store's chunks. The re-split
