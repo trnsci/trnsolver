@@ -368,20 +368,38 @@ class PivotedLowRankPreconditioner:
     By the low-rank-plus-diagonal inverse identity,
     (L Lᵀ + s I)⁻¹ V = (1/s) (V − L (s I_k + Lᵀ L)⁻¹ Lᵀ V)
     = (1/s) (V − W (Wᵀ V)) with W = L C⁻ᵀ, C Cᵀ = s I_k + Lᵀ L.
-    The k × k Cholesky factor C and W are built once, in float64 on the host,
-    then W is stored in L's dtype on L's device, so each application is two
-    (n × k) GEMMs.
+    The k × k Cholesky factor C and W are built once, in float64 on the host;
+    each application is two (n × k) GEMMs.
+
+    Precision. W Wᵀ has eigenvalues λ/(λ + s), within s/λ of 1 along the
+    directions L captures, so V − W (Wᵀ V) cancels: in fp32 the result errs
+    by about u·√k/s against a true value of about 1/λ, i.e. the applied
+    operator is wrong by a factor up to u·√k·λ/s along those directions.
+    For a GP with noise s = 1e-3 that breaks preconditioned CG outright
+    (no convergence in 150 iterations where fp64 needs 20). ``apply`` picks:
+
+    - ``"host64"``: apply in float64 on the host and return V's dtype and
+      device (one (n, R) round trip per application);
+    - ``"native"``: W in L's dtype on L's device (fast; accurate only while
+      u·√k·λ_max/s ≪ 1, e.g. float64 L);
+    - ``"auto"`` (default): ``"native"`` for float64 L, else ``"host64"``.
 
     Attributes:
         L: (n, k) low-rank factor.
         shift: s > 0.
-        W: (n, k) whitened factor L C⁻ᵀ.
+        W: (n, k) whitened factor L C⁻ᵀ (float64 host for ``"host64"``).
+        apply: the resolved mode.
     """
 
-    def __init__(self, L: torch.Tensor, shift: float):
+    def __init__(self, L: torch.Tensor, shift: float, *, apply: str = "auto"):
         shift = float(shift)
         if not shift > 0:
             raise ValueError(f"PivotedLowRankPreconditioner: shift must be > 0, got {shift}")
+        if apply not in ("auto", "host64", "native"):
+            raise ValueError(f"apply must be 'auto', 'host64' or 'native', got {apply!r}")
+        if apply == "auto":
+            apply = "native" if L.dtype == torch.float64 else "host64"
+        self.apply = apply
         self.L = L
         self.shift = shift
         L64 = L.to(device=_HOST, dtype=torch.float64)
@@ -389,9 +407,13 @@ class PivotedLowRankPreconditioner:
         C = torch.linalg.cholesky(shift * torch.eye(k, dtype=torch.float64) + L64.T @ L64)
         self._C = C
         W = torch.linalg.solve_triangular(C, L64.T, upper=False).T
-        self.W = W.to(device=L.device, dtype=L.dtype)
+        self.W = W if apply == "host64" else W.to(device=L.device, dtype=L.dtype)
 
     def __call__(self, V: torch.Tensor) -> torch.Tensor:
+        if self.apply == "host64":
+            V64 = V.detach().to(device=_HOST, dtype=torch.float64)
+            out = (V64 - self.W @ (self.W.T @ V64)) / self.shift
+            return out.to(device=V.device, dtype=V.dtype)
         W = self.W if V.dtype == self.W.dtype else self.W.to(V.dtype)
         return (V - W @ (W.T @ V)) / self.shift
 
@@ -423,6 +445,7 @@ def pivoted_lowrank_preconditioner(
     shift: float,
     *,
     tol: float = 0.0,
+    apply: str = "auto",
 ) -> PivotedLowRankPreconditioner:
     """Preconditioner (L Lᵀ + shift·I)⁻¹ for K + shift·I, L from ``pivoted_cholesky``.
 
@@ -433,7 +456,7 @@ def pivoted_lowrank_preconditioner(
     ``sample()`` serve preconditioned ``slq_logdet``.
     """
     L = pivoted_cholesky(diag_fn, rows_fn, rank, tol=tol)
-    return PivotedLowRankPreconditioner(L, shift)
+    return PivotedLowRankPreconditioner(L, shift, apply=apply)
 
 
 def lanczos_tridiag_from_cg(

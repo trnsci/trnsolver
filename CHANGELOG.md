@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (n = 2000), fp32 recurrence residuals of 1e-4 had true residuals of
     0.05–0.5.
   - `return_coeffs=True` adds per-column α, β histories and r₀ᵀ M r₀.
+- **`PivotedLowRankPreconditioner(..., apply="auto")` applies in float64 on
+  the host for a non-float64 L.** The Woodbury form V − W (Wᵀ V) cancels
+  (W Wᵀ is within s/λ of the identity on the captured subspace), so in fp32
+  the applied operator is wrong by up to u·√k·λ/s there. On a GP with
+  noise 1e-3 (n = 2×10⁴, rank 1024) fp32 preconditioned CG did not
+  converge in 150 iterations; with the host-float64 apply it converges in
+  30, against 20 in full float64. `apply="native"` keeps the old
+  on-device path.
 - **`cg_block_ir`:** fp32 inner `cg_block` inside a float64 host refinement
   loop, the same shape as `gmres_ir`. Returns a float64 host X and
   per-outer-step true residuals. With the pivoted preconditioner it reaches

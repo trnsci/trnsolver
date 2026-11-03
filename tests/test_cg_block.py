@@ -250,6 +250,29 @@ class TestPivotedCholesky:
         assert bool(prec["converged"].all())
         assert prec["iterations"] * 4 < plain["iterations"]
 
+    def test_fp32_apply_is_host64_and_converges(self):
+        """fp32 L: the default applies in float64 on the host (the fp32 Woodbury
+        form cancels; with a near-complete low-rank factor it breaks CG)."""
+        n, noise = 1500, 1e-3
+        K, A = _rbf(n, noise=noise, dtype=torch.float32)
+        K64 = K.double()
+        L = trnsolver.pivoted_cholesky(lambda: torch.diagonal(K64).clone(), lambda i: K64[i], 400)
+        P = trnsolver.PivotedLowRankPreconditioner(L.float(), noise)
+        assert P.apply == "host64"
+        V = torch.randn(n, 3)
+        dense = L @ L.T + noise * torch.eye(n, dtype=torch.float64)
+        ref = torch.linalg.solve(dense, V.double())
+        out = P(V)
+        assert out.dtype == torch.float32
+        assert float((out.double() - ref).norm() / ref.norm()) < 1e-6
+        B = torch.randn(n, 2)
+        _, good = trnsolver.cg_block(A, B, P, tol=1e-5, maxiter=300)
+        assert bool(good["converged"].all())
+        native = trnsolver.PivotedLowRankPreconditioner(L.float(), noise, apply="native")
+        assert native.apply == "native"
+        with pytest.raises(ValueError):
+            trnsolver.PivotedLowRankPreconditioner(L, noise, apply="fp16")
+
 
 class TestCGBlockIR:
     def test_reaches_1e10_with_fp32_inner(self):
