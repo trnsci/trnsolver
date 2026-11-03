@@ -106,6 +106,7 @@ def canonical_orbitals(
     P = 2.0 * C @ C.T
     jk = _aux_stream(system, device, dtype, devices)
     J, K = jk.jk(P.to(dtype).to(jk.device), C.to(dtype).to(jk.device))
+    jk.close()
     F = system.H + J.double().cpu() - 0.5 * K.double().cpu()
     e_hf = float(0.5 * (P * (system.H + F)).sum()) + system.e_nuc
     X = trnsolver.orthogonalizer(system.S, orth, lindep).X

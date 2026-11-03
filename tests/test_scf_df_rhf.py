@@ -575,6 +575,28 @@ def test_streamed_scf_from_store(tmp_path):
     assert abs(scf.energy_at_orbitals(disk32, r32.C_occ) - base.energy) < 1e-6
 
 
+def test_run_scf_releases_device_integrals(monkeypatch, tmp_path):
+    """run_scf frees its DFJK's integral copies before returning. A second
+    run_scf (the ladder's warm-up, then the timed run) must not hold two
+    copies of B on the device at once (NRT_RESOURCE at n_ao 2522, #115)."""
+    _need_aux_stream()
+    closed = []
+    real = scf.DFJK.close
+
+    def spy(self):
+        stream = self.stream
+        real(self)
+        closed.append(stream is None or not stream._resident)
+
+    monkeypatch.setattr(scf.DFJK, "close", spy)
+    mem = scf.h2_lattice(4)
+    r1 = scf.run_scf(mem, dtype=torch.float64, jk_stream=True, jk_resident_gb=1e3)
+    r2 = scf.run_scf(mem, dtype=torch.float64)
+    assert closed == [True, True]
+    assert r1.info["stream"]["resident"] > 0 and r2.info["stream"] is None
+    assert r1.energy == pytest.approx(r2.energy, abs=1e-10)
+
+
 def test_stream_off_for_in_memory_by_default():
     system = scf.h2_lattice(2)
     assert scf.DFJK(system.B, system.nao).stream is None

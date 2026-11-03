@@ -790,6 +790,15 @@ class DFJK:
         self.blocks = []
         self.k_block = max(self.stream.widths)
 
+    def close(self) -> None:
+        """Release the device copies of the integrals (resident chunks or
+        blocks) and the stream's loader threads. The object is unusable after."""
+        if self.stream is not None:
+            self.stream.close()
+        self.blocks = []
+        self.squares = None
+        self.B3 = None
+
     def _stream_pw(self, P: torch.Tensor) -> torch.Tensor:
         """Weighted packed density for the stream (on the host with ``host_pack``)."""
         if self.host_pack:
@@ -1390,6 +1399,25 @@ def run_scf(
     if solver == "purify":
         # Orbital energies of the final Fock matrix: one eigh after the loop.
         eps, _ = solve(F_use)
+    jk_info = {
+        "k_block": jk.k_block,
+        "host_pack": jk.host_pack,
+        "stream": None
+        if jk.stream is None
+        else {
+            "chunks": len(jk.stream.widths),
+            "width": jk.k_block,
+            "resident": jk.stream.stats.chunks_resident,
+            "iters": stream_iters,
+        },
+    }
+    # Free the device copies of the integrals now. Left to the garbage
+    # collector, they were still held when a second run_scf on the same system
+    # uploaded its own. That is the ladder's warm-up then timed run, and at
+    # n_ao 2522 / cc-pVTZ over 4 cores (19.2 GB per core) the second upload hit
+    # NRT_RESOURCE (trnsci/trnsci#115).
+    jk.close()
+    del jk
 
     return SCFResult(
         energy=energies[-1],
@@ -1403,16 +1431,7 @@ def run_scf(
         C_occ=C_occ.detach().to("cpu", torch.float64),
         eps=eps.detach().to("cpu", torch.float64),
         info={
-            "k_block": jk.k_block,
-            "host_pack": jk.host_pack,
-            "stream": None
-            if jk.stream is None
-            else {
-                "chunks": len(jk.stream.widths),
-                "width": jk.k_block,
-                "resident": jk.stream.stats.chunks_resident,
-                "iters": stream_iters,
-            },
+            **jk_info,
             "conv": conv,
             "e_noise": e_noise,
             "d_noise": d_noise,

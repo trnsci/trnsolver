@@ -154,6 +154,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`run_scf` releases its device integrals before it returns (trnsci/trnsci#115).**
+  The DFJK's resident chunks (or blocks) were left for the garbage collector.
+  A second `run_scf` on the same system, such as the ladder's `--warmup-iters` run
+  followed by the timed run, then uploaded a second copy of B while the first was
+  still held. At alkane43 / cc-pVTZ over 4 cores (19.2 GB per core), the second
+  upload failed with NRT_RESOURCE. The new `DFJK.close()` is called at the end of
+  `run_scf` and after the canonical Fock build in `scf_df_mp2.py`.
+
 - **`cg` dropped the imaginary part of complex input (#100).** Its inner
   products were `float(u.dot(v))`: unconjugated, and cast to real, so a
   complex Hermitian positive definite system iterated on the wrong
