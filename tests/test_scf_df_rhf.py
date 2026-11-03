@@ -575,6 +575,37 @@ def test_streamed_scf_from_store(tmp_path):
     assert abs(scf.energy_at_orbitals(disk32, r32.C_occ) - base.energy) < 1e-6
 
 
+def test_guess_orbitals_and_restart():
+    """A given (n, nocc) guess is S-orthonormalised and used in place of the
+    core guess: restarting from a converged C_occ converges at once."""
+    system = scf.h2_lattice(4)
+    base = scf.run_scf(system, dtype=torch.float64)
+    again = scf.run_scf(
+        system, dtype=torch.float64, guess=3.0 * base.C_occ
+    )  # scaled: re-orthonormalised
+    assert again.converged and again.iterations <= 2
+    assert again.energy == pytest.approx(base.energy, abs=1e-10)
+    with pytest.raises(ValueError, match="guess"):
+        scf.run_scf(system, guess="huckel")
+    with pytest.raises(ValueError, match="guess orbitals"):
+        scf.run_scf(system, guess=base.C_occ[:, :1])
+    # Natural orbitals of an idempotent density give back its occupied space.
+    X = trnsolver.orthogonalizer(system.S, "symmetric", 1e-7).X
+    C = scf.guess_orbitals(base.P, system.S, X, system.nocc)
+    torch.testing.assert_close(2 * C @ C.T, base.P, atol=1e-8, rtol=0)
+
+
+def test_minao_guess_converges_faster_than_core():
+    pytest.importorskip("pyscf")
+    system = scf.pyscf_system("alkane6", "cc-pvdz", "cc-pvdz-jkfit", reference=False)
+    core = scf.run_scf(system, dtype=torch.float64)
+    minao = scf.run_scf(system, dtype=torch.float64, guess="minao")
+    assert minao.converged and minao.energy == pytest.approx(core.energy, abs=1e-8)
+    assert minao.iterations < core.iterations
+    with pytest.raises(ValueError, match="pyscf"):
+        scf.run_scf(scf.h2_lattice(2), guess="minao")
+
+
 def test_stream_off_for_in_memory_by_default():
     system = scf.h2_lattice(2)
     assert scf.DFJK(system.B, system.nao).stream is None

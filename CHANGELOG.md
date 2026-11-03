@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`run_scf(guess=...)`: a minao initial guess, or given occupied orbitals (trnsci/trnsci#115).**
+  - `"core"` is the default and keeps the old behaviour.
+  - `"minao"` takes PySCF's superposed atomic densities (`minao_density`) as natural orbitals in the kept orthonormal basis (`guess_orbitals`).
+  - An `(n, nocc)` tensor is S-orthonormalised and used directly, for example to restart.
+  - Why: from the core guess, fp32 DIIS did not converge for alkane69 / cc-pVDZ (n_ao 1666) in 40 iterations, on either `subspace` or `orth`, with the energy wandering between -1900 and +9500 Eh. J and K matched the CPU to 5e-6 relative. From minao it converged in 6 iterations.
+  - `bench_scf_ladder.py` now defaults to `--guess minao`. `scf_df_rhf.py` and `scf_df_mp2.py` take `--guess`.
+
 - **`scripts/bench_scf_ladder.py`: a DF-RHF + DF-MP2 size ladder (#15).**
   - **Systems.** Linear alkanes C_k H_{2k+2} and k-water clusters, both
     synthetic geometries, in cc-pVDZ, aug-cc-pVDZ and cc-pVTZ with

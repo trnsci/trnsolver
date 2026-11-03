@@ -80,6 +80,7 @@ def test_run_one_small_system_against_pyscf(tmp_path):
         jk_devices=None,
         solver="auto",
         max_iter=60,
+        guess="minao",
         warmup_iters=0,
         mp2_fp32=False,
         store_dtype="auto",

@@ -315,6 +315,7 @@ def main():
     ap.add_argument("--bia-path", default=None, help="memmap B_ia^P here (.npy)")
     ap.add_argument("--reference", action="store_true", help="PySCF DF-RHF + DF-MP2")
     ap.add_argument("--max-iter", type=int, default=60)
+    ap.add_argument("--guess", default="core", choices=("core", "minao"))
     args = ap.parse_args()
     if args.device.startswith("neuron"):
         import torch_neuronx  # noqa: F401
@@ -326,6 +327,7 @@ def main():
     print(f"{system.name}: n_ao={system.nao} naux={system.naux} nocc={system.nocc}")
     res = scf.run_scf(
         system,
+        guess=args.guess,
         device=args.device,
         dtype=dtype,
         orth=args.orth,
