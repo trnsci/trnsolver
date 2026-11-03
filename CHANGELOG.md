@@ -28,6 +28,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`cg_block`: block CG for many right-hand sides on matrix-free operators (#97).**
+  - R independent preconditioned CG recurrences, one per column of an (n, R)
+    B, driven by ONE operator call A(P) on the whole block per iteration.
+    The GP exemplar (trnsci/trnsci#109) gets the posterior-mean solve and
+    every log-det probe solve from the same applications.
+  - Converged columns freeze through `torch.where` masks (α = β = 0) and the
+    block keeps its shape. Zero columns return zero, converged at
+    iteration 0.
+  - The host reads the convergence state only every `check_every`
+    iterations. That changes when the loop stops, never the solution.
+  - `info` has per-column iterations, the converged and breakdown masks,
+    the recurrence residual, and a true residual ‖B − A X‖ / ‖B‖ from one
+    extra call at the end. Report both: on an RBF kernel + 1e-4 I
+    (n = 2000), fp32 recurrence residuals of 1e-4 had true residuals of
+    0.05–0.5.
+  - `return_coeffs=True` adds per-column α, β histories and r₀ᵀ M r₀.
+- **`PivotedLowRankPreconditioner(..., apply="auto")` applies in float64 on
+  the host for a non-float64 L.** The Woodbury form V − W (Wᵀ V) cancels
+  (W Wᵀ is within s/λ of the identity on the captured subspace), so in fp32
+  the applied operator is wrong by up to u·√k·λ/s there. On a GP with
+  noise 1e-3 (n = 2×10⁴, rank 1024) fp32 preconditioned CG did not
+  converge in 150 iterations; with the host-float64 apply it converges in
+  30, against 20 in full float64. `apply="native"` keeps the old
+  on-device path.
+- **`cg_block_ir`:** fp32 inner `cg_block` inside a float64 host refinement
+  loop, the same shape as `gmres_ir`. Returns a float64 host X and
+  per-outer-step true residuals. With the pivoted preconditioner it reaches
+  1e-10 relative residual on that matrix where fp32 alone stalls.
+- **`pivoted_cholesky(diag_fn, rows_fn, rank)` and
+  `pivoted_lowrank_preconditioner(diag_fn, rows_fn, rank, shift)`:** rank-k
+  greedy pivoted Cholesky from the diagonal plus one row of K per step. The
+  preconditioner applies (L Lᵀ + shift I)⁻¹ as two (n × k) GEMMs, through
+  the low-rank-plus-diagonal inverse identity (k × k factor built once, in
+  float64 on the host). It also has `logdet()` (matrix determinant lemma)
+  and `sample()` (probes from N(0, L Lᵀ + shift I)). On the RBF matrices
+  above, rank 100 cuts CG iterations by about 10×.
+- **`lanczos_tridiag_from_cg` and `slq_logdet`:** Lanczos tridiagonals from
+  CG coefficients, and stochastic Lanczos quadrature for log det(A) over one
+  `cg_block` of probes. Probes are Rademacher, or N(0, P) when preconditioned
+  (log det P is then exact and only the remainder is estimated). Within 4
+  standard errors of `torch.linalg.slogdet` at n = 1024 with 64 probes.
+
 - **`scripts/bench_scf_ladder.py`: a DF-RHF + DF-MP2 size ladder (#15).**
   - **Systems.** Linear alkanes C_k H_{2k+2} and k-water clusters, both
     synthetic geometries, in cc-pVDZ, aug-cc-pVDZ and cc-pVTZ with
