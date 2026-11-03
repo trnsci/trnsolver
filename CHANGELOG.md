@@ -52,7 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     **`TRNSOLVER_FP64_ON_DEVICE=1` keeps device aten (fp32 precision)** for
     callers who prefer speed. Host-resident float64, backends `nki` /
     `pytorch` and `TRNSOLVER_REQUIRE_NKI=1` are unchanged. One decorator
-    (`nki.dispatch._fp64_host_guard`) holds the rule.
+    (`nki.dispatch._fp64_host_guard`) holds the rule; the preconditioner
+    constructors (`jacobi_` / `block_jacobi_` / `ssor_preconditioner`), which
+    return closures, use `_fp64_host_preconditioner`: the closure computes on
+    the host and returns `z` on `r`'s device.
   The library has no complex kernels; complex input keeps its aten / torch
   routes (#65). Paths where an FP32 input would not run a kernel either (the
   aten cutover, the XLA lineage for Jacobi) are unchanged.

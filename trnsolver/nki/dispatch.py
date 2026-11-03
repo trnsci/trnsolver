@@ -557,6 +557,50 @@ def _fp64_host_guard(what: str):
     return deco
 
 
+def _fp64_host_preconditioner(what: str):
+    """Decorator for a preconditioner constructor (it returns a closure).
+
+    Under the same condition as `_fp64_host_guard`, the constructor runs on
+    host copies of the neuron-resident operands, and the closure it returns
+    computes on the host for every input: a neuron-resident ``r`` is copied to
+    the host and the result goes back to ``r``'s device. Device aten would
+    compute the closure's float64 arithmetic at fp32 precision. Inside `cg` /
+    `gmres` the closure receives device tensors (`_host_callable`) and
+    behaves the same way.
+    """
+
+    def deco(build):
+        @functools.wraps(build)
+        def wrapper(*args, **kwargs):
+            if _fp64_host_device(args, kwargs) is None:
+                return build(*args, **kwargs)
+            _warn_fp64_host_once(what)
+            h_args = [_walk(a, _fp64_to_host) for a in args]
+            h_kwargs = {k: _walk(v, _fp64_to_host) for k, v in kwargs.items()}
+            prev = getattr(_fp64_host_active, "on", False)
+            _fp64_host_active.on = True
+            try:
+                apply = build(*h_args, **h_kwargs)
+            finally:
+                _fp64_host_active.on = prev
+
+            def on_host(r):
+                device = r.device if _on_neuron_device(r) else None
+                prev = getattr(_fp64_host_active, "on", False)
+                _fp64_host_active.on = True
+                try:
+                    z = apply(_fp64_to_host(r))
+                finally:
+                    _fp64_host_active.on = prev
+                return z if device is None else _fp64_to_device(z, device)
+
+            return on_host
+
+        return wrapper
+
+    return deco
+
+
 def _simulate(
     kernel,
     op_name: str,

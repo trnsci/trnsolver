@@ -17,9 +17,10 @@ from collections.abc import Callable
 import torch
 
 from .factor import _mH, _restore, _to_fp32
-from .nki.dispatch import _fp64_host_guard
+from .nki.dispatch import _fp64_host_guard, _fp64_host_preconditioner
 
 
+@_fp64_host_preconditioner("jacobi_preconditioner")
 def jacobi_preconditioner(A: torch.Tensor) -> Callable[[torch.Tensor], torch.Tensor]:
     """Build a Jacobi (diagonal) preconditioner M(r) = r / diag(A).
 
@@ -34,6 +35,7 @@ def jacobi_preconditioner(A: torch.Tensor) -> Callable[[torch.Tensor], torch.Ten
     return lambda r: r * (inv_d if r.dim() == 1 else inv_d.unsqueeze(-1))
 
 
+@_fp64_host_preconditioner("block_jacobi_preconditioner")
 def block_jacobi_preconditioner(
     A: torch.Tensor,
     block_size: int = 16,
@@ -86,6 +88,7 @@ def block_jacobi_preconditioner(
     return apply
 
 
+@_fp64_host_preconditioner("ssor_preconditioner")
 def ssor_preconditioner(
     A: torch.Tensor,
     omega: float = 1.0,

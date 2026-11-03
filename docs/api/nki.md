@@ -43,7 +43,10 @@ the Householder path and `eigh_generalized` through it, `eigh_randomized`,
   first such call: "float64 on the neuron device is computed on the host for
   float64 accuracy (device arithmetic is fp32); pass float32 to stay on
   device". A matvec or preconditioner callable passed to `cg` / `gmres`
-  still receives device tensors. To keep device aten (fp32 precision, no
+  still receives device tensors. The `jacobi_preconditioner`,
+  `block_jacobi_preconditioner` and `ssor_preconditioner` constructors take
+  the same host path: built from device-resident float64 `A`, they return a
+  closure that computes on the host and returns `z` on `r`'s device. To keep device aten (fp32 precision, no
   host round trip), pass float32, or set `TRNSOLVER_FP64_ON_DEVICE=1`.
   Backends `"nki"` and `"pytorch"` and `TRNSOLVER_REQUIRE_NKI=1` are not
   affected.

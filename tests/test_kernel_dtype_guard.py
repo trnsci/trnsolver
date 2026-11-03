@@ -739,6 +739,62 @@ def test_fp64_on_device_auto_computes_on_host(monkeypatch, name, env, fn, dt):
     _assert_matches(out, ref, name)
 
 
+PRECONDITIONERS = [
+    ("jacobi_preconditioner", lambda A: trnsolver.jacobi_preconditioner(A)),
+    ("block_jacobi_preconditioner", lambda A: trnsolver.block_jacobi_preconditioner(A, 4)),
+    ("ssor_preconditioner", lambda A: trnsolver.ssor_preconditioner(A, 1.3)),
+]
+
+
+@pytest.mark.parametrize("name,build", PRECONDITIONERS, ids=[n for n, _ in PRECONDITIONERS])
+def test_fp64_on_device_preconditioner_computes_on_host(monkeypatch, name, build):
+    """A preconditioner built from device-resident float64 under auto: built on
+    host copies, and its closure computes on the host and returns z on r's
+    device (device aten would compute the closure at fp32 precision)."""
+    A, r = _spd(10, torch.float64), torch.arange(1.0, 11.0, dtype=torch.float64)
+    with monkeypatch.context() as m:
+        m.setattr(dispatch, "_backend", "pytorch")
+        want = build(A)(r)
+    _install(monkeypatch, "native", "auto", False)
+    tr = Transfers(monkeypatch)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        M = build(A)
+        zs = [M(r) for _ in range(3)]
+    assert any(t is A for t in tr.to_host), f"{name}: A was not copied to the host"
+    assert sum(t is r for t in tr.to_host) == 3, f"{name}: r was not copied to the host"
+    assert len(tr.to_device) == 3
+    assert len(_host_warnings(caught)) == 1 and name in str(_host_warnings(caught)[0].message)
+    for z in zs:
+        assert z.dtype == torch.float64
+        torch.testing.assert_close(z, want, rtol=1e-12, atol=1e-12)
+
+
+def test_fp64_on_device_preconditioner_inside_cg(monkeypatch):
+    """The host-path closure also works as cg's M (cg hands it device tensors)."""
+    A, b = _spd(10, torch.float64), torch.ones(10, dtype=torch.float64)
+    with monkeypatch.context() as m:
+        m.setattr(dispatch, "_backend", "pytorch")
+        want = trnsolver.cg(A, b, M=trnsolver.ssor_preconditioner(A), tol=1e-12)[0]
+    _install(monkeypatch, "native", "auto", False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        x = trnsolver.cg(A, b, M=trnsolver.ssor_preconditioner(A), tol=1e-12)[0]
+    torch.testing.assert_close(x, want, rtol=1e-10, atol=1e-12)
+
+
+def test_fp64_preconditioner_unchanged_off_the_host_path(monkeypatch):
+    """Host-resident float64, fp32 on the device and the pytorch backend keep
+    the plain closure (no copies, no warning)."""
+    _install(monkeypatch, "native", "auto", False)
+    tr = Transfers(monkeypatch)
+    A32 = _spd(10, torch.float32)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        trnsolver.ssor_preconditioner(A32)(torch.ones(10))
+    assert tr.to_host == [] and _host_warnings(caught) == []
+
+
 def test_fp64_on_device_returns_results_to_the_operand_device(monkeypatch):
     """Each result tensor goes back to the operands' device; the subspace
     state's host fields (theta, residual) stay on the host."""
