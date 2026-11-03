@@ -223,6 +223,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`bench_scf_ladder.py --dry-run` uses the window-4 Trn2 measurements (trnsci/trnsci#115).**
+  - The build is scaled by npair · naux² (the triangular solve), from 1215 s on 2 pinned host threads at n_ao 1658. Before, it was npair · naux from the Mac's 12 threads, about 10× low on the box.
+  - A streamed layout keeps the per-core budget less three chunks of headroom resident, about 60 GB per chip, not 80. That matches #109's `default_resident_bytes`.
+  - DF-MP2 is costed at the measured 5.8e13 multiply-adds/s per chip.
+  - At water61 / aug-cc-pVDZ the planner now gives 54 GB/it streamed (measured 49.7 under the earlier two-chunk rule), 4.9 s/it (measured ≈ 6), MP2 71 s (measured 69) and a 6290 s build (10051 s measured, sharing the CPUs).
+
 - **float64 policy for the NKI kernels (#89, trnsci/trnsci#35; the same rule
   across the trnsci suite).** Every trnsolver kernel computes in FP32, and
   Trainium computes float64 at FP32 precision on device. Where an FP32
@@ -327,14 +333,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when npair > `HOST_PACK_NPAIR` = 1e6: an 11 MB copy each way per iteration
   at that size. The J values are bit-identical to the device-gather path
   (CPU test).
-
-### Changed
-
-- **`bench_scf_ladder.py --dry-run` uses the window-4 Trn2 measurements (trnsci/trnsci#115).**
-  - The build is scaled by npair · naux² (the triangular solve), from 1215 s on 2 pinned host threads at n_ao 1658. Before, it was npair · naux from the Mac's 12 threads, about 10× low on the box.
-  - A streamed layout keeps the per-core budget less three chunks of headroom resident, about 60 GB per chip, not 80. That matches #109's `default_resident_bytes`.
-  - DF-MP2 is costed at the measured 5.8e13 multiply-adds/s per chip.
-  - At water61 / aug-cc-pVDZ the planner now gives 47 GB/it streamed (measured 49.7), 4.5 s/it (measured ≈ 6), MP2 71 s (measured 69) and a 6290 s build (10051 s measured, sharing the CPUs).
 
 ### Fixed
 
