@@ -30,7 +30,12 @@ def test_estimate_plans_streaming_and_multichip():
     assert big["iter_s_48xl"] < big["iter_s_3xl"]
     mid = lad.estimate({"nao": 2478, "naux": 9064, "nocc": 241})  # 111 GB
     assert mid["stream_src"] == "host RAM" and mid["plan"].startswith("3xl, stream")
-    assert mid["stream_GB_per_iter"] == pytest.approx(mid["B32_GB"] - 80.0)
+    # Resident per core when streaming: the 20 GB budget less two chunks in flight.
+    npair = 2478 * 2479 // 2
+    w = lad.df_store.chunk_width(npair, 9064, 4, lad.df_store.DEFAULT_CHUNK_BYTES)
+    resident = 4 * (20.0 - 2 * npair * w * 4 / 1e9)
+    assert mid["stream_GB_per_iter"] == pytest.approx(mid["B32_GB"] - resident)
+    assert 60.0 < resident < 70.0
 
 
 def test_ladder_picks_units_near_targets():

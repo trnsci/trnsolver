@@ -17,17 +17,29 @@ memory each stage needs, and what that means for a Trn2 window:
     cores / chips   logical NeuronCores (LNC=2, 24 GiB each, 20 GB usable
                     for resident chunks) to hold B resident; chips = cores / 4
     plan            trn2.3xlarge (1 chip, 96 GB HBM, ~124 GB host RAM)
-                    resident, or streamed: 80 GB resident, the rest uploaded
+                    resident, or streamed: per core the 20 GB budget less two
+                    in-flight chunks (~66 GB per chip), the rest uploaded
                     every iteration from host RAM (or NVMe once B exceeds
                     host RAM); else trn2.48xlarge (16 chips) resident
     B_ia fp32       the DF-MP2 three-index MO tensor (nocc x nvir x naux)
 
-and rough times, scaled from the window-3 measurements at C40H82 /
-aug-cc-pVDZ (n_ao 1658, naux 6064, nocc 161; #15): the out-of-core build
-(243 CPU-s here for 8.3e9 elements of B), the J/K stage (327 ms per
-iteration on 4 cores, scaled by nocc n^2 naux and the core count), the host
-eigh (301 ms at m 1622, scaled by m^3) and the per-iteration upload at
-14 GB/s when streaming. These are planning estimates, not measurements.
+and rough times. They are scaled from measurements at C40H82 / aug-cc-pVDZ
+(n_ao 1658, naux 6064, nocc 161; #15, trnsci/trnsci#115):
+
+- the out-of-core build: 1215 s on 2 pinned Trn2-host threads. It is
+  dominated by the triangular solve, so it is scaled by npair · naux²;
+- the J/K stage: 327 ms per iteration on 4 cores in window 3, scaled by
+  nocc n² naux and the core count. In window 4 it was 207 ms here and 0.82 s
+  at n_ao 2522 / cc-pVTZ, against 0.81 s scaled;
+- the host eigh: 301 ms at m 1622, scaled by m³;
+- the per-iteration upload when streaming: 14 GB/s. That is the host link,
+  reached from page-cached chunks since trntensor's direct mmap upload.
+  Cold NVMe reads ran at ~1 GB/s per thread, and EBS gp3 at 0.13 GB/s;
+- DF-MP2: 5.8e13 multiply-adds/s per chip (``mp2_energy_blocked`` over 4
+  cores, water61 / aug-cc-pVDZ).
+
+water61 / aug-cc-pVDZ measured about 6 s per streamed iteration against
+4.6 s here. These are planning estimates, not measurements.
 
 Without ``--dry-run`` each system up to ``--max-nao`` runs end to end: the
 out-of-core build (time, peak RSS), the fp32 SCF (noise-aware convergence,
@@ -71,13 +83,16 @@ CORES_PER_CHIP = 4
 HOST_RAM_GB = {"trn2.3xlarge": 124.0, "trn2.48xlarge": 2000.0}
 CHIPS = {"trn2.3xlarge": 1, "trn2.48xlarge": 16}
 H2D_GBPS = 14.0  # host link, per chip (trntensor docs)
-NVME_GBPS = 2.0  # sequential read, planning figure
+NVME_GBPS = 2.0  # aggregate planning figure; window 4 measured 0.9-1.2 GB/s per cold buffered thread, 3.5 GB/s O_DIRECT
 
 # Window-3 anchors (C40H82 / aug-cc-pVDZ, #15).
 _A_NAO, _A_NAUX, _A_NOCC, _A_RANK = 1658, 6064, 161, 1622
 _A_JK_S_4CORES = 0.327
 _A_EIGH_S = 0.301
-_A_BUILD_CPU_S_PER_ELEM = 243.0 / (1375311 * 6064)  # 160 s wall, 243 CPU-s (12 threads here)
+# Build: 1215 s wall on 2 pinned Trn2-host threads, 83% triangular solve
+# (npair x naux against the naux x naux Cholesky factor): scale npair naux^2.
+_A_BUILD_CPU_S_PER_TRSM = 2 * 1215.0 / (1375311 * 6064**2)
+_A_MP2_MACS_PER_S_CHIP = 5.8e13  # 4.03e15 in 69 s, water61 / aug-cc-pVDZ, 4 cores
 
 
 def _lindep_for(basis: str) -> tuple[str, float]:
@@ -124,10 +139,14 @@ def estimate(row: dict, host_threads: int = 2, iters: int = 25) -> dict:
     jk = _A_JK_S_4CORES * (nocc * n * n * naux) / (_A_NOCC * _A_NAO**2 * _A_NAUX)
     e["jk_s_1chip"] = jk
     e["eigh_s"] = _A_EIGH_S * (n / _A_RANK) ** 3
-    e["build_s"] = _A_BUILD_CPU_S_PER_ELEM * npair * naux / host_threads
-    # MP2: nocc^2 nvir^2 naux multiply-adds (pair symmetry halves 2x) at ~20 TFLOP/s per chip.
-    e["mp2_s_1chip"] = nocc * nocc * nvir * nvir * naux / 20e12
+    e["build_s"] = _A_BUILD_CPU_S_PER_TRSM * npair * naux * naux / host_threads
+    # MP2: nocc^2 nvir^2 naux multiply-adds (mp2_energy_blocked, measured rate).
+    e["mp2_s_1chip"] = nocc * nocc * nvir * nvir * naux / _A_MP2_MACS_PER_S_CHIP
     chip_resident = CORES_PER_CHIP * CORE_RESIDENT_GB
+    if e["B32_GB"] > chip_resident:
+        # Streaming: each core keeps two chunks in flight within its budget.
+        w = df_store.chunk_width(npair, naux, 4, df_store.DEFAULT_CHUNK_BYTES)
+        chip_resident = CORES_PER_CHIP * max(0.0, CORE_RESIDENT_GB - 2 * npair * w * 4 / 1e9)
     streamed = max(0.0, e["B32_GB"] - chip_resident)
     ram = HOST_RAM_GB["trn2.3xlarge"] - 8  # leave room for the process
     e["stream_src"] = "" if streamed == 0 else ("host RAM" if e["B32_GB"] <= ram else "NVMe")
