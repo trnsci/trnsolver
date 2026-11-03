@@ -65,13 +65,54 @@ Mixed-precision iterative refinement, the same shape as `gmres_ir`:
 
 Returns a float64 host `X` and `info` with these keys: `outer_iterations`, `inner_iterations`, `residual_history` (`(outer + 1, R)`), `true_residual`, `converged`.
 
-### `pivoted_cholesky(diag_fn, rows_fn, rank, *, tol=0.0)`, `pivoted_lowrank_preconditioner(diag_fn, rows_fn, rank, shift, *, tol=0.0)`
+### `pivoted_cholesky(diag_fn, rows_fn, rank, *, tol=0.0, block=1, sub_fn=None, relax=1.0)`, `pivoted_lowrank_preconditioner(diag_fn, rows_fn, rank, shift, *, tol=0.0, apply="auto")`
 
-Greedy pivoted Cholesky `K ≈ L Lᵀ`, built from `diag_fn() → (n,)` and one row per step, `rows_fn(idx) → (1, n)`. The preconditioner returns a `PivotedLowRankPreconditioner` that applies `(L Lᵀ + shift·I)⁻¹` with two `(n × k)` GEMMs. It has these attributes and methods:
+Greedy pivoted Cholesky `K ≈ L Lᵀ`, built from `diag_fn() → (n,)` and rows `rows_fn(idx) → (len(idx), n)`. With the default `block=1` it asks for one row per pivot.
 
-- `.L`, `.shift`, `.W`;
+`block > 1` (#114) batches the rows, so a matrix-free `K` sees one large kernel evaluation per round instead of one per pivot:
+
+- A round takes the `block` largest remaining diagonals as candidates. It picks pivots greedily from their exact `c × c` Schur complement, and accepts a candidate while its remaining diagonal is at least `relax` times the largest one outside the round.
+- With `relax=1` these are the pivots the one-row algorithm takes, up to ties and rounding.
+- The accepted pivots' rows come from one `rows_fn` call. One GEMM gives their Schur rows and one triangular solve gives the new columns, all in float64 on the host.
+- `sub_fn(idx) → K[idx][:, idx]` (`c²` entries) lets the round choose pivots before any row is requested, so `rows_fn` is asked only for accepted pivots. Without it, every candidate row is requested.
+- On the GP kernel (RBF, ℓ = 0.15, d = 3, rank 1024), `block=512, relax=0.5` makes 26 calls at n = 10⁵ and 61 at n = 10⁶, against 1024. The CG iteration counts match the one-row build.
+
+```python
+def krows(idx):  # K(X[idx], X) on the device: one launch per round
+    eye = torch.eye(len(idx), device="neuron")
+    return trnsparse.kernel_matmul(X, X[idx], eye, "rbf", ell, s).T
+
+
+def ksub(idx):  # K[idx][:, idx], c × c on the host
+    return trnsparse.kernel_matmul_reference(
+        X[idx], X[idx], torch.eye(len(idx), dtype=torch.float64), "rbf", ell, s
+    )
+
+
+L = trnsolver.pivoted_cholesky(op.diag, krows, 1024, block=512, relax=0.5, sub_fn=ksub)
+```
+
+`PivotedLowRankPreconditioner(L, shift, apply=...)` applies `(L Lᵀ + shift·I)⁻¹`. It has these attributes and methods:
+
+- `.L`, `.shift`, `.W` (or `.Q`, `.g` for `"projected"`);
 - `logdet()`, giving `log det(L Lᵀ + shift·I)`;
 - `sample(num, generator)`, drawing from `N(0, L Lᵀ + shift·I)`.
+
+`apply` takes one of these values:
+
+| `apply` | where | notes |
+|---|---|---|
+| `"host64"` | float64 on the host | one `(n, R)` round trip per call |
+| `"native"` | L's dtype and device | `(V − W WᵀV)/s`, two GEMMs; cancels in fp32, so use it only for float64 L |
+| `"projected"` | L's dtype and device | stable in fp32, four GEMMs, no host round trip (#114) |
+| `"auto"` (default) | | `"native"` for float64 L, else `"host64"` |
+
+How `"projected"` works:
+
+- It uses an orthonormal basis Q of L's range, from the Gram matrix in float64 on the host, with `L Lᵀ = Q diag(σ²) Qᵀ`.
+- It applies `Q (Σ² + sI)⁻¹ QᵀV + (I − QQᵀ)V/s` with the projection done twice.
+- One pass leaves an error of about u·√k·‖V‖ along Q, which the 1/s weight amplifies. That is the `"native"` failure. The second pass removes that error.
+- On CPU fp32 it takes the same CG iteration counts as `"host64"` on the GP cases that stall `"native"`.
 
 ### `lanczos_tridiag_from_cg(alpha, beta, col_iterations=None)`, `slq_logdet(A, n, num_probes=32, num_iters=50, generator=None, M=None, *, dtype=torch.float32, device=None, tol=1e-10)`
 

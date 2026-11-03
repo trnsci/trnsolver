@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`pivoted_cholesky(..., block=, sub_fn=, relax=)`: block row requests
+  for the pivoted-Cholesky build (#114).**
+  - A round takes the `block` largest remaining diagonals as candidates and
+    picks pivots greedily from their exact c × c Schur complement. It
+    accepts a candidate while its diagonal is at least `relax` times the
+    largest one outside the round. With `relax=1` that is the one-row
+    algorithm's pivot sequence (up to ties).
+  - The accepted pivots' rows come from one `rows_fn` call, so a device
+    kernel evaluation (`trnsparse.kernel_matmul(X, X[idx], I)`) makes one
+    launch per round. One GEMM gives the Schur rows and one triangular
+    solve the new columns, in float64 on the host, independent of the
+    device's reduction order.
+  - `sub_fn(idx)` gives `K[idx][:, idx]`, so only accepted rows are
+    requested. Without it, every candidate row is.
+  - GP kernel (RBF, ℓ = 0.15, d = 3, rank 1024, CPU), with
+    `block=512, relax=0.5`:
+    - n = 10⁵: 26 calls instead of 1024, 0.85 s against 4.1 s;
+    - n = 10⁶: 61 calls, 11.2 s against 34.6 s, with fp32 kernel rows.
+  - CG iteration counts are unchanged at n = 2×10⁴, 5×10⁴ and 10⁵.
+  - The default `block=1` keeps one row per step. The factor is now
+    stored row-major internally, so appending a column is stride-1.
+- **`PivotedLowRankPreconditioner(..., apply="projected")`: an fp32
+  on-device apply that does not cancel (#114).**
+  - Q is an orthonormal basis of L's range, from the Gram matrix LᵀL in
+    float64 on the host (one n × k × k GEMM; no n × k QR).
+  - The apply is `Q (Σ² + sI)⁻¹ QᵀV + (I − QQᵀ)V/s`, with the projection
+    applied twice: four (n × k) GEMMs on the device, no host round trip.
+  - The single-pass Woodbury form (`"native"`) leaves an error of about
+    u·√k·‖V‖ along the captured subspace, which the 1/s weight amplifies.
+    The second pass removes it. What remains is orthogonal to Q and
+    perturbs the preconditioner only to second order.
+  - CPU, fp32 operator, R = 33, rank 1024, tol 1e-6, `"host64"` against
+    `"projected"`:
+    - n = 2×10⁴, noise 1e-2: 10 and 10 iterations. Posterior mean against
+      scipy `cho_solve`: 6.0e-5 and 6.1e-5.
+    - n = 2×10⁴, noise 1e-3: 30 and 30.
+    - n = 5×10⁴: 20 and 20.
+    - n = 10⁵: see #114.
+    - `"native"` does not converge in 150–200 iterations on the same cases.
+  - Opt-in. `apply="auto"` is unchanged: `"host64"` for a non-float64 L.
+  - `tests/test_block_neuron.py` holds the device gates: apply accuracy on
+    the device, CG iterations against `"host64"`, and a build from device
+    rows.
 - **`cg_block`: block CG for many right-hand sides on matrix-free operators (#97).**
   - R independent preconditioned CG recurrences, one per column of an (n, R)
     B, driven by ONE operator call A(P) on the whole block per iteration.
