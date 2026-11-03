@@ -628,6 +628,8 @@ def test_run_scf_releases_device_integrals(monkeypatch, tmp_path):
     assert closed == [True, True]
     assert r1.info["stream"]["resident"] > 0 and r2.info["stream"] is None
     assert r1.energy == pytest.approx(r2.energy, abs=1e-10)
+
+
 def test_host_float64_stream_over_fp32_store_chunks(tmp_path):
     """A float64 host pass (the canonical Fock) over an fp32 store whose
     chunks double past chunk_bytes uses the store's chunks. The re-split
