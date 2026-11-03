@@ -553,6 +553,21 @@ def test_streamed_jk_matches_blocks(devices, resident, host_pack):
     torch.testing.assert_close(st.k(C), K)
 
 
+def test_default_resident_bytes_leaves_room_for_streamed_chunks():
+    """Streaming needs room for the chunks in flight: n_ao 1658, naux 6064,
+    384-column chunks (2.1 GB) on one core, the case that hit NRT_RESOURCE."""
+    npair = 1658 * 1659 // 2
+    widths = [384] * 15 + [304]
+    chunk = npair * 384 * 4
+    budget = scf.DEVICE_RESIDENT_GB * 1e9
+    one = scf.default_resident_bytes(widths, npair, 4, 1, 1, "neuron")
+    assert one == budget - 2 * chunk
+    assert scf.default_resident_bytes(widths, npair, 4, 1, 2, "neuron") == budget - 3 * chunk
+    # Over 4 cores, B (8.3 GB per core) is all resident: the full budget.
+    assert scf.default_resident_bytes(widths, npair, 4, 4, 1, "neuron") == budget
+    assert scf.default_resident_bytes(widths, npair, 4, 1, 1, "cpu") == 0.0
+
+
 def test_streamed_scf_from_store(tmp_path):
     _need_aux_stream()
     mem = scf.h2_lattice(6)
