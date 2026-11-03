@@ -26,7 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - GP kernel (RBF, ℓ = 0.15, d = 3, rank 1024, CPU), with
     `block=512, relax=0.5`:
     - n = 10⁵: 26 calls instead of 1024, 0.85 s against 4.1 s;
-    - n = 10⁶: 61 calls, 11.2 s against 34.6 s, with fp32 kernel rows.
+    - n = 10⁶: 61 calls, 11.3 s against 34.6 s, with fp32 kernel rows. Two
+      host threads; the factor adds 4.5 s (`"host64"`) or 5.2 s
+      (`"projected"`).
   - CG iteration counts are unchanged at n = 2×10⁴, 5×10⁴ and 10⁵.
   - The default `block=1` keeps one row per step. The factor is now
     stored row-major internally, so appending a column is stride-1.
@@ -46,7 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       scipy `cho_solve`: 6.0e-5 and 6.1e-5.
     - n = 2×10⁴, noise 1e-3: 30 and 30.
     - n = 5×10⁴: 20 and 20.
-    - n = 10⁵: see #114.
+    - n = 10⁵: 20 and 20 (column maximum 15 and 15). The posterior means
+      differ by 6.4e-5.
     - `"native"` does not converge in 150–200 iterations on the same cases.
   - Opt-in. `apply="auto"` is unchanged: `"host64"` for a non-float64 L.
   - `tests/test_block_neuron.py` holds the device gates: apply accuracy on
