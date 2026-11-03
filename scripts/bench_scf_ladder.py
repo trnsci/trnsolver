@@ -257,6 +257,7 @@ def run_one(row: dict, args) -> dict:
         stage_sync=False,
         subspace_opts=sub_opts,
         max_iter=args.max_iter,
+        guess=args.guess,
     )
     if dev.type != "cpu" and args.warmup_iters:
         scf.run_scf(system, **dict(kw, max_iter=args.warmup_iters))
@@ -340,6 +341,13 @@ def main() -> None:
     ap.add_argument("--jk-devices", default=None, help="e.g. neuron:0,neuron:1,neuron:2,neuron:3")
     ap.add_argument("--solver", default="auto", choices=("auto", "orth", "subspace"))
     ap.add_argument("--max-iter", type=int, default=60)
+    ap.add_argument(
+        "--guess",
+        default="minao",
+        choices=("core", "minao"),
+        help="initial guess (minao: PySCF atomic densities; the core guess did not "
+        "converge for alkane69 / cc-pVDZ in fp32)",
+    )
     ap.add_argument("--warmup-iters", type=int, default=3)
     ap.add_argument("--mp2-fp32", action="store_true", help="fp32 AO->MO and MP2 energy")
     ap.add_argument("--store-dir", default=None, help="df_store root (default $TRNSCI_DF_DIR)")
