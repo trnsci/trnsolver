@@ -49,6 +49,24 @@ from trnsolver.nki import dispatch
 from trnsolver.nki import jacobi as nj
 from trnsolver.nki import subspace as ns
 
+# `eigh_randomized` draws its sketch with trnrand when it is installed. Import it
+# here, before any stand-in `torch_neuronx` is in `sys.modules`, and keep it on
+# its pytorch backend for every test in this module (references included). On a
+# Neuron host trnrand would otherwise draw the sketch with its own kernels and
+# register its `trnrand::` ops through the stand-in, whose stubs know only
+# trnsolver's ops, and keep them for the rest of the session.
+try:
+    import trnrand.nki.dispatch as _trnrand_dispatch
+except ImportError:
+    _trnrand_dispatch = None
+
+
+@pytest.fixture(autouse=True)
+def _trnrand_on_pytorch(monkeypatch):
+    if _trnrand_dispatch is not None:
+        monkeypatch.setattr(_trnrand_dispatch, "_backend", "pytorch")
+
+
 # The stand-in neuron device is CPU, so float64 calls under backend "auto"
 # take the host path and warn; only the tests below that check it look.
 pytestmark = pytest.mark.filterwarnings(
