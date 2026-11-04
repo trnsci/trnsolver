@@ -16,7 +16,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv pip install --system "ruff>=0.6"
+      - run: uv pip install --system "ruff==0.17.3"
       - run: ruff check .
       - run: ruff format --check .
 

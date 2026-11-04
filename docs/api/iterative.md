@@ -92,6 +92,8 @@ def ksub(idx):  # K[idx][:, idx], c × c on the host
 L = trnsolver.pivoted_cholesky(op.diag, krows, 1024, block=512, relax=0.5, sub_fn=ksub)
 ```
 
+**float64: keep K on the host when `rows_fn` gathers.** The build is float64 on the host, but L is only as accurate as the rows `rows_fn` returns, and the library can't see inside the callable. On Trn2 a device-side gather of float64 (`K[idx]`, `index_select`, `torch.cat`) rounds to fp32, with a relative error of about 3.6e-8. So a `rows_fn` that gathers rows from a float64 `K` on the `neuron` device gives a `pivoted_lowrank_preconditioner` (or `pivoted_cholesky`) accurate to about 2e-8, not about 1e-15. For float64, keep `K`, or whatever data `rows_fn` reads, on the host. Plain copies (`.to`, `.clone()`, `.contiguous()`, basic indexing) are exact.
+
 `PivotedLowRankPreconditioner(L, shift, apply=...)` applies `(L Lᵀ + shift·I)⁻¹`. It has these attributes and methods:
 
 - `.L`, `.shift`, `.W` (or `.Q`, `.g` for `"projected"`);

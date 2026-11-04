@@ -638,6 +638,16 @@ def pivoted_lowrank_preconditioner(
     pass the kernel diagonal and rows, and the noise variance as ``shift``.
     Use the result as ``M=`` in ``cg_block``; its ``logdet()`` and
     ``sample()`` serve preconditioned ``slq_logdet``.
+
+    float64: L is built in float64 on the host, but it is only as accurate
+    as the rows ``rows_fn`` returns, and the library cannot see inside the
+    callable. On Trn2 a device-side gather of float64 (``K[idx]``,
+    ``index_select``, ``torch.cat``) rounds to fp32 (relative error about
+    3.6e-8), so a ``rows_fn`` that gathers rows from a float64 K resident on
+    the ``neuron`` device gives a preconditioner accurate to about 2e-8, not
+    about 1e-15. For float64, keep K (or whatever data ``rows_fn`` reads) on
+    the host. Plain copies (``.to``, ``.clone()``, ``.contiguous()``, basic
+    indexing) are exact.
     """
     L = pivoted_cholesky(diag_fn, rows_fn, rank, tol=tol)
     return PivotedLowRankPreconditioner(L, shift, apply=apply)
