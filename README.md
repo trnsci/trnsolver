@@ -217,12 +217,14 @@ CPU baselines (torch.linalg, scipy.linalg, trnsolver PyTorch path) run on every 
 
 ## Known issues in earlier releases
 
-Silent wrong-result bugs fixed in the 2026-10-31 to 2026-11-02 releases. Details are in the [CHANGELOG](CHANGELOG.md).
+Silent wrong-result bugs fixed in the 2026-10-31 to 2026-11-04 releases. Details are in the [CHANGELOG](CHANGELOG.md).
 
 | Bug | Affected | Fixed in |
 |---|---|---|
 | `eigh` on the NKI Householder path (`TRNSOLVER_REQUIRE_NKI=1` or a non-native NKI device): float64 input gave garbage results, and n = 1 returned `(1, 1)` eigenvalues; `eigh_generalized` inherited both (#83) | through 0.20.0 (n = 1 shape: 0.4.0–0.20.0) | 0.21.0 |
 | Complex Hermitian and batched input to `cholesky(upper=True)`, `solve_spd`, `inv_spd`, `inv_sqrt_spd`, `eigh_generalized`, `eigh_randomized`, `pinv` and `ssor_preconditioner` used `.T` instead of `.mH` (#64) | every release through 0.20.0 (`pinv` since 0.5.0, `ssor_preconditioner` since 0.8.0) | 0.21.0 |
+| `cg` dropped the imaginary part of complex input (unconjugated inner products cast to real), so a complex Hermitian system returned a wrong `x` with only a `UserWarning`; a complex `A` with a real `b` also lost `A`'s imaginary part (#100) | every release through 0.21.0 | 0.22.0 |
+| `cg` gave a wrong gradient with respect to `A` (it differentiated a fixed polynomial in `A`; rel. err 0.55 at n = 5), and `schur` returned `Q`, `T` that silently contributed zero gradient (#76) | every release through 0.21.0 | 0.22.0 |
 
 ## Related projects in the trnsci suite
 
