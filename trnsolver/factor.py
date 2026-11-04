@@ -14,6 +14,8 @@ For SCF:
 
 from __future__ import annotations
 
+import warnings
+
 import torch
 
 from .nki.dispatch import _fp64_host_guard
@@ -569,6 +571,32 @@ def solve(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return _restore(X, orig)
 
 
+def _warn_ambiguous_rhs(A: torch.Tensor, B: torch.Tensor) -> None:
+    """FutureWarning for solve_spd's ambiguous B (#79); the reading switches in 0.23.0.
+
+    No dedup of its own: Python's default filter shows a FutureWarning once
+    per call site, and ``stacklevel`` points at the caller of ``solve_spd``
+    (through the ``_fp64_host_guard`` wrapper).
+    """
+    n = A.shape[-1]
+    if A.dim() == 3:
+        shared = "or B.unsqueeze(-3) to broadcast one shared (n, k) matrix (today's result)"
+    else:
+        shared = (
+            "or B.unsqueeze(-3) to broadcast each (n, k) matrix over A's last batch dim; "
+            "B.unsqueeze(0) gives today's result"
+        )
+    warnings.warn(
+        f"trnsolver solve_spd: B of shape {tuple(B.shape)} equals A.shape[:-1] and A's last "
+        f"batch dim equals n = {n}, so B is ambiguous. It is read as (*, n, k) "
+        "right-hand-side matrices broadcast over A's batch; from trnsolver 0.23.0 it is "
+        "read as a batch of vectors, as torch.linalg.solve does (trnsci/trnsolver#79). "
+        f"To be explicit, pass B.unsqueeze(-1) for a batch of vectors, {shared}.",
+        FutureWarning,
+        stacklevel=4,
+    )
+
+
 @_fp64_host_guard("solve_spd")
 def solve_spd(
     A: torch.Tensor,
@@ -583,9 +611,19 @@ def solve_spd(
         A: SPD matrix (n, n), or a batch (*, n, n).
         B: Right-hand side (n,) or (n, k); for a batched A also (*, n, k),
             or a batch of vectors (*, n) with ``B.shape == A.shape[:-1]``
-            (as ``torch.linalg.solve``; #79). When the last batch dim of A
-            equals n, a 2-D or higher B of that shape is read as (*, n, k),
-            as before.
+            (as ``torch.linalg.solve``; #79).
+
+            Deprecated: when the last batch dim of A equals n (A
+            ``(*, n, n, n)``, B ``(*, n, n)``), such a B is ambiguous. It is
+            still read as (*, n, k) right-hand-side matrices broadcast over
+            A's batch, with a ``FutureWarning``; from 0.23.0 it is read as a
+            batch of vectors, as ``torch.linalg.solve`` does. Be explicit:
+            ``B.unsqueeze(-1)`` for a batch of vectors (result
+            ``(*, n, n, 1)``), or ``B.unsqueeze(-3)`` to broadcast one shared
+            right-hand-side matrix over A's last batch dim. For a 3-D A,
+            ``B.unsqueeze(-3)`` is today's result; with more batch dims,
+            ``B.unsqueeze(0)`` is. Both explicit forms mean the same in every
+            release.
         iterative_refinement: If True, perform one step of iterative
             refinement: compute the residual R = B - A @ X and apply a
             second Cholesky solve for the correction dX = chol_solve(R).
@@ -601,9 +639,10 @@ def solve_spd(
     n = A.shape[-1]
     # A batch of vectors, B (*, n) with B.shape == A.shape[:-1] (#79). Only
     # where B cannot be read as (*, n, k), so existing callers are unchanged.
-    squeeze = B.dim() == 1 or (
-        B.dim() >= 2 and B.dim() == A.dim() - 1 and B.shape == A.shape[:-1] and B.shape[-2] != n
-    )
+    vec_shaped = B.dim() >= 2 and B.dim() == A.dim() - 1 and B.shape == A.shape[:-1]
+    squeeze = B.dim() == 1 or (vec_shaped and B.shape[-2] != n)
+    if vec_shaped and B.shape[-2] == n:
+        _warn_ambiguous_rhs(A, B)
     if squeeze:
         B = B.unsqueeze(-1)
     # A = L L^H: back substitution with L^H (``.mH``: conjugate for complex,
@@ -635,7 +674,10 @@ def inv_spd(A: torch.Tensor) -> torch.Tensor:
     """
     A, orig = _to_fp32(A)
     n = A.shape[-1]
-    result = solve_spd(A, torch.eye(n, dtype=A.dtype, device=A.device))
+    # The identity at A's full shape: for a batch dim equal to n a bare (n, n)
+    # eye is the ambiguous B of solve_spd (#79).
+    eye = torch.eye(n, dtype=A.dtype, device=A.device).expand(A.shape)
+    result = solve_spd(A, eye)
     return _restore(result, orig)
 
 

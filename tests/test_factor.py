@@ -1,5 +1,7 @@
 """Test matrix factorizations."""
 
+import warnings
+
 import numpy as np
 import pytest
 import torch
@@ -229,15 +231,105 @@ class TestSolveSPDBatchedVectors:
         B = torch.ones(3, 4, dtype=torch.float64)
         np.testing.assert_allclose(trnsolver.solve_spd(A, B).numpy(), np.ones((3, 4)))
 
-    def test_batch_equals_n_keeps_matrix_reading(self):
-        # A (n, n, n), B (n, n): B also reads as one shared (n, k) right-hand
-        # side, which solve_spd has always done. Unchanged (#79, needs-decision).
-        n = 4
-        A = self._spd_batch((n,), n, seed=2)
-        B = np.random.default_rng(3).standard_normal((n, n))
-        X = trnsolver.solve_spd(torch.from_numpy(A), torch.from_numpy(B))
-        assert X.shape == (n, n, n)
+
+def _spd_np(batch, n, seed=0):
+    X = np.random.default_rng(seed).standard_normal((*batch, n, n))
+    return X @ np.swapaxes(X, -1, -2) + n * np.eye(n)
+
+
+def _no_warnings(fn, *args, **kwargs):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        return fn(*args, **kwargs)
+
+
+class TestSolveSPDAmbiguousRHS:
+    """A (*, n, n, n), B (*, n, n): deprecated in 0.22.1, switches in 0.23.0 (#79, #130).
+
+    Today B reads as (*, n, k) right-hand sides broadcast over A's batch;
+    0.23.0 reads it as a batch of vectors, as torch.linalg.solve does. The
+    explicit forms B.unsqueeze(-1) / B.unsqueeze(-3) have B.dim() == A.dim(),
+    so neither reading applies to them: same result in both releases.
+    Reference: numpy.linalg.solve (LAPACK).
+    """
+
+    n = 4
+
+    def _case(self, batch=()):
+        n = self.n
+        A = _spd_np((*batch, n), n, seed=2)
+        B = np.random.default_rng(3).standard_normal((*batch, n, n))
+        return A, B
+
+    @pytest.mark.parametrize("ir", [False, True])
+    def test_warns_and_keeps_matrix_reading(self, ir):
+        A, B = self._case()
+        with pytest.warns(FutureWarning, match=r"0\.23\.0") as rec:
+            X = trnsolver.solve_spd(
+                torch.from_numpy(A), torch.from_numpy(B), iterative_refinement=ir
+            )
+        assert X.shape == (self.n,) * 3
         np.testing.assert_allclose(X.numpy(), np.linalg.solve(A, B), rtol=0, atol=1e-10)
+        msg = str(rec[0].message)
+        assert "B.unsqueeze(-1)" in msg and "B.unsqueeze(-3)" in msg
+        # Points at the caller, not at trnsolver internals.
+        assert rec[0].filename == __file__
+
+    def test_warns_with_leading_batch(self):
+        # A (n, n, n, n), B (n, n, n): B broadcasts as (1, n, n, n), so today's
+        # result is B.unsqueeze(0); the message says so.
+        A, B = self._case((self.n,))
+        with pytest.warns(FutureWarning, match=r"B\.unsqueeze\(0\) gives today's result"):
+            X = trnsolver.solve_spd(torch.from_numpy(A), torch.from_numpy(B))
+        Xe = _no_warnings(
+            trnsolver.solve_spd, torch.from_numpy(A), torch.from_numpy(B).unsqueeze(0)
+        )
+        assert torch.equal(X, Xe)
+
+    def test_explicit_batch_of_vectors(self):
+        # B.unsqueeze(-1): the 0.23.0 reading of B, as torch.linalg.solve.
+        A, B = self._case()
+        At, Bt = torch.from_numpy(A), torch.from_numpy(B)
+        X = _no_warnings(trnsolver.solve_spd, At, Bt.unsqueeze(-1))
+        assert X.shape == (self.n, self.n, 1)
+        ref = np.linalg.solve(A, B[..., None])[..., 0]
+        np.testing.assert_allclose(X.squeeze(-1).numpy(), ref, rtol=0, atol=1e-10)
+        np.testing.assert_allclose(
+            X.squeeze(-1).numpy(), torch.linalg.solve(At, Bt).numpy(), rtol=0, atol=1e-10
+        )
+
+    def test_explicit_shared_matrix(self):
+        # B.unsqueeze(-3): one shared (n, k) right-hand side; for a 3-D A that
+        # is exactly today's result.
+        A, B = self._case()
+        At, Bt = torch.from_numpy(A), torch.from_numpy(B)
+        X = _no_warnings(trnsolver.solve_spd, At, Bt.unsqueeze(-3))
+        with pytest.warns(FutureWarning):
+            X_today = trnsolver.solve_spd(At, Bt)
+        assert torch.equal(X, X_today)
+        np.testing.assert_allclose(X.numpy(), np.linalg.solve(A, B), rtol=0, atol=1e-10)
+
+    @pytest.mark.parametrize(
+        "a_shape,b_shape",
+        [
+            ((4, 4), (4,)),
+            ((4, 4), (4, 4)),
+            ((3, 4, 4), (3, 4)),  # batch of vectors, batch != n
+            ((4, 4, 4), (4, 4, 4)),
+            ((4, 4, 4), (4, 2)),
+            ((2, 3, 4, 4), (2, 3, 4)),
+        ],
+    )
+    def test_no_warning_outside_ambiguous_case(self, a_shape, b_shape):
+        n = a_shape[-1]
+        A = torch.from_numpy(_spd_np(a_shape[:-2], n))
+        B = torch.ones(b_shape, dtype=torch.float64)
+        _no_warnings(trnsolver.solve_spd, A, B)
+
+    def test_inv_spd_batch_equals_n_does_not_warn(self):
+        A = torch.from_numpy(_spd_np((self.n,), self.n))
+        Ainv = _no_warnings(trnsolver.inv_spd, A)
+        np.testing.assert_allclose(Ainv.numpy(), np.linalg.inv(A.numpy()), rtol=0, atol=1e-10)
 
 
 class TestInvSqrtSPD:

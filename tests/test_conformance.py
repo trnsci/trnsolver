@@ -1383,13 +1383,13 @@ for _op in OPS:
     BATCH_IDS.append(
         (f"{_op}-batch{N}", _op, (N,))
     )  # batch == n: a .T over all dims keeps the shape
-# Batch == n: B (n, n) also reads as one shared (n, k) right-hand side, which
-# solve_spd has always done; switching to torch's batch-of-vectors reading
-# would change those callers' results (trnsci/trnsolver#79, needs-decision).
+# Batch == n: B (n, n) still reads as one shared (n, k) right-hand side, with
+# a FutureWarning (0.22.1); 0.23.0 switches to torch's batch-of-vectors reading
+# and this case passes (trnsci/trnsolver#79, #130).
 KNOWN[f"solve_spd_vec-batch{N}"] = pytest.mark.xfail(
     strict=True,
-    reason="trnsci/trnsolver#79 (needs-decision): solve_spd reads B (n, n) with batch == n "
-    "as a shared (n, k) right-hand side, not a batch of vectors",
+    reason="trnsci/trnsolver#130: until 0.23.0 solve_spd reads B (n, n) with batch == n "
+    "as a shared (n, k) right-hand side (deprecated, #79), not a batch of vectors",
 )
 
 

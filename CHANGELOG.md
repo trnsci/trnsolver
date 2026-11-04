@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Deprecated
+
+- **`solve_spd(A, B)` with an ambiguous B: A `(*, n, n, n)`, B `(*, n, n)`
+  (#79).** In this case `B.shape == A.shape[:-1]` and A's last batch dim equals n.
+  `solve_spd` reads B as `(*, n, k)` right-hand-side matrices broadcast over
+  A's batch and returns `(*, n, n, n)`; `torch.linalg.solve` (and
+  `trnsolver.solve`) read it as a batch of vectors and return `(*, n, n)`.
+  The result is unchanged in 0.22.1, but the call now emits a `FutureWarning`
+  (once per call site). In 0.23.0 `solve_spd` switches to torch's reading
+  (#130). To be explicit, pass `B.unsqueeze(-1)` for a batch of vectors, or
+  `B.unsqueeze(-3)` to broadcast one shared matrix. Both forms mean the same
+  in every release. For a 3-D A, `B.unsqueeze(-3)` is today's result; with
+  more batch dims, `B.unsqueeze(0)` is. `inv_spd` no longer passes that shape
+  internally, so a batched A with batch dim n does not warn.
+
 ## [0.22.0] — 2026-11-04
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
