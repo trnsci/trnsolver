@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.1] — 2026-11-07
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: solve_spd emits a FutureWarning for the ambiguous B shape, A (*, n, n, n) with B (*, n, n), ahead of the 0.23.0 switch to torch's reading (#79, #131); inv_spd no longer passes that shape internally.
+
 ### Deprecated
 
 - **`solve_spd(A, B)` with an ambiguous B: A `(*, n, n, n)`, B `(*, n, n)`
