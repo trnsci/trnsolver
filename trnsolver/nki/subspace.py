@@ -62,8 +62,9 @@ import torch
 from .dispatch import HAS_NKI, PMAX, _use_simulator
 
 N_GRAMS = 6
-# Per-partition SBUF budget for the resident state (of 192 KiB on Trn2),
-# leaving the rest to the compiler's temporaries.
+# Per-partition SBUF budget for the resident state, leaving the rest to the
+# compiler's temporaries. Conservative: SBUF is 192 KiB per partition on Trn1
+# and 224 KiB on Trn2 (about 207 KiB of it allocatable by NKI).
 _SBUF_BUDGET = 150 * 1024
 _KB_MAX = 512
 
