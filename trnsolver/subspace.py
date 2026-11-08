@@ -477,7 +477,8 @@ def occupied_subspace(
     """Lowest k eigenpairs of a symmetric F by Chebyshev-filtered subspace iteration.
 
     Args:
-        F: (n, n) symmetric matrix (FP32 or FP64) on any device. In SCF, the
+        F: (n, n) real symmetric matrix (FP32 or FP64) on any device; complex
+           F raises TypeError (use :func:`eigh`). In SCF, the
            Fock matrix in an orthonormal basis (``X^T F X``).
         k: number of eigenpairs (``nocc``).
         guess: the ``state`` of the previous call (warm start), an (n, j)
@@ -536,6 +537,15 @@ def occupied_subspace(
     n = F.shape[0]
     if not 1 <= k <= n:
         raise ValueError(f"need 1 <= k <= n; got k={k}, n={n}")
+    if F.is_complex():
+        # The filter, the Gram blocks and the Rayleigh-Ritz are real. Casting a
+        # complex Hermitian F to float32 used to drop its imaginary part with no
+        # error (#132). Use trnsolver.eigh for complex Hermitian F.
+        raise TypeError(
+            f"trnsolver occupied_subspace: complex F ({F.dtype}) is not supported; "
+            "the filtered subspace iteration is real (symmetric F). Use "
+            "trnsolver.eigh for a complex Hermitian F."
+        )
     if F.dtype not in (torch.float32, torch.float64):
         F = F.float()
     kb = min(n, k + (default_buffer(k) if buffer is None else max(0, buffer)))

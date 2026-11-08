@@ -722,8 +722,6 @@ def test_fp64_on_device_auto_computes_on_host(monkeypatch, name, env, fn, dt):
     ref, ref_err = _pytorch_reference(monkeypatch, env, fn, dt)
     if ref_err is not None:
         pytest.skip(f"the pytorch backend raises for {name} {dt}: {ref_err}")
-    if name == "occupied_subspace" and dt.is_complex:
-        pytest.skip("occupied_subspace is real: it casts other F to float32 (no float64 left)")
     with monkeypatch.context() as m:
         m.setattr(dispatch, "_backend", "pytorch")
         for k, v in env.items():
