@@ -313,6 +313,17 @@ class TestDriver:
         w, V, _ = trnsolver.occupied_subspace(A, 5)
         assert w.dtype == torch.float32
 
+    @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+    def test_complex_hermitian_raises(self, dtype):
+        """A complex Hermitian F used to return the result for F.real, as
+        float32, with no error (#132): the filter is real-only, so it raises."""
+        torch.manual_seed(0)
+        H = torch.randn(12, 12, dtype=torch.complex128)
+        H = (H + H.mH).to(dtype)
+        for guess in (None, torch.eye(12)[:, :6]):
+            with pytest.raises(TypeError, match="occupied_subspace.*complex"):
+                trnsolver.occupied_subspace(H, 3, guess=guess, buffer=3)
+
 
 def test_kernel_fits():
     assert SK.kernel_fits(970, 185)
