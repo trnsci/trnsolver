@@ -12,10 +12,12 @@ Relevant for CPSCF (coupled-perturbed SCF) response equations.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 
 import torch
 
+from .block import _fold_host64, _real_prod, _reduction_mode
 from .factor import _mH, _restore, _to_fp32
 from .nki.dispatch import _fp64_host_guard, _fp64_host_preconditioner
 
@@ -139,16 +141,52 @@ def ssor_preconditioner(
     return apply
 
 
-def _inner(u: torch.Tensor, v: torch.Tensor) -> float:
+# Reductions over n in cg / gmres (#128). Device ``vdot`` / ``norm`` add in
+# an order that depends on the LNC split (see the note in ``block.py``), so
+# with ``reduction="pairwise"`` (cg's default) the products are formed
+# elementwise and summed by ``block._fold_host64``'s fixed tree, finished in
+# float64 on the host; ``"host64"`` copies the product to the host.
+# ``"device"`` is the previous code. Host (CPU) tensors are multiplied in
+# float64 first in every mode, as before, so CPU results keep fp64 inner
+# products; on the device the product is in the working dtype (no fp64).
+
+
+_GMRES_DEFAULT = "pairwise"
+
+
+def _wide(u: torch.Tensor, v: torch.Tensor):
+    return torch.complex128 if (u.is_complex() or v.is_complex()) else torch.float64
+
+
+def _inner(u: torch.Tensor, v: torch.Tensor, reduction: str = "device") -> float:
     """Real part of the conjugated inner product ``u^H v``, accumulated in fp64.
 
     CG's ``r^H z`` and ``p^H A p`` are real for a Hermitian (positive
     definite) ``A`` and ``M``. ``u.dot(v)`` neither conjugates ``u`` nor
     keeps the imaginary part through ``float()``, which made ``cg`` wrong
     for complex input (#100). For real input this is ``u.dot(v)``.
+    ``reduction`` as in :func:`cg` (#128).
     """
-    wide = torch.complex128 if (u.is_complex() or v.is_complex()) else torch.float64
-    return torch.vdot(u.to(wide), v.to(wide)).real.item()
+    if reduction == "device":
+        wide = _wide(u, v)
+        return torch.vdot(u.to(wide), v.to(wide)).real.item()
+    if u.device.type == "cpu":
+        wide = _wide(u, v)
+        u, v = u.to(wide), v.to(wide)
+    P = _real_prod(u, v)
+    if reduction == "host64":
+        return float(P.to(device="cpu", dtype=torch.float64).sum())
+    return float(_fold_host64(P))
+
+
+def _norm(u: torch.Tensor, reduction: str = "device") -> float:
+    """‖u‖₂ as a Python float; ``reduction`` as in :func:`cg` (#128)."""
+    if reduction == "device":
+        return torch.linalg.norm(u).item()
+    if reduction == "host64":
+        w = torch.complex128 if u.is_complex() else torch.float64
+        return float(torch.linalg.vector_norm(u.to(device="cpu", dtype=w)))
+    return math.sqrt(max(_inner(u, u, "pairwise"), 0.0))
 
 
 def _needs_implicit_grad(*ts) -> bool:
@@ -190,6 +228,8 @@ def cg(
     tol: float = 1e-6,
     maxiter: int = 1000,
     M: torch.Tensor | Callable | None = None,
+    *,
+    reduction: str | None = None,
 ) -> tuple[torch.Tensor, int, float]:
     """Conjugate Gradient solver for A @ x = b (A must be SPD or complex HPD).
 
@@ -204,6 +244,15 @@ def cg(
         M: Preconditioner as callable M(r) → approx A^{-1} @ r, or tensor
             (interpreted as the already-inverted preconditioner applied as M@r).
             Use `jacobi_preconditioner(A)` for the common diagonal case.
+        reduction: How the inner products and norms reduce over n (#128),
+            as in :func:`cg_block`. ``"pairwise"`` (default): elementwise
+            products on the device, a fixed pairwise tree of elementwise
+            adds, then float64 on the host, so the result does not depend
+            on the LNC split. ``"host64"``: the product is copied to the
+            host and summed in float64. ``"device"``: ``vdot`` / ``norm`` on
+            the device (the previous behaviour; LNC-dependent). ``None``
+            reads ``TRNSOLVER_CG_REDUCTION``. Host tensors are multiplied in
+            float64 in every mode.
 
     Returns:
         x: Solution vector
@@ -226,6 +275,7 @@ def cg(
     unrolled, which is right for ``b`` at convergence but not for any
     parameters the callable closes over.
     """
+    red = _reduction_mode(reduction)
     b, orig = _to_fp32(b)
     if not callable(A):
         if A.is_complex() and not b.is_complex():
@@ -238,16 +288,16 @@ def cg(
 
             def solve(A_, b_):
                 x_, info["iters"], info["res"] = _cg_impl(
-                    A_, b_, x0 if A_ is A else None, tol, maxiter, M
+                    A_, b_, x0 if A_ is A else None, tol, maxiter, M, red=red
                 )
                 return x_
 
             x = _ImplicitSolve.apply(A, b, solve)
             return _restore(x, orig), info["iters"], info["res"]
-    return _cg_impl(A, b, x0, tol, maxiter, M, orig)
+    return _cg_impl(A, b, x0, tol, maxiter, M, orig, red=red)
 
 
-def _cg_impl(A, b, x0, tol, maxiter, M, orig=None):
+def _cg_impl(A, b, x0, tol, maxiter, M, orig=None, *, red="device"):
     """CG iteration proper; see :func:`cg`. ``b`` is already fp32-or-wider."""
     if orig is None:
         orig = b.dtype
@@ -266,7 +316,7 @@ def _cg_impl(A, b, x0, tol, maxiter, M, orig=None):
 
     x = x0.clone() if x0 is not None else torch.zeros(n, dtype=b.dtype, device=b.device)
     r = b - matvec(x)
-    b_norm = torch.linalg.norm(b).item()
+    b_norm = _norm(b, red)
     if b_norm == 0.0:
         # A x = 0 has the solution x = 0 for any nonsingular A, whatever x0
         # is. (A threshold of 1e-15 here returned x0, or zeros, with residual
@@ -276,11 +326,11 @@ def _cg_impl(A, b, x0, tol, maxiter, M, orig=None):
     z = precond(r) if precond is not None else r.clone()
 
     p = z.clone()
-    rz = _inner(r, z)
+    rz = _inner(r, z, red)
 
     for k in range(maxiter):
         Ap = matvec(p)
-        pAp = _inner(p, Ap)
+        pAp = _inner(p, Ap, red)
         # Exact breakdown only: an absolute threshold (1e-30) stopped
         # small-scale problems (A, b ~ 1e-16) before the first step.
         if pAp == 0.0:
@@ -290,18 +340,18 @@ def _cg_impl(A, b, x0, tol, maxiter, M, orig=None):
         x = x + alpha * p
         r = r - alpha * Ap
 
-        r_norm = torch.linalg.norm(r).item()
+        r_norm = _norm(r, red)
         if r_norm / b_norm < tol:
             return _restore(x, orig), k + 1, r_norm / b_norm
 
         z = precond(r) if precond is not None else r.clone()
 
-        rz_new = _inner(r, z)
+        rz_new = _inner(r, z, red)
         beta = rz_new / rz
         p = z + beta * p
         rz = rz_new
 
-    return _restore(x, orig), maxiter, torch.linalg.norm(r).item() / b_norm
+    return _restore(x, orig), maxiter, _norm(r, red) / b_norm
 
 
 @_fp64_host_guard("gmres")
@@ -313,6 +363,8 @@ def gmres(
     tol: float = 1e-6,
     maxiter: int = 100,
     restart: int = 30,
+    *,
+    reduction: str | None = None,
 ) -> tuple[torch.Tensor, int, float]:
     """GMRES solver for A @ x = b (general, non-symmetric).
 
@@ -327,6 +379,12 @@ def gmres(
         tol: Convergence tolerance
         maxiter: Maximum outer iterations (restarts)
         restart: Krylov subspace size before restart
+        reduction: How the Gram-Schmidt inner products and the norms reduce
+            over n (#128), as in :func:`cg`: ``"pairwise"`` (default),
+            ``"host64"`` or ``"device"`` (the previous behaviour). With
+            ``"pairwise"`` / ``"host64"`` the update ``x + V y`` is also
+            formed as fixed-order axpys instead of a matmul. ``None`` reads
+            ``TRNSOLVER_GMRES_REDUCTION``.
 
     Returns:
         x: Solution vector
@@ -342,6 +400,7 @@ def gmres(
     differentiated (there is no adjoint matvec): ``gmres`` raises
     ``RuntimeError`` if ``b`` or ``x0`` requires grad.
     """
+    red = _reduction_mode(reduction, "TRNSOLVER_GMRES_REDUCTION", _GMRES_DEFAULT)
     b, orig = _to_fp32(b)
     if not callable(A):
         A = A.to(b.dtype)
@@ -350,7 +409,7 @@ def gmres(
 
             def solve(A_, b_):
                 x_, info["iters"], info["res"] = _gmres_impl(
-                    A_, b_, x0 if A_ is A else None, tol, maxiter, restart
+                    A_, b_, x0 if A_ is A else None, tol, maxiter, restart, red=red
                 )
                 return x_
 
@@ -361,10 +420,10 @@ def gmres(
             "gmres: cannot differentiate with a callable A (no adjoint matvec); "
             "pass A as a tensor, or call under torch.no_grad()"
         )
-    return _gmres_impl(A, b, x0, tol, maxiter, restart, orig)
+    return _gmres_impl(A, b, x0, tol, maxiter, restart, orig, red=red)
 
 
-def _gmres_impl(A, b, x0, tol, maxiter, restart, orig=None):
+def _gmres_impl(A, b, x0, tol, maxiter, restart, orig=None, *, red="device"):
     """Restarted GMRES proper; see :func:`gmres`. ``b`` is already fp32-or-wider."""
     if orig is None:
         orig = b.dtype
@@ -374,7 +433,7 @@ def _gmres_impl(A, b, x0, tol, maxiter, restart, orig=None):
     matvec = A if callable(A) else lambda x: torch.mv(A, x)
 
     x = x0.clone() if x0 is not None else torch.zeros(n, dtype=b.dtype, device=b.device)
-    b_norm = torch.linalg.norm(b).item()
+    b_norm = _norm(b, red)
     if b_norm == 0.0:
         # A x = 0 has the solution x = 0 for any nonsingular A, whatever x0
         # is. (A threshold of 1e-15 here returned x0, or zeros, with residual
@@ -385,7 +444,7 @@ def _gmres_impl(A, b, x0, tol, maxiter, restart, orig=None):
 
     for _outer in range(maxiter):
         r = b - matvec(x)
-        r_norm = torch.linalg.norm(r).item()
+        r_norm = _norm(r, red)
         if r_norm / b_norm < tol:
             return _restore(x, orig), total_iters, r_norm / b_norm
 
@@ -408,10 +467,13 @@ def _gmres_impl(A, b, x0, tol, maxiter, restart, orig=None):
 
             # Modified Gram-Schmidt — FP64 inner products for numerical stability
             for i in range(j + 1):
-                H[i, j] = float(w.to(torch.float64).dot(V[:, i].to(torch.float64)))
+                if red == "device":
+                    H[i, j] = float(w.to(torch.float64).dot(V[:, i].to(torch.float64)))
+                else:
+                    H[i, j] = _inner(V[:, i], w, red)
                 w = w - H[i, j].item() * V[:, i]
 
-            H[j + 1, j] = torch.linalg.norm(w).item()
+            H[j + 1, j] = _norm(w, red)
             h_next = H[j + 1, j].item()
             if h_next < 1e-14:
                 m = j + 1
@@ -423,10 +485,18 @@ def _gmres_impl(A, b, x0, tol, maxiter, restart, orig=None):
 
         # Solve least-squares: min ||H @ y - g|| (host, (m+1) x m)
         y, _ = torch.linalg.lstsq(H[: m + 1, :m], g[: m + 1])[:2]
-        x = x + V[:, :m] @ y[:m].to(V.device)
+        if red == "device":
+            x = x + V[:, :m] @ y[:m].to(V.device)
+        else:
+            # V y contracts over m only, but as a matmul its order is the
+            # compiler's; fixed-order axpys are elementwise (LNC-invariant).
+            upd = V[:, 0] * y[0].item()
+            for i in range(1, m):
+                upd = upd + V[:, i] * y[i].item()
+            x = x + upd
 
     r = b - matvec(x)
-    return _restore(x, orig), total_iters, torch.linalg.norm(r).item() / b_norm
+    return _restore(x, orig), total_iters, _norm(r, red) / b_norm
 
 
 @_fp64_host_guard("gmres_ir")
