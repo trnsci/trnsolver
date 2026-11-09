@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`pivoted_cholesky(..., pad_rows=True)`: a few data-independent `rows_fn`
+  shapes (trnsci/trnsci#109).** With `block` > 1, the number of pivots a
+  round accepts depends on the values of K, so a device `rows_fn` (one NEFF
+  per shape) compiled in almost every round. A compile-only pre-warm could
+  not reach those shapes, because the pivots depend on the data. The GP n = 1e6
+  build hit 57 compiles in 63 calls and went from 143 s to 207 s.
+  `pad_rows=True` pads each call to a power of two, capped at `block`, by
+  repeating the last index, and drops the extra rows. That leaves at most
+  ⌈log₂ block⌉ + 1 shapes. The factor is bitwise unchanged. The default is
+  False, so `rows_fn` callers that need distinct indices are unaffected.
+  Trn2, n = 1e5, cold NEFF cache, one logical core: 21 → 3 shapes, rows
+  83.6 → 16.5 s, build 100.3 → 29.1 s.
+- **`scripts/bench_gp_precond.py`:** `--pad-rows` (on by default), `--prewarm`
+  (compiles every padded shape first, which also works in compile-only mode),
+  and `host_s`, the host fp64 part of `cholesky_s`. `cholesky_s` includes the
+  device rows (`rows_s`). Read that way, the window-5 "cholesky 150 s against
+  90 s" was 82 s against 80 s on the host, plus the cold compiles.
+
 ### Fixed
 
 - **`occupied_subspace` with a complex Hermitian F raises `TypeError` (#132).**

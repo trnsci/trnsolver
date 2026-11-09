@@ -321,6 +321,7 @@ def pivoted_cholesky(
     block: int = 1,
     sub_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
     relax: float = 1.0,
+    pad_rows: bool = False,
 ) -> torch.Tensor:
     """Greedy partially pivoted Cholesky, K ≈ L Lᵀ, from diagonal and row access.
 
@@ -350,6 +351,15 @@ def pivoted_cholesky(
     per round; ``relax`` < 1 (e.g. 0.5) accepts more at a small cost in
     approximation quality per pivot.
 
+    How many pivots a round accepts depends on the values of K, so a
+    device ``rows_fn`` that compiles one kernel per shape (a NEFF per
+    ``len(idx)``) compiles in almost every round, and a pre-warm with other
+    data cannot reach those shapes (trnsci/trnsci#109: 57 compiles in 63
+    calls at n = 1e6). ``pad_rows=True`` pads every ``rows_fn`` index set to
+    a power of two (at most ``block``) by repeating its last index and drops
+    the extra rows, so ``rows_fn`` sees at most ⌈log₂ block⌉ + 1 shapes,
+    whatever the data. The factor is unchanged.
+
     The arithmetic (Schur rows, the new columns and the diagonal update)
     runs in float64 on the host, whatever device ``rows_fn`` returns on, so
     the factor does not depend on how a device reduces (the LNC split).
@@ -359,7 +369,7 @@ def pivoted_cholesky(
             noise / shift term).
         rows_fn: ``rows_fn(idx) -> (len(idx), n)``, rows ``idx`` of K, any
             device and floating dtype. ``idx`` is an int64 host tensor of
-            at most ``block`` distinct indices.
+            at most ``block`` indices, distinct unless ``pad_rows``.
         rank: Maximum rank k.
         tol: Stop early when the trace of the remaining Schur complement is
             at most ``tol · trace(K)``. Also stops when the largest remaining
@@ -371,6 +381,10 @@ def pivoted_cholesky(
             submatrix K[idx][:, idx].
         relax: Acceptance factor in (0, 1] for candidates after the first
             of a round (the first is always the global greedy pivot).
+        pad_rows: Pad each ``rows_fn`` call to a power-of-two number of
+            indices (capped at ``block``) by repeating the last one, so a
+            shape-compiled ``rows_fn`` sees a few data-independent shapes.
+            Costs up to 2x the rows per call; default False.
 
     Returns:
         L: (n, k) with k ≤ rank, in the diagonal's dtype and on its device.
@@ -399,6 +413,17 @@ def pivoted_cholesky(
     def host64(T, *shape):
         return T.detach().reshape(*shape).to(device=_HOST, dtype=torch.float64)
 
+    cap = int(block)
+
+    def rows(idx):  # (len(idx), n) float64 host rows of K, via padded calls when pad_rows
+        j = idx.numel()
+        if not pad_rows:
+            return host64(rows_fn(idx), j, n)
+        jp = min(1 << (j - 1).bit_length(), cap)  # j <= block always
+        if jp > j:
+            idx = torch.cat([idx, idx[-1:].expand(jp - j)])
+        return host64(rows_fn(idx), jp, n)[:j]
+
     m = 0
     while m < rank:
         rem = float(d.sum())
@@ -416,7 +441,7 @@ def pivoted_cholesky(
             K_c = None
             Scc = host64(sub_fn(cand), c, c) - Lc.T @ Lc
         else:
-            K_c = host64(rows_fn(cand), c, n)
+            K_c = rows(cand)
             Scc = K_c[:, cand] - Lc.T @ Lc
         # Greedy pivoted Cholesky on the c × c Schur block of the candidates.
         Scc = (Scc + Scc.T) / 2
@@ -444,8 +469,7 @@ def pivoted_cholesky(
             if perm.numel() == 0:
                 break
         piv = cand[perm]
-        j = perm.numel()
-        K_p = K_c[perm] if K_c is not None else host64(rows_fn(piv), j, n)
+        K_p = K_c[perm] if K_c is not None else rows(piv)
         S = K_p - Lt[:m, piv].T @ Lt[:m] if m else K_p  # Schur rows of the pivots
         Lnew = torch.linalg.solve_triangular(C, S, upper=False)  # (j, n)
         # Honour tol pivot by pivot: keep pivot r only if the trace before it is above tol.
