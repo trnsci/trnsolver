@@ -29,6 +29,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cg` and `gmres` no longer depend on the LNC split (#128).** They take
+  `reduction=` as `cg_block` does: `"pairwise"` (the default for both),
+  `"host64"` or `"device"` (the previous code). `None` reads
+  `TRNSOLVER_CG_REDUCTION` for `cg` and `TRNSOLVER_GMRES_REDUCTION` for
+  `gmres`. On the device, `rᴴz`, `pᴴAp`, the norms and the Gram-Schmidt
+  dots are now elementwise products, folded by the same fixed tree and
+  finished in float64 on the host. `gmres` also forms `x + V y` as
+  fixed-order axpys. Host tensors keep their float64 products. Trn2, LNC=2,
+  n = 1e5, the GP `KernelOperator` on one vector (289 ms per call):
+  `cg` goes from 299.7 to 299.9 ms per iteration (+0.1%), and `gmres` from
+  375.9 to 337.6 ms (−10%, because the old path cast to float64 on the
+  device for every dot).
 - **`cg_block` no longer depends on the LNC split (#128).** Device aten
   reductions over n (`sum`, `vector_norm`, matmul) add in an order that
   depends on how the work is split across logical cores. On Trn2 at

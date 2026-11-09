@@ -81,10 +81,12 @@ _FOLD_LEAF = 64  # fold until at most this many rows remain (then host fp64)
 _QTV_BLOCK = 128  # rows per block of the blocked Qᵀ V (one 128-row contraction)
 
 
-def _reduction_mode(reduction: str | None) -> str:
-    """Resolve ``reduction=...``; ``None`` reads ``TRNSOLVER_CG_REDUCTION``."""
+def _reduction_mode(
+    reduction: str | None, env: str = "TRNSOLVER_CG_REDUCTION", default: str = "pairwise"
+) -> str:
+    """Resolve ``reduction=...``; ``None`` reads the ``env`` variable (else ``default``)."""
     if reduction is None:
-        reduction = os.environ.get("TRNSOLVER_CG_REDUCTION", "").strip().lower() or "pairwise"
+        reduction = os.environ.get(env, "").strip().lower() or default
     if reduction not in _REDUCTIONS:
         raise ValueError(f"reduction must be one of {_REDUCTIONS}; got {reduction!r}")
     return reduction

@@ -2,7 +2,7 @@
 
 Both solvers operate on the host (PyTorch). The matvec / inner-product hot path would benefit from NKI Level 1/2 kernels in `trnblas`, but the iteration loop itself stays on CPU.
 
-## `cg(A, b, x0=None, tol=1e-6, maxiter=1000, M=None)`
+## `cg(A, b, x0=None, tol=1e-6, maxiter=1000, M=None, *, reduction=None)`
 
 Conjugate Gradient for SPD `A`. `A` may be a tensor or a callable `A(x) → A @ x`.
 
@@ -10,6 +10,7 @@ Conjugate Gradient for SPD `A`. `A` may be a tensor or a callable `A(x) → A @ 
 - **`tol`** — relative residual tolerance
 - **`maxiter`** — iteration cap
 - **`M`** — optional preconditioner (tensor or callable applying `M⁻¹`)
+- **`reduction`** — how `rᴴz`, `pᴴAp` and `‖r‖` reduce over n (#128): `"pairwise"` (default), `"host64"` or `"device"`, as in [`cg_block`](#cg_blocka-b-mnone--tol1e-6-maxiternone-check_every10-x0none-return_coeffsfalse-reductionnone). `None` reads `TRNSOLVER_CG_REDUCTION`. Host tensors are multiplied in float64 in every mode, as before. On the device the product is in the working dtype, then folded and finished in float64 on the host.
 
 Returns `(x, iters, residual)`.
 
@@ -17,9 +18,20 @@ Returns `(x, iters, residual)`.
 x, iters, residual = trnsolver.cg(A_spd, b, tol=1e-8)
 ```
 
-## `gmres(A, b, x0=None, tol=1e-6, maxiter=200, restart=30)`
+## `gmres(A, b, x0=None, tol=1e-6, maxiter=200, restart=30, *, reduction=None)`
 
 GMRES for general (non-symmetric) systems. Same calling convention as `cg`. `restart` controls the Krylov subspace size before restart.
+
+`reduction` (#128) applies to the modified Gram-Schmidt inner products and the norms: `"pairwise"` (default), `"host64"` or `"device"`. With `"pairwise"` / `"host64"`, the update `x + V y` is formed as fixed-order axpys instead of a matmul. `None` reads `TRNSOLVER_GMRES_REDUCTION`.
+
+Cost on Trn2 (LNC=2, one logical core, n = 1e5, the GP exemplar's `KernelOperator` applied to one vector, 289 ms per call, 60 iterations):
+
+| solver | `device` ms/iter | `pairwise` ms/iter | `host64` ms/iter |
+|---|---|---|---|
+| `cg` | 299.7 | 299.9 (+0.1%) | 296.7 |
+| `gmres` (restart 30) | 375.9 | 337.6 (−10%) | 324.6 |
+
+`gmres` gets faster because the old path cast both vectors to float64 on the device for every Gram-Schmidt dot.
 
 ```python
 x, iters, residual = trnsolver.gmres(A, b, tol=1e-6)

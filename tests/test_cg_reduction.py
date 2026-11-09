@@ -25,7 +25,7 @@ import pytest
 import torch
 
 import trnsolver
-from trnsolver import block
+from trnsolver import block, iterative
 
 
 class _Dev(torch.Tensor):
@@ -82,11 +82,22 @@ def _split_reduce(name, args, kwargs):
         t = args[0]
         h = t.shape[0] // 2
         return torch.sqrt((t[:h] * t[:h]).sum(dim=0) + (t[h:] * t[h:]).sum(dim=0))
-    if name in ("matmul", "__matmul__", "mm") and len(args) == 2:
+    if name in ("matmul", "__matmul__", "mm", "mv") and len(args) == 2:
         A, B = args
-        if A.dim() == 2 and B.dim() == 2 and A.shape[1] > 1:
+        if A.dim() == 2 and B.dim() in (1, 2) and A.shape[1] > 1:
             h = A.shape[1] // 2
             return A[:, :h] @ B[:h] + A[:, h:] @ B[h:]
+    # cg / gmres (#128): full 1-D inner products and norms.
+    if name in ("vdot", "dot") and len(args) == 2 and args[0].dim() == 1 and args[0].shape[0] > 1:
+        u, v = args
+        h = u.shape[0] // 2
+        f = torch.vdot if name == "vdot" else torch.dot
+        return f(u[:h], v[:h]) + f(u[h:], v[h:])
+    if name == "linalg_norm" and len(args) == 1 and not kwargs and args[0].dim() == 1:
+        t = args[0]
+        if t.shape[0] > 1:
+            h = t.shape[0] // 2
+            return torch.sqrt(t[:h].abs().square().sum() + t[h:].abs().square().sum())
     return None
 
 
@@ -343,3 +354,160 @@ class TestModes:
             assert P.reduction == r
             assert torch.allclose(P(V), ref, rtol=1e-8, atol=1e-10), r
             assert torch.allclose(P(V[:, 0]), ref[:, 0], rtol=1e-8, atol=1e-10), r
+
+
+# ── cg / gmres (#128) ────────────────────────────────────────────────────────
+
+
+def _vec_op(A):
+    """Fixed-order matvec for cg / gmres on stand-in vectors."""
+
+    def op(x):
+        with torch._C.DisableTorchFunctionSubclass():
+            return (A @ x[:, None])[:, 0].as_subclass(_Dev)
+
+    return op
+
+
+def _nonsym(n, seed=11):
+    g = torch.Generator().manual_seed(seed)
+    _, A = _gp(n, noise=1.0, seed=seed)
+    return A + 0.05 * torch.randn(n, n, generator=g, dtype=torch.float64) / n**0.5
+
+
+class TestVectorSolvers:
+    """cg and gmres take ``reduction=`` as cg_block does."""
+
+    def _both(self, fn):
+        with _layout(1):
+            a = fn()
+        with _layout(2):
+            b = fn()
+        return a, b
+
+    def _cg(self, red, n=1500):
+        _, A = _gp(n, noise=1e-1)
+        b = _dev(torch.randn(n, generator=torch.Generator().manual_seed(12)))
+        x, it, res = trnsolver.cg(_vec_op(A.float()), b, tol=1e-6, maxiter=500, reduction=red)
+        return _plain(x), it, res, A
+
+    def _gmres(self, red, n=1200):
+        A = _nonsym(n)
+        b = _dev(torch.randn(n, generator=torch.Generator().manual_seed(13)))
+        x, it, res = trnsolver.gmres(
+            _vec_op(A.float()), b, tol=1e-6, maxiter=20, restart=15, reduction=red
+        )
+        return _plain(x), it, res, A
+
+    @pytest.mark.parametrize("solver", ["_cg", "_gmres"])
+    @pytest.mark.parametrize("red", ["pairwise", "host64"])
+    def test_bitwise_across_layouts(self, solver, red):
+        (xa, ia, ra, A), (xb, ib, rb, _) = self._both(lambda: getattr(self, solver)(red))
+        assert torch.equal(xa, xb)
+        assert ia == ib and ra == rb
+        b = torch.randn(
+            xa.shape[0], generator=torch.Generator().manual_seed(12 if solver == "_cg" else 13)
+        )
+        x64 = torch.linalg.solve(A, b.double())
+        assert float((xa.double() - x64).norm() / x64.norm()) < 1e-3
+        assert ra < 1e-5
+
+    @pytest.mark.parametrize("solver", ["_cg", "_gmres"])
+    def test_device_mode_differs(self, solver):
+        # On the host the stand-in's "device" dots are float64, so their
+        # order rarely moves x; the fp32 device norms do move the residual.
+        (xa, _, ra, _), (xb, _, rb, _) = self._both(lambda: getattr(self, solver)("device"))
+        assert not (torch.equal(xa, xb) and ra == rb)
+
+    @pytest.mark.parametrize("red", block._REDUCTIONS)
+    def test_cg_modes_agree(self, red):
+        n = 600
+        _, A = _gp(n, noise=1e-1)
+        b = torch.randn(n, generator=torch.Generator().manual_seed(14))
+        x, it, res = trnsolver.cg(A.float(), b, tol=1e-6, reduction=red)
+        x0, it0, _ = trnsolver.cg(A.float(), b, tol=1e-6, reduction="device")
+        # In fp32 the CG residual is not monotone near 1e-6 (it moves by
+        # ~2x from one step to the next), so where it first drops below tol
+        # can shift by a few steps with the BLAS's rounding of A @ p.
+        assert res < 1e-6 and abs(it - it0) <= max(2, it0 // 20), (it, it0)
+        x64 = torch.linalg.solve(A, b.double())
+        for xs in (x, x0):
+            assert float((xs.double() - x64).norm() / x64.norm()) < 1e-4
+        assert torch.allclose(x, x0, rtol=1e-4, atol=1e-5)
+
+    @pytest.mark.parametrize("red", block._REDUCTIONS)
+    def test_gmres_modes_agree(self, red):
+        n = 500
+        A = _nonsym(n, seed=15)
+        b = torch.randn(n, generator=torch.Generator().manual_seed(15))
+        # gmres checks the residual only at a restart, so the iteration
+        # count moves in steps of ``restart``. In fp32 this system stagnates
+        # at a residual of ~5e-7 from the third cycle on, and after the
+        # second cycle it is ~8.5e-7: a tol of 1e-6 sits on that plateau, and
+        # the BLAS's rounding of A @ v (MKL on Linux, Accelerate on macOS)
+        # decided between 40 and 60 iterations. tol=1e-5 is reached after
+        # two cycles with a ~10x margin in every mode.
+        x, it, res = trnsolver.gmres(A.float(), b, tol=1e-5, restart=20, reduction=red)
+        x0, it0, _ = trnsolver.gmres(A.float(), b, tol=1e-5, restart=20, reduction="device")
+        assert res < 1e-5 and abs(it - it0) <= 2, (it, it0)
+        x64 = torch.linalg.solve(A, b.double())
+        for xs in (x, x0):
+            assert float((xs.double() - x64).norm() / x64.norm()) < 1e-5
+        assert torch.allclose(x, x0, rtol=1e-4, atol=1e-5)
+
+    def test_cg_complex_hpd(self):
+        n = 300
+        g = torch.Generator().manual_seed(16)
+        Z = torch.randn(n, n, generator=g, dtype=torch.complex128)
+        A = Z @ Z.mH / n + torch.eye(n, dtype=torch.complex128)
+        b = torch.randn(n, generator=g, dtype=torch.complex128)
+        ref = torch.linalg.solve(A, b)
+        for red in block._REDUCTIONS:
+            x, _, res = trnsolver.cg(
+                A.to(torch.complex64), b.to(torch.complex64), tol=1e-6, reduction=red
+            )
+            assert res < 1e-6, red
+            assert float((x.to(torch.complex128) - ref).norm() / ref.norm()) < 1e-4, red
+
+    def test_inner_and_norm_helpers(self):
+        g = torch.Generator().manual_seed(17)
+        u, v = torch.randn(100003, generator=g), torch.randn(100003, generator=g)
+        ref = float((u.double() * v.double()).sum())
+        nref = float(u.double().norm())
+        scale = float((u.double() * v.double()).abs().sum())
+        for red in block._REDUCTIONS:
+            # Host tensors: float64 products in every mode; the device-mode
+            # norm is torch.linalg.norm in the working dtype (fp32).
+            tol = 1e-6 if red == "device" else 1e-12
+            assert abs(iterative._inner(u, v, red) - ref) <= 1e-12 * scale
+            assert abs(iterative._norm(u, red) - nref) <= tol * nref
+
+    def test_env_and_defaults(self, monkeypatch):
+        monkeypatch.delenv("TRNSOLVER_CG_REDUCTION", raising=False)
+        monkeypatch.delenv("TRNSOLVER_GMRES_REDUCTION", raising=False)
+        A, b = torch.eye(4) * 2, torch.ones(4)
+        calls = []
+        orig = iterative._inner
+
+        def spy(u, v, reduction="device"):
+            calls.append(reduction)
+            return orig(u, v, reduction)
+
+        monkeypatch.setattr(iterative, "_inner", spy)
+        trnsolver.cg(A, b)
+        assert set(calls) == {"pairwise"}
+        calls.clear()
+        trnsolver.gmres(A, b)
+        assert set(calls) == {iterative._GMRES_DEFAULT}
+        calls.clear()
+        monkeypatch.setenv("TRNSOLVER_CG_REDUCTION", "host64")
+        monkeypatch.setenv("TRNSOLVER_GMRES_REDUCTION", "device")
+        trnsolver.cg(A, b)
+        assert set(calls) == {"host64"}
+        calls.clear()
+        trnsolver.gmres(A, b)
+        assert calls == []  # "device" keeps the old fp64 dot
+        with pytest.raises(ValueError, match="reduction"):
+            trnsolver.cg(A, b, reduction="fast")
+        with pytest.raises(ValueError, match="reduction"):
+            trnsolver.gmres(A, b, reduction="fast")
