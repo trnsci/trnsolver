@@ -178,6 +178,8 @@ def test_pairwise_reductions_on_device_vs_cpu():
 def _probe(lnc, cores, out):
     script = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "probe_cg_reduction.py"
     env = dict(os.environ, NEURON_LOGICAL_NC_CONFIG=str(lnc), NEURON_RT_VISIBLE_CORES=cores)
+    if "TORCH_NEURONX_NEFF_CACHE_DIR" in env:  # keep the two LNC settings' NEFFs apart
+        env["TORCH_NEURONX_NEFF_CACHE_DIR"] += f"/lnc{lnc}"
     args = [sys.executable, "-P", str(script), "--n", "1e5", "--R", "33", "--out", str(out)]
     args += ["--no-ref", "--micro-reps", "2", "--modes", "pairwise,host64,device"]
     proc = subprocess.run(args, env=env, capture_output=True, text=True, timeout=1800)
