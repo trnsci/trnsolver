@@ -29,6 +29,7 @@ Also here:
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Callable
 
 import torch
@@ -52,14 +53,160 @@ def _as_block_op(A, dtype) -> Callable[[torch.Tensor], torch.Tensor]:
     return lambda V: A @ V
 
 
-def _cdot(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
-    """Column-wise inner products Re(xⱼᴴ yⱼ), shape (R,)."""
-    s = (X.conj() * Y).sum(dim=0) if X.is_complex() else (X * Y).sum(dim=0)
-    return s.real if s.is_complex() else s
+# ── Reductions over n: fixed order, independent of the LNC split (#128) ──────
+#
+# Device aten reductions over n (``sum``, ``vector_norm``, matmul) add in an
+# order that depends on how the compiler splits the work across logical
+# cores: on Trn2 at n = 1e5, R = 33, ``(X * Y).sum(0)`` differs by 4.9e-4
+# between LNC=1 and LNC=2 (bitwise reproducible within one LNC), and the GP
+# posterior mean by 4.5e-4. Elementwise ops are bitwise equal across LNC. So:
+#
+# - ``"pairwise"`` (default): zero-pad the rows to m · 2^L (m ≤ 64; zeros are
+#   exact for sums), fold with L elementwise adds of contiguous halves
+#   (t[:h] + t[h:]) on the device, which is a fixed pairwise tree that only
+#   depends on n, then D2H the (m, R) leaves and sum them in float64 on the
+#   host. About 2x more accurate than the device sum.
+# - ``"host64"``: D2H the whole (n, R) elementwise product (or X itself for a
+#   norm) and reduce in float64 on the host. The most accurate (rel 3e-8 for a
+#   dot, set by the fp32 product; 1e-10 for a norm), also LNC-invariant, but
+#   one full (n, R) D2H per reduction.
+# - ``"device"``: the previous device reductions (fastest; LNC-dependent).
+#   Kept for performance comparison.
+#
+# ``reduction=None`` reads ``TRNSOLVER_CG_REDUCTION`` (default "pairwise").
+# The pairwise / host64 results are a few-element host reduction, so every
+# call is one small D2H (a host sync) and one (R,) upload.
+_REDUCTIONS = ("pairwise", "host64", "device")
+_FOLD_LEAF = 64  # fold until at most this many rows remain (then host fp64)
+_QTV_BLOCK = 128  # rows per block of the blocked Qᵀ V (one 128-row contraction)
 
 
-def _col_norm(X: torch.Tensor) -> torch.Tensor:
-    return torch.linalg.vector_norm(X, dim=0)
+def _reduction_mode(reduction: str | None) -> str:
+    """Resolve ``reduction=...``; ``None`` reads ``TRNSOLVER_CG_REDUCTION``."""
+    if reduction is None:
+        reduction = os.environ.get("TRNSOLVER_CG_REDUCTION", "").strip().lower() or "pairwise"
+    if reduction not in _REDUCTIONS:
+        raise ValueError(f"reduction must be one of {_REDUCTIONS}; got {reduction!r}")
+    return reduction
+
+
+def _fold_plan(n: int, leaf: int = _FOLD_LEAF) -> tuple[int, int]:
+    """(levels L, leaves m) with m = ceil(n / 2^L) ≤ ``leaf``."""
+    lev = 0
+    while -(-n >> lev) > leaf:
+        lev += 1
+    return lev, -(-n >> lev)
+
+
+def _fold_host64(t: torch.Tensor, leaf: int = _FOLD_LEAF) -> torch.Tensor:
+    """Σ over dim 0 by a fixed pairwise tree: device halvings, then host float64.
+
+    Only elementwise adds of contiguous halves run on ``t``'s device; the
+    tree depends on ``t.shape[0]`` alone, not on how the device splits work.
+    Returns a float64 host tensor of shape ``t.shape[1:]``.
+    """
+    n = t.shape[0]
+    lev, m = _fold_plan(n, leaf)
+    npad = m << lev
+    if npad != n:
+        t = torch.cat([t, t.new_zeros((npad - n, *t.shape[1:]))], 0)
+    for _ in range(lev):
+        h = t.shape[0] // 2
+        t = t[:h] + t[h:]
+    return t.to(device=_HOST, dtype=torch.float64).sum(dim=0)
+
+
+def _real_prod(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """Elementwise Re(conj(x) y) (real dtype)."""
+    if X.is_complex():
+        return X.real * Y.real + X.imag * Y.imag
+    return X * Y
+
+
+def _cdot(X: torch.Tensor, Y: torch.Tensor, reduction: str = "pairwise") -> torch.Tensor:
+    """Column-wise inner products Re(xⱼᴴ yⱼ), shape (R,), on X's device."""
+    if reduction == "device":
+        s = (X.conj() * Y).sum(dim=0) if X.is_complex() else (X * Y).sum(dim=0)
+        return s.real if s.is_complex() else s
+    P = _real_prod(X, Y)
+    if reduction == "host64":
+        s = P.to(device=_HOST, dtype=torch.float64).sum(dim=0)
+    else:
+        s = _fold_host64(P)
+    return s.to(device=P.device, dtype=P.dtype)
+
+
+def _col_norm(X: torch.Tensor, reduction: str = "pairwise") -> torch.Tensor:
+    """Column 2-norms ‖xⱼ‖, shape (R,), real dtype, on X's device."""
+    if reduction == "device":
+        return torch.linalg.vector_norm(X, dim=0)
+    rdtype = X.real.dtype if X.is_complex() else X.dtype
+    if reduction == "host64":
+        X64 = X.to(device=_HOST, dtype=torch.complex128 if X.is_complex() else torch.float64)
+        s = torch.linalg.vector_norm(X64, dim=0)
+    else:
+        s = _fold_host64(_real_prod(X, X)).sqrt()
+    return s.to(device=X.device, dtype=rdtype)
+
+
+def _pad_rows(Q: torch.Tensor, b: int = _QTV_BLOCK) -> torch.Tensor:
+    """Q (n, k) zero-padded to a multiple of b rows (Q itself if n already is)."""
+    n = Q.shape[0]
+    npad = -(-n // b) * b
+    return Q if npad == n else torch.cat([Q, Q.new_zeros(npad - n, *Q.shape[1:])], 0)
+
+
+def _cdot_and_norm(X: torch.Tensor, Y: torch.Tensor, reduction: str = "pairwise"):
+    """(``_cdot(X, Y)``, ``_col_norm(X)``); ``"pairwise"`` folds both in one pass.
+
+    The two products share one fold and one D2H; each column's result is
+    the same as from the separate calls (the fold is column-wise).
+    """
+    if reduction != "pairwise":
+        return _cdot(X, Y, reduction), _col_norm(X, reduction)
+    R = X.shape[1]
+    s = _fold_host64(torch.cat([_real_prod(X, Y), _real_prod(X, X)], 1))
+    rdtype = X.real.dtype if X.is_complex() else X.dtype
+    out = torch.cat([s[:R], s[R:].sqrt()]).to(device=X.device, dtype=rdtype)
+    return out[:R], out[R:]
+
+
+def _tmatmul(
+    Q: torch.Tensor,
+    V: torch.Tensor,
+    reduction: str = "pairwise",
+    *,
+    Qpad: torch.Tensor | None = None,
+    Q64: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Qᵀ V for tall Q (n, k) and V (n, R): a reduction over n (#128, #117).
+
+    - ``"pairwise"``: Q and V zero-padded to m blocks of ``_QTV_BLOCK`` rows
+      (``Qpad``: Q already padded by ``_pad_rows``, if at hand), the block
+      products V_iᵀ Q_i from one bmm (each a ``_QTV_BLOCK``-row contraction;
+      Q's blocks are a plain view, only V is transposed), then the m blocks
+      folded as in ``_fold_host64``, down to at most 4 before the host float64
+      sum, which keeps the D2H to 4 · R · k values.
+    - ``"host64"``: Qᵀ V in float64 on the host (``Q64``: Q as float64 on the
+      host, if at hand); one (n, R) D2H.
+    - ``"device"``: ``Q.T @ V``.
+
+    The result is (k, R), in V's dtype on V's device.
+    """
+    if reduction == "device":
+        return Q.T @ V
+    if reduction == "host64":
+        Q64 = Q.to(device=_HOST, dtype=torch.float64) if Q64 is None else Q64
+        c = Q64.T @ V.to(device=_HOST, dtype=torch.float64)
+        return c.to(device=V.device, dtype=V.dtype)
+    b = _QTV_BLOCK
+    Qpad = _pad_rows(Q, b) if Qpad is None else Qpad
+    npad, k = Qpad.shape
+    m, R = npad // b, V.shape[1]
+    Vt = _pad_rows(V, b).reshape(m, b, R).transpose(1, 2).contiguous()  # (m, R, b)
+    parts = torch.bmm(Vt, Qpad.view(m, b, k))  # (m, R, k): V_iᵀ Q_i
+    c = _fold_host64(parts, leaf=4).T.contiguous()
+    return c.to(device=V.device, dtype=V.dtype)
 
 
 @_fp64_host_guard("cg_block")
@@ -74,6 +221,7 @@ def cg_block(
     check_every: int = 10,
     X0: torch.Tensor | None = None,
     return_coeffs: bool = False,
+    reduction: str | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Column-batched preconditioned CG for A X = B (A SPD), one A(P) per iteration.
 
@@ -97,6 +245,16 @@ def cg_block(
         X0: Initial guess (n, R) or (n,). Costs one extra operator call.
         return_coeffs: Also return the per-column CG coefficients α and β
             (for ``lanczos_tridiag_from_cg`` and stochastic log-det).
+        reduction: How inner products and norms reduce over n (#128).
+            ``"pairwise"`` (default): a fixed pairwise tree of elementwise
+            adds on the device, finished in float64 on the host, so the
+            result does not depend on the device's LNC split (bitwise equal
+            at LNC=1 and LNC=2). ``"host64"``: the whole (n, R) product is
+            copied to the host and reduced in float64 (most accurate; one
+            (n, R) D2H per reduction). ``"device"``: plain device sums (the
+            previous behaviour; fastest, but at n = 1e5 the sums differ
+            between LNC=1 and LNC=2 by about 5e-4). ``None`` reads
+            ``TRNSOLVER_CG_REDUCTION``.
 
     Returns:
         X: Solution, shape and dtype of B (bf16/fp16 computed in fp32).
@@ -122,8 +280,11 @@ def cg_block(
         Zero columns of B return zero, count as converged at iteration 0,
         and report residual 0.
 
-    Inner products run in the working dtype on B's device (no float64 on
-    device). Eager-only (``torch.compiler.disable``); see :func:`cg` (#41).
+    Inner products: elementwise products in the working dtype on B's device
+    (no float64 on device), reduced as ``reduction`` says. With
+    ``"pairwise"`` / ``"host64"`` each reduction reads a few values back to
+    the host (two small syncs per iteration). Eager-only
+    (``torch.compiler.disable``); see :func:`cg` (#41).
     """
     B, orig = _to_fp32(B)
     vector = B.dim() == 1
@@ -134,6 +295,7 @@ def cg_block(
     if check_every < 1:
         raise ValueError(f"cg_block: check_every must be >= 1, got {check_every}")
     n, R = B.shape
+    red = _reduction_mode(reduction)
     if maxiter is None:
         maxiter = 10 * n
     dtype, device = B.dtype, B.device
@@ -141,7 +303,7 @@ def cg_block(
     op = _as_block_op(A, dtype)
     precond = None if M is None else _as_block_op(M, dtype)
 
-    b_norm = _col_norm(B)
+    b_norm = _col_norm(B, red)
     nonzero = b_norm > 0
     thresh = tol * b_norm
     if X0 is not None:
@@ -154,9 +316,9 @@ def cg_block(
         Rr = B.clone()
     Z = precond(Rr) if precond is not None else Rr
     P = Z.clone()
-    rz = _cdot(Rr, Z)
+    rz, r_norm = _cdot_and_norm(Rr, Z, red)
     rz0 = rz.clone()
-    active = nonzero & (_col_norm(Rr) > thresh)
+    active = nonzero & (r_norm > thresh)
     breakdown = torch.zeros(R, dtype=torch.bool, device=device)
     col_iters = torch.zeros(R, dtype=torch.int64, device=device)
     one = torch.ones((), dtype=rdtype, device=device)
@@ -169,7 +331,7 @@ def cg_block(
         if k % check_every == 0 and not bool(active.any()):
             break
         AP = op(P)
-        pAp = _cdot(P, AP)
+        pAp = _cdot(P, AP, red)
         ok = pAp > 0
         breakdown = breakdown | (active & ~ok)
         active = active & ok
@@ -177,7 +339,7 @@ def cg_block(
         X = X + alpha * P
         Rr = Rr - alpha * AP
         Z = precond(Rr) if precond is not None else Rr
-        rz_new = _cdot(Rr, Z)
+        rz_new, r_norm = _cdot_and_norm(Rr, Z, red)
         rz_ok = rz != 0
         beta = torch.where(active & rz_ok, rz_new / torch.where(rz_ok, rz, one), zero)
         P = torch.where(active, Z + beta * P, P)
@@ -186,12 +348,12 @@ def cg_block(
         if return_coeffs:
             alphas.append(alpha)
             betas.append(beta)
-        active = active & (_col_norm(Rr) > thresh)
+        active = active & (r_norm > thresh)
         k += 1
 
     safe_norm = torch.where(nonzero, b_norm, torch.ones_like(b_norm))
-    res = torch.where(nonzero, _col_norm(Rr) / safe_norm, torch.zeros_like(b_norm))
-    true_res = torch.where(nonzero, _col_norm(B - op(X)) / safe_norm, torch.zeros_like(b_norm))
+    res = torch.where(nonzero, r_norm / safe_norm, torch.zeros_like(b_norm))
+    true_res = torch.where(nonzero, _col_norm(B - op(X), red) / safe_norm, torch.zeros_like(b_norm))
     info: dict = {
         "iterations": k,
         "col_iterations": col_iters,
@@ -243,7 +405,8 @@ def cg_block_ir(
         tol: Outer per-column relative true-residual target (float64).
         inner_tol: ``cg_block`` tolerance for each correction solve.
         max_outer: Maximum number of corrections.
-        **cg_kwargs: Passed to ``cg_block`` (``maxiter``, ``check_every``).
+        **cg_kwargs: Passed to ``cg_block`` (``maxiter``, ``check_every``,
+            ``reduction``).
 
     Returns:
         X: float64 solution on the host, shape of B. (fp64 because an fp32
@@ -280,7 +443,7 @@ def cg_block_ir(
         def A_hi_op(X):
             return A64 @ X
 
-    b_norm = _col_norm(B64)
+    b_norm = _col_norm(B64, "host64")  # host float64 already
     nonzero = b_norm > 0
     safe_norm = torch.where(nonzero, b_norm, torch.ones_like(b_norm))
     X = torch.zeros_like(B64)
@@ -288,7 +451,7 @@ def cg_block_ir(
     inner_iters: list[int] = []
     for outer in range(max_outer + 1):
         Rr = B64 - A_hi_op(X) if outer > 0 else B64.clone()
-        r_norm = _col_norm(Rr)
+        r_norm = _col_norm(Rr, "host64")
         rel = torch.where(nonzero, r_norm / safe_norm, torch.zeros_like(b_norm))
         history.append(rel)
         todo = nonzero & (rel > tol)
@@ -544,7 +707,11 @@ class PivotedLowRankPreconditioner:
       u·√k·‖V‖ along Q, which the 1/s weight blows up; the second pass
       takes that out, so what is left is an error orthogonal to Q, which
       perturbs the preconditioner only to second order. No host round
-      trip; the (k,) diagonal stays on the device too.
+      trip; the (k,) diagonal stays on the device too. The two Qᵀ V
+      reductions over n follow ``reduction`` (as in ``cg_block``; default
+      ``"pairwise"``: blocked 128-row products, folded in a fixed order and
+      finished in float64 on the host, so the apply does not depend on the
+      LNC split, #128); the products by Q contract over k only.
     - ``"auto"`` (default): ``"native"`` for float64 L, else ``"host64"``.
       A float64 L on the neuron device takes ``"host64"`` under backend
       ``"auto"`` (device aten computes float64 at fp32 precision; one
@@ -559,9 +726,17 @@ class PivotedLowRankPreconditioner:
             columns and the (k,) weights s / (σ² + s), in L's dtype on L's
             device.
         apply: the resolved mode.
+        reduction: the resolved ``reduction`` (used by ``"projected"``).
     """
 
-    def __init__(self, L: torch.Tensor, shift: float, *, apply: str = "auto"):
+    def __init__(
+        self,
+        L: torch.Tensor,
+        shift: float,
+        *,
+        apply: str = "auto",
+        reduction: str | None = None,
+    ):
         shift = float(shift)
         if not shift > 0:
             raise ValueError(f"PivotedLowRankPreconditioner: shift must be > 0, got {shift}")
@@ -570,6 +745,7 @@ class PivotedLowRankPreconditioner:
                 f"apply must be 'auto', 'host64', 'native' or 'projected', got {apply!r}"
             )
         _refuse_device_fp64("PivotedLowRankPreconditioner", (L,), {})
+        self.reduction = _reduction_mode(reduction)
         orig_apply = apply
         if apply == "auto":
             apply = "native" if L.dtype == torch.float64 else "host64"
@@ -594,9 +770,18 @@ class PivotedLowRankPreconditioner:
         C = torch.linalg.cholesky(shift * torch.eye(k, dtype=torch.float64) + G)
         self._C = C
         self.Q = self.g = self.W = None
+        self._Qpad = self._Q64 = None
         if apply == "projected":
             Q, lam = _gram_basis(L64, G, shift)
-            self.Q = Q.to(device=L.device, dtype=L.dtype)
+            if self.reduction == "pairwise":
+                # Q zero-padded to whole row blocks for the fixed-order Qᵀ V;
+                # .Q is a view of it (no second copy).
+                self._Qpad = _pad_rows(Q).to(device=L.device, dtype=L.dtype)
+                self.Q = self._Qpad[: Q.shape[0]]
+            else:
+                self.Q = Q.to(device=L.device, dtype=L.dtype)
+                if self.reduction == "host64":
+                    self._Q64 = Q
             self.g = (shift / (lam + shift)).to(device=L.device, dtype=L.dtype)
             return
         W = torch.linalg.solve_triangular(C, L64.T, upper=False).T
@@ -615,12 +800,14 @@ class PivotedLowRankPreconditioner:
     def _apply_projected(self, V: torch.Tensor) -> torch.Tensor:
         vec = V.dim() == 1
         Vm = V.unsqueeze(-1) if vec else V
-        Q, g = self.Q, self.g
+        Q, g, Qpad = self.Q, self.g, self._Qpad
         if Q.dtype != Vm.dtype:
             Q, g = Q.to(Vm.dtype), g.to(Vm.dtype)
-        c1 = Q.T @ Vm
+            Qpad = None if Qpad is None else Qpad.to(Vm.dtype)
+        red = self.reduction
+        c1 = _tmatmul(Q, Vm, red, Qpad=Qpad, Q64=self._Q64)
         Y = Vm - Q @ c1  # (I − Q Qᵀ) V, first pass
-        c2 = Q.T @ Y  # what the first pass left along Q
+        c2 = _tmatmul(Q, Y, red, Qpad=Qpad, Q64=self._Q64)  # what the first pass left along Q
         # z = (Y − Q c2)/s + Q (c1 + c2)/(σ² + s) = (Y − Q (c2 − g ⊙ (c1 + c2)))/s
         out = (Y - Q @ (c2 - g[:, None] * (c1 + c2))) / self.shift
         return out.squeeze(-1) if vec else out
@@ -654,6 +841,7 @@ def pivoted_lowrank_preconditioner(
     *,
     tol: float = 0.0,
     apply: str = "auto",
+    reduction: str | None = None,
 ) -> PivotedLowRankPreconditioner:
     """Preconditioner (L Lᵀ + shift·I)⁻¹ for K + shift·I, L from ``pivoted_cholesky``.
 
@@ -674,7 +862,7 @@ def pivoted_lowrank_preconditioner(
     indexing) are exact.
     """
     L = pivoted_cholesky(diag_fn, rows_fn, rank, tol=tol)
-    return PivotedLowRankPreconditioner(L, shift, apply=apply)
+    return PivotedLowRankPreconditioner(L, shift, apply=apply, reduction=reduction)
 
 
 def lanczos_tridiag_from_cg(
@@ -728,6 +916,7 @@ def slq_logdet(
     dtype: torch.dtype = torch.float32,
     device: torch.device | str | None = None,
     tol: float = 1e-10,
+    reduction: str | None = None,
 ) -> tuple[float, dict]:
     """Stochastic Lanczos quadrature estimate of log det(A) for SPD A.
 
@@ -757,6 +946,7 @@ def slq_logdet(
             is a tensor, else host).
         tol: ``cg_block`` tolerance (columns that converge early end their
             quadrature there).
+        reduction: ``cg_block``'s reduction mode (default ``"pairwise"``).
 
     Returns:
         estimate (float) and info with ``"std_error"``, ``"quadratures"``
@@ -775,7 +965,14 @@ def slq_logdet(
         Z = M.sample(num_probes, generator=generator).to(device=device, dtype=dtype)
         base = M.logdet()
     _, info = cg_block(
-        A, Z, M, tol=tol, maxiter=num_iters, check_every=num_iters, return_coeffs=True
+        A,
+        Z,
+        M,
+        tol=tol,
+        maxiter=num_iters,
+        check_every=num_iters,
+        return_coeffs=True,
+        reduction=reduction,
     )
     Ts = lanczos_tridiag_from_cg(info["alpha"], info["beta"], info["col_iterations"])
     w2 = info["rz0"].to(device=_HOST, dtype=torch.float64)

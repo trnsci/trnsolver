@@ -29,6 +29,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cg_block` no longer depends on the LNC split (#128).** Device aten
+  reductions over n (`sum`, `vector_norm`, matmul) add in an order that
+  depends on how the work is split across logical cores. On Trn2 at
+  n = 1e5, R = 33, `cg_block`'s inner products differed by 4.9e-4 between
+  LNC=1 and LNC=2, and the GP posterior mean by 4.5e-4. The new
+  `reduction=` argument (or `TRNSOLVER_CG_REDUCTION`) chooses how the inner
+  products and norms reduce over n:
+  - `"pairwise"` (the new default): zero-pad the rows to m · 2^L (m ≤ 64),
+    fold with L elementwise adds of contiguous halves on the device (a fixed
+    tree that depends on n only), then sum the m leaves in float64 on the
+    host. It is about 2x more accurate than the device sum.
+  - `"host64"`: copy the whole (n, R) product to the host and reduce it in
+    float64. This is the most accurate option, at one (n, R) D2H per
+    reduction.
+  - `"device"`: the previous device sums. They are fastest, but
+    LNC-dependent; this mode is kept for performance comparison.
+
+  The residual norm and rᵀz now share one fold, so the default costs two
+  small host syncs per iteration. `PivotedLowRankPreconditioner(apply=
+  "projected")` takes the same `reduction=` for its two Qᵀ V reductions
+  (#117). With `"pairwise"`, it forms them as 128-row block products in one
+  bmm, folded in the same fixed order. `pivoted_lowrank_preconditioner` and
+  `slq_logdet` pass `reduction` through. The float64 policy and
+  `TRNSOLVER_REQUIRE_NKI` behaviour are unchanged.
+
 - **`occupied_subspace` with a complex Hermitian F raises `TypeError` (#132).**
   0.21.0 through 0.22.1 cast a complex64 / complex128 F to float32, dropping
   its imaginary part, and returned the occupied subspace of `F.real` with no
