@@ -99,6 +99,7 @@ class DeviceRows:
         self.device = device
         self.calls = self.rows = 0
         self.t_rows = 0.0
+        self.shapes = set()
 
     def rows_fn(self, idx):
         t = time.perf_counter()
@@ -108,6 +109,7 @@ class DeviceRows:
         self.t_rows += time.perf_counter() - t
         self.calls += 1
         self.rows += idx.numel()
+        self.shapes.add(idx.numel())
         return out
 
     def sub_fn(self, idx):
@@ -116,7 +118,21 @@ class DeviceRows:
         return trnsparse.kernel_matmul_reference(Xi, Xi, eye, "rbf", LS, OS)
 
 
-def build(X, op, device, *, rank, block, relax, apply, seq=False):
+def prewarm(X, device, block):
+    """Compile every rows_fn shape pad_rows can produce (powers of two up to block).
+
+    The shapes don't depend on the data, so this also works in TorchNeuron
+    compile-only mode, unlike a pre-warm build (trnsci/trnsci#109).
+    """
+    dr = DeviceRows(X, device)
+    t0 = time.perf_counter()
+    sizes = sorted({min(1 << b, block) for b in range(max(1, block).bit_length())})
+    for j in sizes:
+        dr.rows_fn(torch.arange(j))
+    return time.perf_counter() - t0, sizes
+
+
+def build(X, op, device, *, rank, block, relax, apply, seq=False, pad_rows=True):
     t = {}
     t0 = time.perf_counter()
     if seq:
@@ -125,10 +141,19 @@ def build(X, op, device, *, rank, block, relax, apply, seq=False):
     else:
         dr = DeviceRows(X, device)
         L = trnsolver.pivoted_cholesky(
-            op.diag, dr.rows_fn, rank, block=block, relax=relax, sub_fn=dr.sub_fn
+            op.diag,
+            dr.rows_fn,
+            rank,
+            block=block,
+            relax=relax,
+            sub_fn=dr.sub_fn,
+            pad_rows=pad_rows,
         )
-        info = dict(calls=dr.calls, rows=dr.rows, rows_s=round(dr.t_rows, 2))
+        info = dict(calls=dr.calls, rows=dr.rows, shapes=len(dr.shapes), rows_s=round(dr.t_rows, 2))
+    # cholesky_s includes the device rows (rows_s); host_s is the host fp64 part alone.
     t["cholesky_s"] = time.perf_counter() - t0
+    if info["rows_s"] is not None:
+        t["host_s"] = t["cholesky_s"] - info["rows_s"]
     t0 = time.perf_counter()
     Ld = L.to(device=device, dtype=torch.float32)
     M = trnsolver.PivotedLowRankPreconditioner(Ld, op.noise, apply=apply)
@@ -156,12 +181,21 @@ def cmd_build(a):
     op = trnsparse.KernelOperator(X, "rbf", LS, OS, a.noise, device=a.device)
     for apply in a.applies.split(","):
         L, M, t, info = build(
-            X, op, a.device, rank=a.rank, block=a.block, relax=a.relax, apply=apply, seq=a.seq
+            X,
+            op,
+            a.device,
+            rank=a.rank,
+            block=a.block,
+            relax=a.relax,
+            apply=apply,
+            seq=a.seq,
+            pad_rows=a.pad_rows,
         )
         ta = time_apply(M, n, a.device)
         print(
             f"n={n} rank={info['rank']} seq={a.seq} block={a.block} relax={a.relax} apply={apply}: "
-            f"cholesky {t['cholesky_s']:.1f}s (rows on device {info['rows_s']}s, {info['calls']} calls) "
+            f"pad_rows={a.pad_rows}: cholesky {t['cholesky_s']:.1f}s (rows on device {info['rows_s']}s, "
+            f"{info['calls']} calls, {info.get('shapes')} shapes; host {t.get('host_s', 0):.1f}s) "
             f"factor {t['factor_s']:.1f}s total {t['precond_s']:.1f}s; apply(n,33) {ta * 1e3:.0f} ms; "
             f"trace_rem {info['trace_rem']:.4e}",
             flush=True,
@@ -273,7 +307,14 @@ def cmd_gp(a):
     B = torch.cat([y[:, None], _rademacher(n, a.probes, 1)], 1).to(device=a.device, dtype=op.dtype)
     t["setup_s"] = time.perf_counter() - t0
     L, M, tb, binfo = build(
-        X, op, a.device, rank=min(a.rank, n), block=a.block, relax=a.relax, apply=a.apply
+        X,
+        op,
+        a.device,
+        rank=min(a.rank, n),
+        block=a.block,
+        relax=a.relax,
+        apply=a.apply,
+        pad_rows=a.pad_rows,
     )
     t.update(tb)
     t["precond_rank"] = binfo["rank"]
@@ -324,6 +365,17 @@ def main():
     ap.add_argument(
         "--seq", action="store_true", help="build: the one-row-per-step host build (baseline)"
     )
+    ap.add_argument(
+        "--pad-rows",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="pad device row calls to power-of-two shapes (trnsci/trnsci#109)",
+    )
+    ap.add_argument(
+        "--prewarm",
+        action="store_true",
+        help="compile the pad_rows shapes first (timed separately as prewarm_s)",
+    )
     ap.add_argument("--apply", default="projected")
     ap.add_argument("--applies", default="host64,projected")
     ap.add_argument(
@@ -346,6 +398,11 @@ def main():
         torch.set_num_threads(a.threads)
     a.device = "cpu" if a.cpu else "neuron"
     trnsparse.set_backend("pytorch" if a.cpu else "nki")
+    if a.prewarm and a.cmd != "conv":
+        X = synthetic_field(int(a.n), 3, noise=a.noise)[0]
+        tp, sizes = prewarm(X, a.device, a.block)
+        print(f"prewarm: {len(sizes)} shapes {sizes} in {tp:.1f}s", flush=True)
+        emit(kind="prewarm", n=int(a.n), prewarm_s=round(tp, 2), shapes=sizes)
     {"build": cmd_build, "conv": cmd_conv, "gp": cmd_gp}[a.cmd](a)
 
 

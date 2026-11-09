@@ -149,6 +149,45 @@ def test_block_build_from_trnsparse_kernel_matmul():
     assert math.isfinite(rem_dev) and rem_dev < 1.15 * rem_host
 
 
+def test_padded_rows_from_trnsparse_kernel_matmul():
+    # trnsci/trnsci#109: pad_rows gives a few power-of-two kernel shapes and
+    # the same factor as unpadded calls (padding rows are computed and dropped).
+    trnsparse = pytest.importorskip("trnsparse")
+    n, ell, noise, block = 20000, 0.15, 1e-2, 512
+    g = torch.Generator().manual_seed(0)
+    X = torch.rand(n, 3, generator=g, dtype=torch.float64)
+    trnsparse.set_backend("nki")
+    try:
+        op = trnsparse.KernelOperator(X, "rbf", ell, 1.0, noise, device=DEV)
+        shapes = {False: [], True: []}
+
+        def rows_for(pad):
+            def rows(idx):
+                shapes[pad].append(idx.numel())
+                eye = torch.eye(idx.numel(), dtype=torch.float32, device=DEV)
+                return trnsparse.kernel_matmul(X.float(), X[idx].float(), eye, "rbf", ell, 1.0).T
+
+            return rows
+
+        def sub(idx):
+            Xi = X[idx]
+            eye = torch.eye(idx.numel(), dtype=torch.float64)
+            return trnsparse.kernel_matmul_reference(Xi, Xi, eye, "rbf", ell, 1.0)
+
+        kw = dict(block=block, relax=0.5, sub_fn=sub)
+        L0 = trnsolver.pivoted_cholesky(op.diag, rows_for(False), 1024, **kw)
+        L1 = trnsolver.pivoted_cholesky(op.diag, rows_for(True), 1024, pad_rows=True, **kw)
+    finally:
+        trnsparse.set_backend("auto")
+    print(f"shapes unpadded {sorted(set(shapes[False]))} padded {sorted(set(shapes[True]))}")
+    assert set(shapes[True]) <= {1 << b for b in range(10)}
+    assert len(set(shapes[True])) <= len(set(shapes[False]))
+    assert L1.shape == L0.shape
+    err = float((L1 - L0).abs().max() / L0.abs().max())
+    print(f"padded vs unpadded factor: max rel diff {err:.2e}")
+    assert err < 1e-6
+
+
 # ── LNC-invariant reductions (#128) ──────────────────────────────────────────
 
 

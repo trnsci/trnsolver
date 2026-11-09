@@ -376,6 +376,35 @@ class TestPivotedCholeskyBlock:
         )
         assert L.dtype == torch.float32 and L.shape == (200, 20)
 
+    @pytest.mark.parametrize("block", [64, 48])
+    @pytest.mark.parametrize("with_sub", [True, False])
+    def test_pad_rows_few_shapes_same_factor(self, block, with_sub):
+        # trnsci/trnsci#109: the accepted-pivot count per round is value
+        # dependent; pad_rows maps it onto power-of-two shapes (capped at block).
+        K = _scaled_rbf(700)
+        diag = lambda: torch.diagonal(K).clone()  # noqa: E731
+        sub = (lambda i: K[i][:, i]) if with_sub else None
+        plain, padded = [], []
+
+        def rows(log):
+            def f(idx):
+                assert idx.dtype == torch.int64 and idx.device.type == "cpu"
+                log.append(idx.numel())
+                return K[idx]
+
+            return f
+
+        kw = dict(block=block, relax=0.5, sub_fn=sub)
+        L0 = trnsolver.pivoted_cholesky(diag, rows(plain), 150, **kw)
+        L1 = trnsolver.pivoted_cholesky(diag, rows(padded), 150, pad_rows=True, **kw)
+        assert torch.equal(L0, L1)
+        assert len(padded) == len(plain)
+        allowed = {1 << b for b in range(block.bit_length()) if 1 << b < block} | {block}
+        assert set(padded) <= allowed
+        assert all(p >= q for p, q in zip(padded, plain, strict=True))
+        if with_sub:
+            assert len(set(plain)) > len(set(padded))
+
     def test_bad_args(self):
         K = _scaled_rbf(20)
         d = lambda: torch.diagonal(K).clone()  # noqa: E731
