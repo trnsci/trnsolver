@@ -426,7 +426,13 @@ class TestVectorSolvers:
         b = torch.randn(n, generator=torch.Generator().manual_seed(14))
         x, it, res = trnsolver.cg(A.float(), b, tol=1e-6, reduction=red)
         x0, it0, _ = trnsolver.cg(A.float(), b, tol=1e-6, reduction="device")
-        assert res < 1e-6 and abs(it - it0) <= 1
+        # In fp32 the CG residual is not monotone near 1e-6 (it moves by
+        # ~2x from one step to the next), so where it first drops below tol
+        # can shift by a few steps with the BLAS's rounding of A @ p.
+        assert res < 1e-6 and abs(it - it0) <= max(2, it0 // 20), (it, it0)
+        x64 = torch.linalg.solve(A, b.double())
+        for xs in (x, x0):
+            assert float((xs.double() - x64).norm() / x64.norm()) < 1e-4
         assert torch.allclose(x, x0, rtol=1e-4, atol=1e-5)
 
     @pytest.mark.parametrize("red", block._REDUCTIONS)
@@ -434,9 +440,19 @@ class TestVectorSolvers:
         n = 500
         A = _nonsym(n, seed=15)
         b = torch.randn(n, generator=torch.Generator().manual_seed(15))
-        x, it, res = trnsolver.gmres(A.float(), b, tol=1e-6, restart=20, reduction=red)
-        x0, it0, _ = trnsolver.gmres(A.float(), b, tol=1e-6, restart=20, reduction="device")
-        assert res < 1e-6 and abs(it - it0) <= 2
+        # gmres checks the residual only at a restart, so the iteration
+        # count moves in steps of ``restart``. In fp32 this system stagnates
+        # at a residual of ~5e-7 from the third cycle on, and after the
+        # second cycle it is ~8.5e-7: a tol of 1e-6 sits on that plateau, and
+        # the BLAS's rounding of A @ v (MKL on Linux, Accelerate on macOS)
+        # decided between 40 and 60 iterations. tol=1e-5 is reached after
+        # two cycles with a ~10x margin in every mode.
+        x, it, res = trnsolver.gmres(A.float(), b, tol=1e-5, restart=20, reduction=red)
+        x0, it0, _ = trnsolver.gmres(A.float(), b, tol=1e-5, restart=20, reduction="device")
+        assert res < 1e-5 and abs(it - it0) <= 2, (it, it0)
+        x64 = torch.linalg.solve(A, b.double())
+        for xs in (x, x0):
+            assert float((xs.double() - x64).norm() / x64.norm()) < 1e-5
         assert torch.allclose(x, x0, rtol=1e-4, atol=1e-5)
 
     def test_cg_complex_hpd(self):
