@@ -6,6 +6,8 @@ Needs trnsparse (>= the #104 multicore kernel_matmul).
 
   python scripts/bench_gp_precond.py build --n 1e5 [--seq]   # preconditioner build time
   python scripts/bench_gp_precond.py conv  --n 5e4           # CG: host64 vs projected
+  python scripts/bench_gp_precond.py conv  --n 1e5 --applies projected \
+      --reductions device,pairwise,host64 --L-cache L.pt --save-dir DIR   # #128
   python scripts/bench_gp_precond.py gp    --n 1e6           # GP posterior mean (C3)
 
 --cpu runs the same on the CPU (trnsparse pytorch backend).
@@ -16,8 +18,10 @@ Output is one JSON line per measurement (prefix RESULT) plus human-readable line
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
 import time
 
 import torch
@@ -178,10 +182,10 @@ def cmd_build(a):
             break
 
 
-def solve(op, B, M, a):
+def solve(op, B, M, a, reduction=None):
     t0 = time.perf_counter()
     sol, info = trnsolver.cg_block(
-        op, B, M=M, tol=a.tol, maxiter=a.maxiter, check_every=a.check_every
+        op, B, M=M, tol=a.tol, maxiter=a.maxiter, check_every=a.check_every, reduction=reduction
     )
     sync()
     return sol, info, time.perf_counter() - t0
@@ -199,16 +203,25 @@ def cmd_conv(a):
     X, y, Xt, ft = synthetic_field(n, 3, noise=a.noise)
     op = trnsparse.KernelOperator(X, "rbf", LS, OS, a.noise, device=a.device)
     B = torch.cat([y[:, None], _rademacher(n, 32, 1)], 1).to(device=a.device, dtype=torch.float32)
-    dr = DeviceRows(X, a.device)
-    L = trnsolver.pivoted_cholesky(
-        op.diag, dr.rows_fn, a.rank, block=a.block, relax=a.relax, sub_fn=dr.sub_fn
-    )
+    if a.L_cache and os.path.exists(a.L_cache):
+        L = torch.load(a.L_cache)  # float64 host factor from an earlier run
+    else:
+        dr = DeviceRows(X, a.device)
+        L = trnsolver.pivoted_cholesky(
+            op.diag, dr.rows_fn, a.rank, block=a.block, relax=a.relax, sub_fn=dr.sub_fn
+        )
+        if a.L_cache:
+            torch.save(L, a.L_cache)
     Ld = L.to(device=a.device, dtype=torch.float32)
     first = None
-    for apply in a.applies.split(","):
-        M = trnsolver.PivotedLowRankPreconditioner(Ld, a.noise, apply=apply)
+    runs = [(ap, red) for ap in a.applies.split(",") for red in a.reductions.split(",")]
+    for apply, red in runs:
+        red = red or None
+        M = trnsolver.PivotedLowRankPreconditioner(Ld, a.noise, apply=apply, reduction=red)
         ta = time_apply(M, n, a.device)
-        sol, info, ts = solve(op, B, M, a)
+        if a.warm:
+            solve(op, B, M, a, red)  # first call compiles; time the second
+        sol, info, ts = solve(op, B, M, a, red)
         alpha = sol[:, 0].detach().cpu().double()
         mean = trnsparse.kernel_matmul_reference(Xt, X, alpha, "rbf", LS, OS)
         r = dict(
@@ -216,6 +229,8 @@ def cmd_conv(a):
             n=n,
             noise=a.noise,
             apply=apply,
+            reduction=M.reduction,
+            lnc=os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2"),
             iterations=info["iterations"],
             col_iters_max=int(info["col_iterations"].max()),
             converged=bool(info["converged"].all()),
@@ -224,9 +239,18 @@ def cmd_conv(a):
             sampled_res=sampled_residual(X, y, alpha, a.noise, n),
             solve_s=round(ts, 1),
             s_per_iter=round(ts / max(1, info["iterations"] + 1), 2),
+            ms_per_iter=round(1e3 * ts / max(1, info["iterations"] + 1), 1),
             apply_ms=round(ta * 1e3, 1),
             rmse=float((mean - ft).pow(2).mean().sqrt()),
+            sha_X=hashlib.sha256(sol.detach().cpu().numpy().tobytes()).hexdigest()[:16],
+            sha_mean=hashlib.sha256(mean.numpy().tobytes()).hexdigest()[:16],
         )
+        if a.save_dir:
+            os.makedirs(a.save_dir, exist_ok=True)
+            torch.save(
+                dict(X=sol.detach().cpu(), mean=mean, info=r),
+                f"{a.save_dir}/conv_{apply}_{M.reduction}.pt",
+            )
         if first is None:
             first = (mean, sol.detach().cpu())
         else:
@@ -302,6 +326,14 @@ def main():
     )
     ap.add_argument("--apply", default="projected")
     ap.add_argument("--applies", default="host64,projected")
+    ap.add_argument(
+        "--reductions",
+        default="",
+        help="conv: cg_block reduction modes, comma-separated (default: the library default)",
+    )
+    ap.add_argument("--L-cache", default=None, help="conv: load / save the factor L here")
+    ap.add_argument("--save-dir", default=None, help="conv: save X and the mean per run")
+    ap.add_argument("--warm", action="store_true", help="conv: run each solve twice, time the 2nd")
     ap.add_argument("--probes", type=int, default=32)
     ap.add_argument("--tol", type=float, default=1e-6)
     ap.add_argument("--maxiter", type=int, default=1000)
