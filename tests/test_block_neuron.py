@@ -9,16 +9,30 @@ device can show: that the projected apply keeps its fp32 accuracy through
 the device's matmuls (an accidental bf16 matmul would show up as a ~1e-2
 error here), that preconditioned CG on the device takes the host-fp64
 apply's iteration count, and that a build from device rows matches one
-from host rows. Device reductions depend on the LNC split (trnsolver#107),
-so comparisons are within tolerance, not bitwise.
+from host rows. These comparisons are within tolerance.
+
+LNC invariance (#128): ``cg_block``'s default ``reduction="pairwise"`` and
+the projected apply's Qᵀ V must give the same bits at LNC=1 and LNC=2. A
+process has one LNC setting, so ``test_cg_block_lnc1_vs_lnc2_bitwise`` runs
+scripts/probe_cg_reduction.py once at each and compares SHA-256 hashes. It
+runs an LNC=1 process, which on a shared box needs the whole chip, so it only
+runs with ``TRNSOLVER_TEST_LNC=1``; ``TRNSOLVER_TEST_LNC1_CORES`` /
+``TRNSOLVER_TEST_LNC2_CORES`` set ``NEURON_RT_VISIBLE_CORES`` for the two
+runs (physical / logical core ids, default 0).
 """
 
+import json
 import math
+import os
+import pathlib
+import subprocess
+import sys
 
 import pytest
 import torch
 
 import trnsolver
+from trnsolver import block
 
 pytestmark = pytest.mark.neuron
 
@@ -133,3 +147,61 @@ def test_block_build_from_trnsparse_kernel_matmul():
     print(f"remaining trace: device-row block build {rem_dev:.4e}, host sequential {rem_host:.4e}")
     assert L_dev.shape == (n, 1024)
     assert math.isfinite(rem_dev) and rem_dev < 1.15 * rem_host
+
+
+# ── LNC-invariant reductions (#128) ──────────────────────────────────────────
+
+
+def test_pairwise_reductions_on_device_vs_cpu():
+    """The fold is elementwise adds only; report whether the device gives the CPU's bits."""
+    n, R = 100003, 33  # ragged: padded to 49 · 2^11
+    g = torch.Generator().manual_seed(3)
+    X, Y = torch.randn(n, R, generator=g), torch.randn(n, R, generator=g)
+    Xd, Yd = X.to(DEV), Y.to(DEV)
+    d_dev = block._cdot(Xd, Yd, "pairwise").cpu()
+    n_dev = block._col_norm(Xd, "pairwise").cpu()
+    d_cpu, n_cpu = block._cdot(X, Y, "pairwise"), block._col_norm(X, "pairwise")
+    ref = (X.double() * Y.double()).sum(0)
+    scale = (X.double() * Y.double()).abs().sum(0)
+    err = float(((d_dev.double() - ref).abs() / scale).max())
+    print(f"pairwise dot rel err {err:.2e}; device == cpu: "
+          f"dot {torch.equal(d_dev, d_cpu)} norm {torch.equal(n_dev, n_cpu)}")  # fmt: skip
+    assert err < 13 * 2.0**-24
+    assert torch.allclose(n_dev, n_cpu, rtol=1e-6)
+    Q = torch.randn(n, 256, generator=g) / math.sqrt(n)
+    c = block._tmatmul(Q.to(DEV), Yd, "pairwise").cpu()
+    c_ref = Q.double().T @ Y.double()
+    c_scale = Q.double().abs().T @ Y.double().abs()
+    assert float(((c.double() - c_ref).abs() / c_scale).max()) < 1e-5
+
+
+def _probe(lnc, cores, out):
+    script = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "probe_cg_reduction.py"
+    env = dict(os.environ, NEURON_LOGICAL_NC_CONFIG=str(lnc), NEURON_RT_VISIBLE_CORES=cores)
+    if "TORCH_NEURONX_NEFF_CACHE_DIR" in env:  # keep the two LNC settings' NEFFs apart
+        env["TORCH_NEURONX_NEFF_CACHE_DIR"] += f"/lnc{lnc}"
+    args = [sys.executable, "-P", str(script), "--n", "1e5", "--R", "33", "--out", str(out)]
+    args += ["--no-ref", "--micro-reps", "2", "--modes", "pairwise,host64,device"]
+    proc = subprocess.run(args, env=env, capture_output=True, text=True, timeout=1800)
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-4000:]
+    return json.loads((out / "res.json").read_text())
+
+
+@pytest.mark.skipif(
+    os.environ.get("TRNSOLVER_TEST_LNC") != "1",
+    reason="runs an LNC=1 and an LNC=2 process; needs the whole chip (TRNSOLVER_TEST_LNC=1)",
+)
+def test_cg_block_lnc1_vs_lnc2_bitwise(tmp_path):
+    r1 = _probe(1, os.environ.get("TRNSOLVER_TEST_LNC1_CORES", "0"), tmp_path / "lnc1")
+    r2 = _probe(2, os.environ.get("TRNSOLVER_TEST_LNC2_CORES", "0"), tmp_path / "lnc2")
+    keys = ("sha_X", "sha_MB")
+    micro = ("sha_cdot", "sha_norm", "sha_qtv")
+    for mode in ("pairwise", "host64", "device"):
+        s1, s2 = r1["solves"][mode], r2["solves"][mode]
+        same = {k: s1[k] == s2[k] for k in keys} | {
+            k: r1["micro"][mode][k] == r2["micro"][mode][k] for k in micro
+        }
+        print(f"{mode}: iterations {s1['iterations']} / {s2['iterations']}, bitwise {same}")
+        if mode != "device":  # "device" is the old, LNC-dependent path
+            assert s1["iterations"] == s2["iterations"]
+            assert all(same.values()), (mode, same)

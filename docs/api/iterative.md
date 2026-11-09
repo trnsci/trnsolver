@@ -38,9 +38,19 @@ Raises `ValueError` if any diagonal entry is within `1e-15` of zero. More-capabl
 
 ## Block CG on matrix-free operators (#97)
 
-### `cg_block(A, B, M=None, *, tol=1e-6, maxiter=None, check_every=10, X0=None, return_coeffs=False)`
+### `cg_block(A, B, M=None, *, tol=1e-6, maxiter=None, check_every=10, X0=None, return_coeffs=False, reduction=None)`
 
-Column-batched preconditioned CG for SPD `A` with an `(n, R)` right-hand side (or `(n,)`). `A` and `M` are callables on `(n, R)` blocks, or tensors. Each iteration makes **one** call `A(P)` on the whole block. Converged columns freeze, but the full block is still passed in, so every call has the same shape. Convergence is per column, `‖rⱼ‖ ≤ tol·‖bⱼ‖`. The host syncs only every `check_every` iterations.
+Column-batched preconditioned CG for SPD `A` with an `(n, R)` right-hand side (or `(n,)`). `A` and `M` are callables on `(n, R)` blocks, or tensors. Each iteration makes **one** call `A(P)` on the whole block. Converged columns freeze, but the full block is still passed in, so every call has the same shape. Convergence is per column, `‖rⱼ‖ ≤ tol·‖bⱼ‖`. The stopping test reads back to the host only every `check_every` iterations.
+
+`reduction` sets how the inner products and norms reduce over n (#128). `None` reads `TRNSOLVER_CG_REDUCTION`.
+
+| `reduction` | How | LNC=1 vs LNC=2 | Cost |
+|---|---|---|---|
+| `"pairwise"` (default) | zero-pad to m · 2^L rows (m ≤ 64), L elementwise adds of contiguous halves on the device, then the m leaves summed in float64 on the host | bitwise equal | two small D2H syncs per iteration |
+| `"host64"` | the whole (n, R) product is copied to the host and reduced in float64 | bitwise equal; most accurate | one (n, R) D2H per reduction |
+| `"device"` | device `sum` / `vector_norm` (the previous behaviour) | differs (5e-4 relative at n = 1e5) | fastest; for comparison |
+
+Device reductions over n add in an order that depends on how the compiler splits the work across logical cores. Elementwise ops do not. So `"pairwise"` and `"host64"` give the same bits at any LNC, provided the operator `A` (and `M`) does too.
 
 Returns `(X, info)`. `info` has these keys:
 
@@ -115,7 +125,8 @@ How `"projected"` works:
 - It applies `Q (Σ² + sI)⁻¹ QᵀV + (I − QQᵀ)V/s` with the projection done twice.
 - One pass leaves an error of about u·√k·‖V‖ along Q, which the 1/s weight amplifies. That is the `"native"` failure. The second pass removes that error.
 - On CPU fp32 it takes the same CG iteration counts as `"host64"` on the GP cases that stall `"native"`.
+- Its two QᵀV products reduce over n, so they take `reduction=` as `cg_block` does (`PivotedLowRankPreconditioner(L, shift, apply="projected", reduction=None)`; `None` reads `TRNSOLVER_CG_REDUCTION`). With `"pairwise"`, QᵀV is formed as 128-row block products `Q_iᵀ V_i` in one bmm, then the blocks are folded as above and finished in float64 on the host (#128).
 
-### `lanczos_tridiag_from_cg(alpha, beta, col_iterations=None)`, `slq_logdet(A, n, num_probes=32, num_iters=50, generator=None, M=None, *, dtype=torch.float32, device=None, tol=1e-10)`
+### `lanczos_tridiag_from_cg(alpha, beta, col_iterations=None)`, `slq_logdet(A, n, num_probes=32, num_iters=50, generator=None, M=None, *, dtype=torch.float32, device=None, tol=1e-10, reduction=None)`
 
 `lanczos_tridiag_from_cg` builds the per-column Lanczos tridiagonals from CG coefficients. `slq_logdet` gives the stochastic Lanczos quadrature estimate of `log det(A)` and returns `(estimate, info)`. `info` has `std_error`, `quadratures` and `cg_info`.
