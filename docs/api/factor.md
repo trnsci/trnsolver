@@ -28,22 +28,20 @@ Solves `A X = B` via Cholesky — faster than `solve` when `A` is SPD.
 `B` is `(n,)`, `(*, n, k)`, or a batch of vectors `(*, n)` with
 `B.shape == A.shape[:-1]`, as `torch.linalg.solve` reads it.
 
-!!! warning "Deprecated in 0.22.1: an ambiguous `B` shape (#79)"
-    When A's last batch dim equals `n` (A `(*, n, n, n)`, B `(*, n, n)`), `B`
-    can be read either way. `solve_spd` still reads it as `(*, n, k)`
-    right-hand-side matrices broadcast over A's batch (result
-    `(*, n, n, n)`), and now emits a `FutureWarning`. From 0.23.0 it reads
-    it as a batch of vectors, as `torch.linalg.solve` does (result
-    `(*, n, n)`; [#130](https://github.com/trnsci/trnsolver/issues/130)).
-    Be explicit; both forms mean the same in every release:
+This includes A `(*, n, n, n)` with B `(*, n, n)`, where A's last batch dim
+equals `n`: `B` is a batch of vectors and `X` is `(*, n, n)`, as in
+`torch.linalg.solve`.
+
+!!! note "Changed in 0.23.0 (#130)"
+    trnsolver 0.22.1 and earlier read that `B` as `(*, n, k)` right-hand-side
+    matrices broadcast over A's batch (result `(*, n, n, n)`; 0.22.1 warned,
+    #79). For that result, pass the explicit form, which means the same in
+    every release:
 
     ```python
-    X = trnsolver.solve_spd(A, B.unsqueeze(-1))  # batch of vectors -> (*, n, n, 1)
-    X = trnsolver.solve_spd(A, B.unsqueeze(-3))  # one shared (n, k) right-hand side
+    X = trnsolver.solve_spd(A, B.unsqueeze(-3))  # 3-D A: one shared (n, k) right-hand side
+    X = trnsolver.solve_spd(A, B.unsqueeze(0))  # any A: the 0.22.1 reading
     ```
-
-    For a 3-D `A`, `B.unsqueeze(-3)` is the current result; with more batch
-    dims, `B.unsqueeze(0)` is.
 
 ## `inv_spd(A)`
 
