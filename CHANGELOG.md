@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-11-10
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: `solve_spd` reads `B.shape == A.shape[:-1]` as a batch of vectors in every case, as `torch.linalg.solve` does (#130, completes #79; breaking for the formerly ambiguous shape). `cg`, `gmres` and `cg_block` reductions over n no longer depend on the LNC split (#128). `pivoted_cholesky(pad_rows=True)` keeps a device `rows_fn` to a few shapes (trnsci/trnsci#109). `occupied_subspace` raises on complex F (#132).
+
 ### Added
 
 - **`pivoted_cholesky(..., pad_rows=True)`: a few data-independent `rows_fn`
