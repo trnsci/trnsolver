@@ -272,6 +272,92 @@ def _pending(issue, pr, what):
 KNOWN: dict[str, pytest.MarkDecorator] = {}  # filled in next to each case table
 
 
+# ---------------------------------------------------------------- device-known categories
+#
+# A device conformance run (``--backend nki --conformance-device neuron``) has
+# known failures that are platform limits, not trnsolver bugs. Each category
+# has one tracking issue, and the cases in it are marked
+# ``xfail(strict=False)`` at run time, on device runs only (the pattern of
+# #146): CPU CI runs them and they must pass. So on device a NEW failure is the
+# only red, and a case of a known category that starts to pass shows as XPASS,
+# a signal rather than a failure. The rules are by test and parameter, not ID
+# lists, from the trnsci/trnsci#35 window-4/5/6 baselines (41 complex, 60
+# device float64). The conftest summary counts them by category;
+# scripts/conformance_expect.py merges chunked runs.
+
+DEVICE_KNOWN = {
+    "complex-linalg": (
+        "trnsci/trnsolver#98",
+        "complex cholesky/eigh/svd/solve/qr/lu are unsupported on the neuron device",
+    ),
+    "device-fp64": (
+        "trnsci/trnsolver#147",
+        "device float64 under explicit nki computes at fp32 precision "
+        "(fp64 policy, #89): fp64-tight residual, solve and torch.equal checks",
+    ),
+}
+
+# Every case of these tests is float64 with an fp64-tight check (cg / gmres /
+# gmres_ir "reported != true residual" or x vs linalg.solve at <= 1e-8; schur
+# QTQᵀ at 1e-8; eigh_randomized eigenvalues across seeds at 1e-8).
+_FP64_WHOLE_TESTS = {
+    "test_cg",
+    "test_gmres",
+    "test_gmres_ir",
+    "test_scaled_system",
+    "test_cg_exact_x0",
+    "test_schur_requires_grad_raises",
+    "test_eigh_randomized_seeds_differ_answer_same",
+}
+# Checked at 1e-8 against linalg.solve; the other three cases use tol_for(F64).
+_FP64_NONCONTIG_EXTRA = {"cg-b_step", "gmres-A_T", "gmres_ir-A_T"}
+# 1-D operands: _view builds the device view with torch.stack, which rounds
+# float64 to fp32, so the torch.equal layout check fails.
+_FP64_VECTOR_OPS = {"solve_vec", "solve_spd_vec"}
+
+
+def _device_known_category(node) -> str | None:
+    """The DEVICE_KNOWN category of a conformance case on a device nki run, or None."""
+    name = getattr(node, "originalname", None) or node.name
+    cs = getattr(node, "callspec", None)
+    p = cs.params if cs is not None else {}
+    dt = p.get("dt")
+    if name == "test_dtype":
+        return "complex-linalg" if dt.is_complex and p["op"] not in REAL_ONLY else None
+    if name == "test_mixed_real_complex":
+        # eigh_generalized may raise (an accepted skip); solve / solve_spd fail.
+        return "complex-linalg" if p["op"] in ("solve", "solve_spd") else None
+    if name == "test_eigh_randomized_dtype":
+        return "complex-linalg" if dt is not None and dt.is_complex else None
+    if name in _FP64_WHOLE_TESTS:
+        return "device-fp64"
+    if name == "test_noncontiguous":
+        return "device-fp64" if dt == F64 and p["op"] in _FP64_VECTOR_OPS else None
+    if name == "test_noncontiguous_extra":
+        return "device-fp64" if p["case"] in _FP64_NONCONTIG_EXTRA else None
+    if name == "test_gmres_truncated":
+        return "device-fp64" if (p["maxiter"], p["restart"]) == (2, 2) else None  # #144
+    if name == "test_cg_maxiter":
+        # maxiter=0 returns x0 through the fp32 cast: torch.equal(x, x0) fails.
+        return "device-fp64" if p["maxiter"] == 0 else None
+    if name == "test_inv_sqrt_spd_ns_kwargs":
+        # max_iters=0: torch.equal against the fp64 initial guess.
+        return "device-fp64" if p["max_iters"] == 0 else None
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _device_known_xfail(request, _conformance_env):
+    if BACKEND != "nki" or DEV.type == "cpu":
+        return
+    cat = _device_known_category(request.node)
+    if cat is not None:
+        issue, what = DEVICE_KNOWN[cat]
+        request.applymarker(
+            pytest.mark.xfail(strict=False, reason=f"[device-known:{cat}] {issue}: {what}")
+        )
+
+
 # ---------------------------------------------------------------- reference checkers
 
 
@@ -1047,19 +1133,11 @@ def test_gmres(n, tol, restart, maxiter, callable_A, x0):
 
 
 @pytest.mark.parametrize("maxiter,restart", [(1, 3), (2, 2)])
-def test_gmres_truncated(request, maxiter, restart):
-    if BACKEND == "nki" and DEV.type != "cpu" and (maxiter, restart) == (2, 2):
-        # Device float64 under explicit nki runs at fp32. With the #141
-        # reductions the reported residual is 1.2e-6 (relative) from the fp64
-        # true residual, against a 1e-6 bound: the known device-fp64 category,
-        # accepted into the baseline (trnsci/trnsolver#144, 2026-11-10).
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=False,
-                reason="trnsci/trnsolver#144: device float64 at fp32 precision, "
-                "reported vs true residual 1.2e-6 > 1e-6 (known category)",
-            )
-        )
+def test_gmres_truncated(maxiter, restart):
+    # [2-2] on device under nki: the device-fp64 category (DEVICE_KNOWN). With
+    # the #141 reductions the reported residual is 1.2e-6 (relative) from the
+    # fp64 true residual, against a 1e-6 bound; accepted into the baseline
+    # (trnsci/trnsolver#144, 2026-11-10).
     A, b = gen(20), rand(20)
     out = ts.gmres(dev(A), dev(b), tol=1e-14, maxiter=maxiter, restart=restart)
     _check_iterative(A, b, out, 1e-14, maxiter * restart)
