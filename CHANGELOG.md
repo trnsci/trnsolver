@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Device conformance runs are signal-only (trnsci/trnsci#35).** On a
+  device run (`--backend nki --conformance-device neuron`), the known
+  platform-limit cases in `tests/test_conformance.py` are marked
+  `xfail(strict=False)` by category rules: `complex-linalg` (41 cases, #98)
+  and `device-fp64` (60 cases, #147, which takes over #144's
+  `test_gmres_truncated[2-2]` marker). CPU runs are unchanged and still run
+  every case. The run ends with a summary (passed, xfailed and XPASS by
+  category, NEW failures); `--conformance-json PATH` writes it as JSON, and
+  `scripts/conformance_expect.py` merges chunked runs and exits 1 on NEW
+  failures. Test-only; no library change.
+
 ## [0.23.0] — 2026-11-10
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
