@@ -27,6 +27,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   device rows (`rows_s`). Read that way, the window-5 "cholesky 150 s against
   90 s" was 82 s against 80 s on the host, plus the cold compiles.
 
+### Changed
+
+- **`solve_spd` reads an ambiguous `B` as a batch of vectors, as
+  `torch.linalg.solve` does (#130, completes #79). Breaking for callers who
+  pass that shape.** With A `(*, n, n, n)` and B `(*, n, n)` (`B.shape ==
+  A.shape[:-1]` and A's last batch dim equals n), `B` is now `(*, n)`
+  vectors and the result is `(*, n, n)`. 0.22.1 and earlier read it as
+  `(*, n, k)` matrices broadcast over A's batch and returned `(*, n, n, n)`;
+  0.22.1 warned with a `FutureWarning` (#131), which is removed. For the old
+  result, pass `B.unsqueeze(-3)` for a 3-D A, or `B.unsqueeze(0)` in
+  general; both mean the same in every release. The same holds with
+  `iterative_refinement=True`. The conformance case `solve_spd_vec-batch{N}`
+  passes (it was `xfail(strict=True)`).
+
 ### Fixed
 
 - **`cg` and `gmres` no longer depend on the LNC split (#128).** They take
