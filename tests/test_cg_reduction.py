@@ -340,9 +340,16 @@ class TestModes:
         }
         its = {r: info["iterations"] for r, (_, info) in out.items()}
         assert max(its.values()) - min(its.values()) <= 1, its
+        # Against a float64 solve, column by column and normwise: an fp32 CG
+        # stopped at tol = 1e-5 leaves entries near zero that differ between
+        # reduction orders by more than an elementwise rtol allows (Linux CI
+        # BLAS). cond(A) is about 700, so cond * tol is about 7e-3; all three
+        # modes measure about 8.6e-6.
+        Xs = torch.linalg.solve(A.double(), B.double())
         for r, (X, info) in out.items():
             assert bool(info["converged"].all()), r
-            assert torch.allclose(X, out["host64"][0], rtol=1e-3, atol=1e-4), r
+            err = (X.double() - Xs).norm(dim=0) / Xs.norm(dim=0)
+            assert float(err.max()) < 5e-4, (r, err)
 
     def test_projected_modes_agree(self):
         K, _ = _gp(700)
