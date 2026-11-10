@@ -1047,7 +1047,19 @@ def test_gmres(n, tol, restart, maxiter, callable_A, x0):
 
 
 @pytest.mark.parametrize("maxiter,restart", [(1, 3), (2, 2)])
-def test_gmres_truncated(maxiter, restart):
+def test_gmres_truncated(request, maxiter, restart):
+    if BACKEND == "nki" and DEV.type != "cpu" and (maxiter, restart) == (2, 2):
+        # Device float64 under explicit nki runs at fp32. With the #141
+        # reductions the reported residual is 1.2e-6 (relative) from the fp64
+        # true residual, against a 1e-6 bound: the known device-fp64 category,
+        # accepted into the baseline (trnsci/trnsolver#144, 2026-11-10).
+        request.applymarker(
+            pytest.mark.xfail(
+                strict=False,
+                reason="trnsci/trnsolver#144: device float64 at fp32 precision, "
+                "reported vs true residual 1.2e-6 > 1e-6 (known category)",
+            )
+        )
     A, b = gen(20), rand(20)
     out = ts.gmres(dev(A), dev(b), tol=1e-14, maxiter=maxiter, restart=restart)
     _check_iterative(A, b, out, 1e-14, maxiter * restart)
