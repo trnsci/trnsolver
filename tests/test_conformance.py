@@ -338,8 +338,10 @@ def _device_known_category(node) -> str | None:
     if name == "test_gmres_truncated":
         return "device-fp64" if (p["maxiter"], p["restart"]) == (2, 2) else None  # #144
     if name == "test_cg_maxiter":
-        # maxiter=0 returns x0 through the fp32 cast: torch.equal(x, x0) fails.
-        return "device-fp64" if p["maxiter"] == 0 else None
+        # maxiter=3: the fp32 reported residual misses the fp64 true residual
+        # by ~1.1e-6 relative (check: 1e-6). maxiter=0 (x0 comes back
+        # unchanged) and maxiter=1 pass on device (trnsci/trnsci#35, windows 6, 7).
+        return "device-fp64" if p["maxiter"] == 3 else None
     if name == "test_inv_sqrt_spd_ns_kwargs":
         # max_iters=0: torch.equal against the fp64 initial guess.
         return "device-fp64" if p["max_iters"] == 0 else None
