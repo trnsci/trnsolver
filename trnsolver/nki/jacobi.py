@@ -79,6 +79,7 @@ from .dispatch import HAS_NKI, PMAX, _use_simulator
 # Clamp for rsqrt arguments: the Scalar Engine rsqrt table is valid on
 # [2^-87, 2^97], so the floor must sit inside it.
 _TINY = 2.0**-80
+_RSQRT_IMPL = "gpsimd"
 
 # Tiles per launch and independent dependency chains per step, by padded
 # block size ne. Measured on Trn2: the per-step (P, G) column math is a
@@ -250,6 +251,31 @@ if HAS_NKI:
     import nki.isa as nisa
     import nki.language as nl
 
+    def _rsqrt(dst, x, col):
+        """dst = 1 / sqrt(x) for a (P, G) SBUF column, x in [_TINY, 2^97].
+
+        Variant under test (trnsci/trnsci#173): ``_RSQRT_IMPL``.
+        """
+        if _RSQRT_IMPL == "lut":
+            nisa.activation(dst=dst, op=nl.rsqrt, data=x)
+            return
+        if _RSQRT_IMPL == "gpsimd":
+            nisa.tensor_scalar(
+                dst=dst, data=x, op0=nl.rsqrt, operand0=0.0, engine=nisa.gpsimd_engine
+            )
+            return
+        # Scalar Engine table, then two Newton steps y (1.5 - 0.5 x y^2) on
+        # the Vector Engine (one step leaves ~1e-3 from the table's ~3e-2).
+        nisa.activation(dst=dst, op=nl.rsqrt, data=x)
+        for _ in range(2):
+            e = col()
+            nisa.tensor_tensor(dst=e, data1=dst, data2=x, op=nl.multiply)
+            nisa.tensor_tensor(dst=e, data1=e, data2=dst, op=nl.multiply)
+            nisa.tensor_scalar(
+                dst=e, data=e, op0=nl.multiply, operand0=-0.5, op1=nl.add, operand1=1.5
+            )
+            nisa.tensor_tensor(dst=dst, data1=dst, data2=e, op=nl.multiply)
+
     def _step(X, g0, g1, w, pibd, sig, per_tile, onezero, delta=True):
         """One round-robin step on tiles g0..g1-1 of the state X (one chain).
 
@@ -366,8 +392,10 @@ if HAS_NKI:
         tt(xx, xx, hh, add)
         ts(xx, xx, nl.maximum, _TINY)
         rr = col()
-        # sqrt(x) as x * rsqrt(x): the Scalar Engine keeps one table loaded.
-        nisa.activation(dst=rr, op=nl.rsqrt, data=xx)
+        # sqrt(x) = x * rsqrt(x), the rsqrt accurate to about 1 ULP
+        # (`_rsqrt`; the Scalar Engine rsqrt table alone is up to 2.9%
+        # off, trnsci/trnsci#173).
+        _rsqrt(rr, xx, col)
         tt(rr, rr, xx, mul)
         den = col()
         # |h| = max(-h, h)  (abs_max is NeuronCore-v4+ only)
@@ -376,24 +404,23 @@ if HAS_NKI:
         tt(den, den, rr, add)
         ts(den, den, nl.maximum, _TINY)
         u = col()
-        # 1 / den = rsqrt(den)^2 (den is clamped into the rsqrt table range;
-        # ScalarE reciprocal is ~1.5e-6 relative in range but silently
-        # returns 1e7 or 0 outside about |x| in [2^-42, 2^41]).
-        nisa.activation(dst=u, op=nl.rsqrt, data=den)
+        # 1 / den on the Vector Engine (correctly rounded; den >= _TINY).
+        nisa.reciprocal(dst=u, data=den)
         t = col()
         tt(t, gs, u, mul)
-        tt(t, t, u, mul)
         tt(t, t, sg, mul)
-        t2 = col()
-        tt(t2, t, t, mul)
+        q = col()
+        tt(q, t, t, mul)
+        ts(q, q, add, 1.0)
         c = col()
-        nisa.activation(dst=c, op=nl.rsqrt, data=t2, bias=1.0)
+        _rsqrt(c, q, col)
         negs = col()
         ts(negs, t, mul, -1.0)
         tt(negs, negs, c, mul)
         w_ = col()
-        nisa.activation(dst=w_, op=nl.rsqrt, data=c, bias=1.0)
-        tt(w_, w_, w_, mul)
+        # 1 / (1 + c), c in (0, 1].
+        ts(w_, c, add, 1.0)
+        nisa.reciprocal(dst=w_, data=w_)
         km1 = col()
         tt(km1, negs, negs, mul)
         ts(km1, km1, mul, -1.0)
