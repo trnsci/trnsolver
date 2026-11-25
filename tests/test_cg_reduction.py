@@ -27,6 +27,10 @@ import torch
 import trnsolver
 from trnsolver import block, iterative
 
+# Every mode but "device" is LNC-invariant by construction ("ff" / "exact" /
+# "auto" through trnblas.fp64's fixed order, trnsci/trnsci#169).
+_INVARIANT = [r for r in block._REDUCTIONS if r != "device"]
+
 
 class _Dev(torch.Tensor):
     layout = 1
@@ -247,7 +251,7 @@ class TestLayoutInvariance:
         a, b = self._both(lambda: _plain(block._tmatmul(Q, Y, "device")))
         assert not torch.equal(a, b)
 
-    @pytest.mark.parametrize("red", ["pairwise", "host64"])
+    @pytest.mark.parametrize("red", _INVARIANT)
     @pytest.mark.parametrize("n", [1000, 30011])
     def test_reductions_bitwise(self, red, n):
         g = torch.Generator().manual_seed(6)
@@ -262,13 +266,15 @@ class TestLayoutInvariance:
             assert torch.equal(a, b)
 
     def _gp_solve(self, red, M=None, n=1500, R=33):
+        if red in ("ff", "exact"):
+            R = 4  # one trnblas reduction per column: keep the CPU reference quick
         K, A = _gp(n, noise=1e-1)
         op = _kernel_op(A.float())
         B = _dev(torch.randn(n, R, generator=torch.Generator().manual_seed(7)))
         X, info = trnsolver.cg_block(op, B, M, tol=1e-5, maxiter=2000, reduction=red)
         return _plain(X), info, A
 
-    @pytest.mark.parametrize("red", ["pairwise", "host64"])
+    @pytest.mark.parametrize("red", _INVARIANT)
     def test_cg_block_bitwise(self, red):
         (Xa, ia, A), (Xb, ib, _) = self._both(lambda: self._gp_solve(red))
         assert torch.equal(Xa, Xb)
@@ -329,7 +335,7 @@ class TestModes:
         with pytest.raises(ValueError, match="reduction"):
             block._reduction_mode(None)
         with pytest.raises(ValueError, match="reduction"):
-            trnsolver.cg_block(torch.eye(3), torch.ones(3), reduction="exact")
+            trnsolver.cg_block(torch.eye(3), torch.ones(3), reduction="fp64")
 
     def test_modes_agree_and_iterations_match(self):
         n = 800
@@ -407,7 +413,7 @@ class TestVectorSolvers:
         return _plain(x), it, res, A
 
     @pytest.mark.parametrize("solver", ["_cg", "_gmres"])
-    @pytest.mark.parametrize("red", ["pairwise", "host64"])
+    @pytest.mark.parametrize("red", _INVARIANT)
     def test_bitwise_across_layouts(self, solver, red):
         (xa, ia, ra, A), (xb, ib, rb, _) = self._both(lambda: getattr(self, solver)(red))
         assert torch.equal(xa, xb)

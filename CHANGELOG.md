@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`reduction="ff"`, `"exact"` and `"auto"` in `cg`, `gmres` and
+  `cg_block` (trnsci/trnsci#169).** These hand the working-dtype vectors to
+  trnblas.fp64:
+  - `"ff"`: the double-word `dot` / `nrm2`. Products are exact (TwoProd),
+    the lanes accumulate in AccurateDWPlusDW, and the chunk partials get an
+    exact host finish.
+  - `"exact"`: the integer-limb arm, whose result is the exactly rounded
+    dot.
+  - `"auto"`: `"host64"` below 5e5 rows, `"ff"` from there.
+    `TRNSOLVER_REDUCTION_FF_MIN_N` moves the threshold, and `cg_block`
+    reports the mode it used in `info["reduction"]`.
+
+  Measured on Trn2 in window 7, per `_inner` call (ms and correct bits on
+  fp32 CG vectors):
+
+  | n | `"ff"` | `host64` | `pairwise` | `"exact"` |
+  |---|---|---|---|---|
+  | 1e5 | 0.57 (52.5 b) | 0.33 (32.1 b) | 1.44 (29.4 b) | 0.76 (53 b) |
+  | 1e6 | 1.37 (53 b) | 1.80 (35.0 b) | 1.95 (30.7 b) | 2.05 (53 b) |
+  | 1e7 | 2.57 (53 b) | 38.9 (38.0 b) | 2.10 (27.8 b) | 7.90 (53 b) |
+
+  - All three new modes are LNC-invariant through the kernels' fixed
+    order, which depends on n only.
+  - The trnblas CPU reference matches the kernels bit for bit, so host
+    tensors give the device's bits.
+  - The projected preconditioner's Qᵀ V keeps the pairwise blocked product
+    under these modes.
+  - The default stays `"pairwise"`.
+
+  Applications: the GP exemplar's `cg_block` (trnsci/trnsci#109) and
+  preconditioned solves. `scripts/bench_cg_reduction_ff.py` times each
+  mode per CG iteration and end to end at n = 1e5, 1e6 and 1e7, for the
+  next device window. `tests/test_cg_reduction_ff_neuron.py` holds the
+  device checks, including a gated LNC=1 vs LNC=2 test.
+
 - **Device conformance runs are signal-only (trnsci/trnsci#35).** On a
   device run (`--backend nki --conformance-device neuron`), the known
   platform-limit cases in `tests/test_conformance.py` are marked
@@ -19,6 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   category, NEW failures); `--conformance-json PATH` writes it as JSON, and
   `scripts/conformance_expect.py` merges chunked runs and exits 1 on NEW
   failures. Test-only; no library change.
+
+### Changed
+
+- **trnblas >= 0.14 is now a runtime dependency**, for `trnblas.fp64`
+  behind the new reduction modes. trnblas needs only torch and numpy. The
+  dev extra's floor also moves from 0.9 to 0.14.
 
 ## [0.23.0] — 2026-11-10
 
