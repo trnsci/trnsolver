@@ -183,9 +183,11 @@ def run_one(args, n, case, method, arm, prob, ref):
         args_in = (F64.to(dev, dt), S64.to(dev, dt))
         kw = dict(n_occ=n_occ, method=method, iters=iters, precision=prec, ns_cond=args.ns_cond)
 
+    t0 = time.perf_counter()
     r = density_purification(*args_in, **kw)  # warm-up (compiles on the device)
     _sync(args.device)
-    t_loop = None
+    t_first = time.perf_counter() - t0
+    t_loop = t_compile = compile_error = None
     if args.compile:
         gemm_k, gemm_last = _precision.schedule(prec)
         F_in = args_in[0]
@@ -197,15 +199,21 @@ def run_one(args, n, case, method, arm, prob, ref):
         torch._dynamo.reset()  # a fresh closure per row: no stale guards, no recompile limit
         backend = "neuron" if args.device == "neuron" else args.compile_backend
         cloop = torch.compile(loop, backend=backend, fullgraph=True, dynamic=False)
-        cloop(Fo)
-        _sync(args.device)
-        ts = []
-        for _ in range(args.repeat):
+        try:
             t0 = time.perf_counter()
-            out = cloop(Fo)
+            out = cloop(Fo)  # first call: trace + compile + run
             out[0].sum().item()
-            ts.append(time.perf_counter() - t0)
-        t_loop = min(ts)
+            t_compile = time.perf_counter() - t0
+            ts = []
+            for _ in range(args.repeat):
+                t0 = time.perf_counter()
+                out = cloop(Fo)
+                out[0].sum().item()
+                ts.append(time.perf_counter() - t0)
+            t_loop = min(ts)
+        except Exception as e:  # record it; the eager row is still useful
+            compile_error = f"{type(e).__name__}: {str(e)[:300]}"
+            print(f"compile failed (n={n} {case} {method} {arm}): {compile_error}", flush=True)
     ts = []
     for _ in range(args.repeat):
         t0 = time.perf_counter()
@@ -241,7 +249,10 @@ def run_one(args, n, case, method, arm, prob, ref):
         "trace_err": r.trace_error,
         "ns_res": r.ns_residual,
         "t_s": min(ts),
+        "t_first_call_s": t_first,
         "t_loop_compiled_s": t_loop,
+        "t_compile_first_call_s": t_compile,
+        "compile_error": compile_error,
         "t_eigh_host_s": ref[2],
     }
 
