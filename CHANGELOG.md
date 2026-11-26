@@ -20,6 +20,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scripts/conformance_expect.py` merges chunked runs and exits 1 on NEW
   failures. Test-only; no library change.
 
+### Fixed
+
+- **`subspace_filter_kernel` / `subspace_step_kernel` PSUM accumulation
+  groups now open with a matmul write (trnsci/trnsci#185).** The kernels
+  zeroed PSUM tiles with `nl.zeros(..., buffer=nl.psum)` (a memset) and then
+  accumulated into them with `nisa.nc_matmul(..., accumulate=True)`. The
+  `nc_matmul` docs make that undefined behaviour on NeuronCore-v3 (Trn2):
+  accumulating onto PSUM that a non-matmul instruction initialised is not
+  supported, and the first write must use `accumulate=False`. Device results
+  matched the references so far, but they relied on that behaviour. The five
+  sites (the on-chip `X Q` fold, the F-apply, the residual-norm reduction,
+  the Gram blocks and `E = Y - X M`) pass `accumulate=(j > 0)` over their
+  static loops, and their PSUM tiles are plain `nl.ndarray`s, so the
+  redundant memsets are gone. The two `matmul_kernel` variants in
+  `nki/dispatch.py` already wrote with `accumulate=False` and are unchanged.
+  Simulator outputs are bitwise equal to 0.23.0 at the test shapes. A new
+  static lint (`tests/test_psum_accumulate_lint.py`) fails when a zeroed
+  PSUM tile is a matmul accumulation target, or when a tile is only ever
+  accumulated into.
+
 ## [0.23.0] — 2026-11-10
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
