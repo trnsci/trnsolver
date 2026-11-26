@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`density_purification(F, S, n_occ=...)`: the SCF density without
+  eigenvectors (#149, first slice).** Canonical (Palser–Manolopoulos 1998,
+  2 products per iteration) or SP2 (Niklasson 2002, 1 product per iteration)
+  purification of `XᵀFX`, matrix products only, with a fixed iteration count
+  and no host synchronisation inside the loop (each step's branch is a
+  `torch.where` on a 0-d tensor), so the loop compiles to one static graph
+  (checked with `torch.compile(fullgraph=True)`). `X = S⁻¹ᐟ²` comes from the
+  fixed-iteration Newton–Schulz below, or pass any `X` with `XᵀSX = I`
+  (rectangular `orthogonalizer(S).X` works). Returns `PurificationResult`: the
+  AO projector, `tr(PF)`, idempotency and trace errors, and `tr(P' − P'²)` per
+  iteration. Against host fp64 `eigh` on synthetic SCF-like problems
+  (`scripts/bench_purification.py`, n = 64 to 2048) fp64 gets `tr(PF)` within
+  6e-12 (relative ~1e-15), idempotency ≤ 5e-13 and the eigh density to 1e-12
+  (gap 0.5) to 1.5e-9 (gap 1e-6). Iterations to `tr(P' − P'²) < 1e-10`:
+  27–42 at gap 0.5, 42–69 at 1e-2, 66–113 at 1e-6. SP2 barely grows with n;
+  canonical does at small gaps and does not converge in 150 iterations at
+  n = 2048, gap 1e-6.
+- **`inv_sqrt_spd_ns(A, iters)`: fixed-iteration mode and minimax first
+  iterations (#149).** `iters=k` runs exactly k coupled Newton–Schulz steps
+  with no host synchronisation and a norm-bound scaling
+  (`min(‖A‖_F, ‖A‖_∞)`); `polynomial="minimax", cond=...` uses the greedy
+  minimax odd-cubic step polynomials of "Polar Express" (arXiv 2505.16932),
+  about half the Newton–Schulz iterations at the same accuracy (cond 1e6: 13
+  against 24). `trnsolver.matfun.ns_iteration_count(cond, tol)` fixes k ahead
+  of time. The first step skips the two products with `Z₀ = I`.
+  `iters=None` keeps the adaptive behaviour and its defaults.
+- **`precision=` GEMM routing for both (#149, trnsci/trnsci#172).** A spec
+  (`None`, `"fp32"`, `"fp64"` / `"ozaki1"` / `"ozaki2"` through
+  `trnblas.gemm_fp64`, a dict of `gemm_fp64` keywords, a callable) or a list
+  of specs per iteration, for staged precision. The iterate stays in the input
+  dtype (trnsci/trnsci#176, rule 7). Measured: 20 fp32-product iterations,
+  then fp64, restores fp64 idempotency but leaves an fp32-level rotation of
+  the occupied subspace (density error 2e-6 at n = 64 to 1e-4 at n = 2048,
+  gap 0.5); the energy error is second order in it (1e-12 to 8e-9 relative).
+  In fp32 the error is mostly S⁻¹ᐟ² and the basis transforms, not the
+  purification: at n = 1024, gap 0.5, `tr(PF)` is off by 7e-3 (1e-5
+  relative) all-fp32, and by 1e-5 to 2e-4 with X and `XᵀFX` in host fp64 and
+  only the purification in fp32 (bench arm `fp32orth`).
+- **`scripts/bench_purification.py` and `tests/test_matfun_neuron.py`:** the
+  CPU timing harness and the device bench / hardware gate (n = 512, 1024,
+  2048, 3508 against host `eigh`; native fp32 on the device, host fp64 with
+  `gemm_fp64` products on the device, and the staged arm).
+
 - **Device conformance runs are signal-only (trnsci/trnsci#35).** On a
   device run (`--backend nki --conformance-device neuron`), the known
   platform-limit cases in `tests/test_conformance.py` are marked

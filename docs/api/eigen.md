@@ -74,6 +74,64 @@ In float64 nothing has to be dropped at this size. In FP32 the dropped direction
 
 C20H42/aug-cc-pVDZ (n = 838, smallest eigenvalue 4.1e-7) is milder. At lindep 1e-7 two functions are dropped, and every variant converges in FP32 (26–35 iterations). In float64 the two dropped functions raise the energy by 2.8e-5 Eh against the full basis (canonical −781.9162346 against −781.9162624 Eh for S⁻¹ᐟ², the Cholesky of S, and `cholesky`). The threshold trades that basis-set truncation against FP32 conditioning. Lower it, or use float64, when the truncation matters more.
 
+## `density_purification(F, S=None, *, n_occ, X=None, method="canonical", iters=None, precision=None, bounds=None, ns_iters=None, ns_cond=1e6, ns_polynomial="minimax")`
+
+The SCF density matrix without eigenvectors (#149): matrix products only, a
+fixed iteration count, fixed shapes, and no host synchronisation inside the
+loop (each step's branch is a `torch.where` on a 0-d tensor). A fixed count
+compiles into one static schedule; the on-device tridiagonalisation (#42) does
+not fit that shape, so `eigh` falls back to the host.
+
+- The orthonormal-basis Fock matrix is `F' = XᵀFX`. With `S` and no `X`,
+  `X = S⁻¹ᐟ²` by `inv_sqrt_spd_ns` with a fixed minimax schedule
+  (`ns_iteration_count(ns_cond, 50 eps)` iterations). Any `X` with
+  `XᵀSX = I` works, including the rectangular `orthogonalizer(S).X`.
+- `method="canonical"`: Palser–Manolopoulos canonical purification (Phys. Rev.
+  B 58, 12704, 1998), two products per iteration, trace-conserving.
+  `method="sp2"`: Niklasson's trace-correcting SP2 (Phys. Rev. B 66, 155115,
+  2002), one product per iteration.
+- Spectral bounds of `F'` are Gershgorin discs unless `bounds=` is given.
+- Returns a `PurificationResult`: `P` (the AO projector `X P' Xᵀ`, so
+  `PSP = P`, `tr(PS) = n_occ`; the closed-shell density is `2P`), `P_orth`,
+  `X`, `energy = tr(PF)`, `idempotency_error = ‖P'² − P'‖_F`,
+  `trace_error = |tr P' − n_occ|`, `history` (`tr(P' − P'²)` at the start of
+  each iteration, free of extra products), `iters`, `ns_iters`, `ns_residual`.
+- `iters` defaults to 80. Iterations to `tr(P' − P'²) < 1e-10` in fp64 on the
+  synthetic spectra of `scripts/bench_purification.py` (core levels to −20,
+  valence band, virtuals to +8; n = 64 / 512 / 1024 / 2048):
+
+  | gap | canonical | SP2 |
+  |---|---|---|
+  | 0.5 | 27 / 30 / 32 / 33 | 35 / 39 / 40 / 42 |
+  | 1e-2 | 42 / 57 / 63 / 69 | 55 / 58 / 60 / 62 |
+  | 1e-6 | 66 / 99 / 123 / >150 | 97 / 105 / 108 / 113 |
+
+  SP2 takes about one product per iteration where canonical takes two, and
+  its count barely grows with n.
+
+### `precision=`
+
+Each product goes through a spec, per iteration:
+
+| spec | product |
+|---|---|
+| `None`, `"native"` | `torch.matmul` in the iterate's dtype |
+| `"fp32"` | operands cast to fp32, result cast back |
+| `"fp64"`, `"ozaki1"`, `"ozaki2"` | `trnblas.gemm_fp64(scheme=...)`, result cast back |
+| dict | `trnblas.gemm_fp64(**spec)`, e.g. `{"scheme": "ozaki2", "moduli": 14}` |
+| callable | `(A, B) -> C` |
+| list of the above | entry k for iteration k, the last entry after the end and for the transforms |
+
+The iterate stays in the input dtype: low precision only enters as split
+pieces inside `gemm_fp64`, never as the working precision (trnsci/trnsci#176).
+A staged schedule such as `["fp32"] * 20 + ["ozaki1"]` (the TPU DFT precedent,
+arXiv 2202.01255, ran fp32 iterations, then fp64-emulated ones) restores fp64
+idempotency, but the occupied subspace keeps the O(fp32) rotation of the early
+stage: at gap 0.5 the density error is 4e-6 / 2e-5 / 1e-4 at n = 256 / 1024 /
+2048, while the energy error (second order in the rotation) is 1e-11 / 3e-10
+/ 8e-9 relative. The SCF's own iterations
+remove that rotation; a single purification does not.
+
 ## Backend notes
 
 Householder tridiagonalization is n − 2 dependent BLAS-2 steps and leaves the Tensor Engine idle (#48). A parallel-ordered Jacobi step rotates n/2 disjoint pairs at once, so a batch of matrices advances in lockstep with no long dependency chain. In the kernel the Tensor Engine applies the step's partner permutation (an exact matmul shared by every tile) and the Vector Engine applies the rotations. For measurements see #48; the fair CPU baseline splits the batch across the same threads, which is 1.6–5.8× faster than one batched `torch.linalg.eigh` call (#54, v0.19.0).

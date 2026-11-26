@@ -695,74 +695,97 @@ def inv_sqrt_spd(A: torch.Tensor) -> torch.Tensor:
 @_fp64_host_guard("inv_sqrt_spd_ns")
 def inv_sqrt_spd_ns(
     A: torch.Tensor,
+    iters: int | None = None,
     *,
     max_iters: int = 20,
     tol: float = 1e-7,
+    polynomial: str = "newton",
+    cond: float | None = None,
+    scaling: str | float | None = None,
+    precision=None,
 ) -> tuple[torch.Tensor, int, float]:
     """A^{-1/2} for SPD A via the coupled Newton-Schulz iteration.
 
     Iterates:
         Y_{k+1} = Y_k T
         Z_{k+1} = T Z_k
-    with T = 0.5 (3I - Z_k Y_k), starting from Y_0 = A / s, Z_0 = I where
-    s = ||A||_F is a scaling factor that keeps the spectrum of Y_0 inside
-    (0, 1) for convergence. At convergence Y_k → (A/s)^{1/2} and
-    Z_k → (A/s)^{-1/2}, so A^{-1/2} = Z_k / sqrt(s). Convergence is tracked
-    via ||Y_k Z_k - I||_F (which must go to 0).
+    with T = c1 I + c3 Z_k Y_k, starting from Y_0 = A / s, Z_0 = I, where
+    s >= lambda_max(A) is a cheap norm bound. Newton-Schulz is
+    (c1, c3) = (3/2, -1/2). Y_k -> (A/s)^{1/2} and Z_k -> (A/s)^{-1/2}, so
+    A^{-1/2} = Z_k / sqrt(s); convergence is tracked by ||Y_k Z_k - I||_F.
 
-    All operations are GEMMs — the workload shape that maps well to the
-    Trainium Tensor Engine via trnblas. Prefer this over :func:`inv_sqrt_spd`
-    when the NKI backend is active and A is well-conditioned. Falls back
-    to the eigendecomposition path (:func:`inv_sqrt_spd`) is recommended
-    for A with eigenvalue spread beyond ~1e6.
+    All O(n^3) work is matrix products, so the iteration maps to the Trainium
+    Tensor Engine. Two modes:
+
+    - ``iters=None`` (adaptive, the original behaviour): up to ``max_iters``
+      iterations, stopping once ||Y Z - I||_F / sqrt(n) < ``tol``; one host
+      synchronisation per iteration. Products use ``trnblas.gemm`` when
+      trnblas is installed (torch.matmul otherwise), unless ``precision``
+      is given.
+    - ``iters=k`` (fixed, #149): exactly k iterations with no host
+      synchronisation inside the loop, so the shapes and the schedule are
+      static; the residual is computed once at the end. Pick k with
+      :func:`trnsolver.matfun.ns_iteration_count`.
 
     Args:
         A: Symmetric positive definite matrix (n, n).
-        max_iters: Maximum iterations.
-        tol: Relative Frobenius-norm tolerance on ||Y - I||.
+        iters: Fixed iteration count, or None for the adaptive mode.
+        max_iters: Adaptive mode: maximum iterations.
+        tol: Adaptive mode: tolerance on ||Y Z - I||_F / sqrt(n).
+        polynomial: ``"newton"`` (default) or ``"minimax"``: the greedy
+            minimax odd-cubic schedule ("Polar Express", Amsel et al., arXiv
+            2505.16932) for eigenvalues of A / s in [1 / cond, 1]. Its
+            coefficients tend to Newton-Schulz as the iteration converges;
+            for ill-conditioned A it needs far fewer iterations
+            (cond = 1e6: 12 against 22 iterations to 1e-14).
+        cond: ``polynomial="minimax"``: an upper bound on s / lambda_min(A).
+            An underestimate is safe; it only slows the smallest eigenvalues.
+        scaling: ``"bound"`` (min of the Frobenius and infinity norms, both
+            bounds on lambda_max), ``"fro"``, ``"inf"``, or a number (e.g. a
+            lambda_max bound from an earlier SCF iteration). Default:
+            ``"fro"`` in the adaptive mode (the original behaviour),
+            ``"bound"`` in the fixed mode.
+        precision: GEMM routing (``trnsolver._precision``): None, ``"fp32"``,
+            ``"fp64"`` / ``"ozaki1"`` / ``"ozaki2"`` (``trnblas.gemm_fp64``),
+            a dict of ``gemm_fp64`` keywords, a callable ``(A, B) -> C``, or a
+            list of these per iteration (staged precision).
 
     Returns:
         X: Approximation of A^{-1/2}.
         iters: Number of iterations executed.
-        residual: Final ||Y - I||_F relative to ||I||_F.
-
-    Note:
-        TODO: power-iteration-based spectral-norm scaling is tighter than
-        Frobenius for matrices with one dominant eigenvalue. Frobenius is
-        good enough for typical DF-MP2 metric matrices.
+        residual: Final ||Y Z - I||_F / sqrt(n).
     """
+    from . import _precision
+    from .matfun import _ns_fixed, _ns_scale, _ns_step, ns_coefficients
+
     A, orig = _to_fp32(A)
-
-    try:
-        import trnblas as _tb
-    except ImportError:
-        _tb = None
-
     n = A.shape[0]
-    s = torch.linalg.norm(A, ord="fro")
     eye_n = torch.eye(n, dtype=A.dtype, device=A.device)
+
+    if iters is not None:
+        gemm_k, gemm_last = _precision.schedule(precision)
+        s = _ns_scale(A, "bound" if scaling is None else scaling)
+        X, res = _ns_fixed(A, ns_coefficients(iters, polynomial, cond), s, gemm_k, gemm_last)
+        return _restore(X, orig), iters, float(res)
+
+    if precision is None:
+        try:
+            import trnblas  # noqa: F401
+
+            precision = "trnblas"
+        except ImportError:
+            precision = None
+    gemm_k, _ = _precision.schedule(precision)
+    s = _ns_scale(A, "fro" if scaling is None else scaling)
+    coeffs = ns_coefficients(max_iters, polynomial, cond)
 
     Y = A / s
     Z = eye_n.clone()
-
-    norm_I = torch.linalg.norm(eye_n, ord="fro")
     residual = float("inf")
-    for k in range(max_iters):
-        if _tb is not None:
-            # NKI-accelerated path: O(n³) GEMMs via trnblas (blocked NKI GEMM
-            # on Trainium, torch.matmul fallback elsewhere). The O(n²) scalar
-            # combination for T stays on the host — no systolic advantage there.
-            ZY = _tb.gemm(1.0, Z, Y)  # Z @ Y
-            T = 1.5 * eye_n - 0.5 * ZY  # 0.5*(3I - Z@Y), host O(n²)
-            Y = _tb.gemm(1.0, Y, T)  # Y @ T
-            Z = _tb.gemm(1.0, T, Z)  # T @ Z
-            YZ = _tb.gemm(1.0, Y, Z)  # Y @ Z  (convergence check)
-        else:
-            T = 0.5 * (3.0 * eye_n - Z @ Y)
-            Y = Y @ T
-            Z = T @ Z
-            YZ = Y @ Z
-        residual = (torch.linalg.norm(YZ - eye_n, ord="fro") / norm_I).item()
+    for k, (c1, c3) in enumerate(coeffs):
+        g = gemm_k(k)
+        Y, Z = _ns_step(Y, Z, c1, c3, g, first=(k == 0))
+        residual = (torch.linalg.norm(g(Y, Z) - eye_n, ord="fro") / n**0.5).item()
         if residual < tol:
             return _restore(Z / torch.sqrt(s), orig), k + 1, residual
 

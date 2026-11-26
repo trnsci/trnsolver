@@ -47,6 +47,9 @@ from .iterative import (
     ssor_preconditioner,
 )
 
+# GEMM-only matrix functions: density purification (#149)
+from .matfun import PurificationResult, density_purification
+
 # Backend control
 from .nki import HAS_NKI, get_backend, set_backend
 
@@ -73,6 +76,8 @@ __all__ = [
     "inv_spd",
     "inv_sqrt_spd",
     "inv_sqrt_spd_ns",
+    "density_purification",
+    "PurificationResult",
     "pinv",
     "schur",
     "svd",

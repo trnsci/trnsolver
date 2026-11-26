@@ -22,6 +22,8 @@ trnsolver/
 │   ├── eigen.py             # eigh, eigh_generalized (Jacobi + torch fallback)
 │   ├── factor.py            # cholesky, lu, qr, solve, solve_spd, inv_sqrt_spd
 │   ├── orthogonalize.py     # orthogonalizer(S): symmetric / canonical / pivoted Cholesky
+│   ├── matfun.py            # density_purification, Newton-Schulz schedules (#149)
+│   ├── _precision.py        # precision= GEMM routing (torch.matmul / trnblas.gemm_fp64)
 │   ├── iterative.py         # cg, gmres
 │   ├── block.py             # cg_block(_ir), pivoted low-rank preconditioner, SLQ
 │   └── nki/
@@ -51,6 +53,7 @@ trnsolver/
 | Eigensolve | A' V = V Λ | `eigh(A')` (Jacobi on NKI) |
 | Back-transform | C = L^{-T} V | `trsm` (in trnblas) |
 | Density | P = C_occ @ C_occ^T | `syrk` (in trnblas) |
+| ...without eigenvectors | P = purify(X^T F X) | `density_purification(F, S, n_occ=...)` |
 | Metric inverse | J^{-1/2} | `inv_sqrt_spd(J)` |
 
 ## NKI Jacobi Strategy

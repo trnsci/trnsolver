@@ -194,6 +194,7 @@ python scripts/bench_scf_ladder.py --dry-run   # 500-3500 AO ladder: memory, cor
 | Eigen | `orthogonalizer` | X with XᵀSX = I on S's kept subspace: Löwdin, canonical or pivoted Cholesky, dropping near-linear dependencies |
 | Eigen | `eigh_randomized` | Randomized: k dominant eigenpairs, O(n²k), sRR |
 | Eigen | `occupied_subspace` | Lowest k eigenpairs for SCF: warm-started Chebyshev-filtered subspace iteration, one NKI launch per pass (F resident in SBUF) |
+| Eigen | `density_purification` | SCF density without eigenvectors: canonical (Palser–Manolopoulos) or SP2 purification, fixed iterations, GEMM only, `precision=` staging |
 | Factor | `cholesky` | `A = LL^T` |
 | Factor | `lu` | `A = PLU` |
 | Factor | `qr` | `A = QR` |
@@ -203,7 +204,7 @@ python scripts/bench_scf_ladder.py --dry-run   # 500-3500 AO ladder: memory, cor
 | Solve | `solve_spd` | `Ax = b` (Cholesky, A is SPD) |
 | Solve | `inv_spd` | `A^{-1}` for SPD A |
 | Solve | `inv_sqrt_spd` | `A^{-1/2}` via eigendecomposition |
-| Solve | `inv_sqrt_spd_ns` | `A^{-1/2}` via Newton-Schulz (all-GEMM) |
+| Solve | `inv_sqrt_spd_ns` | `A^{-1/2}` via Newton-Schulz (all-GEMM); fixed `iters`, minimax first iterations |
 | Iterative | `cg` | Conjugate Gradient (SPD systems) |
 | Iterative | `gmres` | GMRES (general systems) |
 | Iterative | `gmres_ir` | GMRES-IR: iterative refinement, FP64 outer residual |
