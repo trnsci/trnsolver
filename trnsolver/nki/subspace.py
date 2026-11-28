@@ -42,11 +42,13 @@ trace-time constants, so one compiled kernel serves every call with the same
 (n, kb, m). ``sched`` is shape-only: ``sched.shape[0] = m``.
 
 NKI 0.7 rules followed (``tests/test_subspace.py`` runs the MLIR verifier at
-lnc = 1 and 2): every SBUF/PSUM tile starts at partition 0; PSUM
-accumulators are created zeroed (``nl.zeros``) and then only accumulated
-into, one whole tile per accumulation group; (128, 1) arithmetic is float
-multiply / add only (no divide, no reciprocal); no transposing DMA
-(``nisa.nc_transpose`` on the Tensor Engine instead).
+lnc = 1 and 2): every SBUF/PSUM tile starts at partition 0; each PSUM
+accumulation group covers one whole tile, and its first matmul writes with
+``accumulate=False`` (``accumulate=(j > 0)`` over a static loop), since a
+matmul that accumulates onto PSUM initialised by a memset such as
+``nl.zeros`` is undefined behaviour on Trn2 (trnsci/trnsci#185); (128, 1)
+arithmetic is float multiply / add only (no divide, no reciprocal); no
+transposing DMA (``nisa.nc_transpose`` on the Tensor Engine instead).
 
 Under LNC=2 both programs run the whole launch and write identical results
 (the F-applies need every row tile of the previous step, and NKI 0.7 has no
@@ -183,7 +185,7 @@ if HAS_NKI:
                             dst=pt, data=src[0:P, i, c0 : c0 + cw], engine=nisa.engine.tensor
                         )
                         nisa.tensor_copy(dst=tt[0:cw, h * len(chunks) + ci, 0:P], src=pt)
-                ps = nl.zeros((P, kb), dtype=f32, buffer=nl.psum)
+                ps = nl.ndarray((P, kb), dtype=f32, buffer=nl.psum)
                 for h in range(2):
                     for ci, (_c0, cw) in enumerate(chunks):
                         q = h * len(chunks) + ci
@@ -191,7 +193,7 @@ if HAS_NKI:
                             dst=ps,
                             stationary=tt[0:cw, q, 0:P],
                             moving=Qs[0:cw, q, 0:kb],
-                            accumulate=True,
+                            accumulate=(q > 0),
                         )
                 nisa.tensor_copy(dst=Xs[0:P, i, 0:kb], src=ps)
         if emit_x:
@@ -203,18 +205,19 @@ if HAS_NKI:
         def apply_f(src, emit):
             """emit(i, ps) with ps = (F src)[row tile i] in PSUM, for every i."""
             for i in range(nt):
-                ps = nl.zeros((P, kb), dtype=f32, buffer=nl.psum)
+                ps = nl.ndarray((P, kb), dtype=f32, buffer=nl.psum)
                 for j in range(nt):
                     nisa.nc_matmul(
                         dst=ps,
                         stationary=Fs[0:P, j, i * P : (i + 1) * P],
                         moving=src[0:P, j, 0:kb],
-                        accumulate=True,
+                        accumulate=(j > 0),
                     )
                 emit(i, ps)
 
         # Step 0: FX, the input residual, and Y_1 = a_1 FX + b_1 X.
-        rn = nl.zeros((1, kb), dtype=f32, buffer=nl.psum)
+        # One accumulation group over the row tiles; tile 0 opens it.
+        rn = nl.ndarray((1, kb), dtype=f32, buffer=nl.psum)
 
         def emit0(i, ps):
             nisa.tensor_copy(dst=FXs[0:P, i, 0:kb], src=ps)
@@ -225,7 +228,7 @@ if HAS_NKI:
             nisa.tensor_tensor(dst=rt, data1=rt, data2=FXs[0:P, i, 0:kb], op=add)
             sq = nl.ndarray((P, kb), dtype=f32, buffer=nl.sbuf)
             nisa.tensor_tensor(dst=sq, data1=rt, data2=rt, op=mul)
-            nisa.nc_matmul(dst=rn, stationary=ones, moving=sq, accumulate=True)
+            nisa.nc_matmul(dst=rn, stationary=ones, moving=sq, accumulate=(i > 0))
             t = nl.ndarray((P, kb), dtype=f32, buffer=nl.sbuf)
             nisa.tensor_scalar(dst=t, data=Xs[0:P, i, 0:kb], op0=mul, operand0=col(m))
             nisa.scalar_tensor_tensor(
@@ -268,13 +271,13 @@ if HAS_NKI:
         def gram(A, Bv, emit):
             """emit(ci, c0, cw, ps) with ps = A[:, c-chunk]^T Bv in PSUM (cw, kb)."""
             for ci, (c0, cw) in enumerate(chunks):
-                ps = nl.zeros((cw, kb), dtype=f32, buffer=nl.psum)
+                ps = nl.ndarray((cw, kb), dtype=f32, buffer=nl.psum)
                 for j in range(nt):
                     nisa.nc_matmul(
                         dst=ps,
                         stationary=A[0:P, j, c0 : c0 + cw],
                         moving=Bv[0:P, j, 0:kb],
-                        accumulate=True,
+                        accumulate=(j > 0),
                     )
                 emit(ci, c0, cw, ps)
 
@@ -294,13 +297,13 @@ if HAS_NKI:
 
         # E = Y - X M, row tile by row tile.
         for i in range(nt):
-            ps = nl.zeros((P, kb), dtype=f32, buffer=nl.psum)
+            ps = nl.ndarray((P, kb), dtype=f32, buffer=nl.psum)
             for ci, (_c0, cw) in enumerate(chunks):
                 nisa.nc_matmul(
                     dst=ps,
                     stationary=XT[0:cw, ci, i, 0:P],
                     moving=Ms[0:cw, ci, 0:kb],
-                    accumulate=True,
+                    accumulate=(ci > 0),
                 )
             nisa.tensor_tensor(
                 dst=Eb[0:P, i, 0:kb], data1=Y[0:P, i, 0:kb], data2=ps, op=nl.subtract

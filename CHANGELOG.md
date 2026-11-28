@@ -44,6 +44,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   next device window. `tests/test_cg_reduction_ff_neuron.py` holds the
   device checks, including a gated LNC=1 vs LNC=2 test.
 
+### Changed
+
+- **trnblas >= 0.14 is now a runtime dependency**, for `trnblas.fp64`
+  behind the new reduction modes. trnblas needs only torch and numpy. The
+  dev extra's floor also moves from 0.9 to 0.14.
+
+## [0.24.0] — 2026-11-28
+
+### Added
+
 - **Device conformance runs are signal-only (trnsci/trnsci#35).** On a
   device run (`--backend nki --conformance-device neuron`), the known
   platform-limit cases in `tests/test_conformance.py` are marked
@@ -55,11 +65,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scripts/conformance_expect.py` merges chunked runs and exits 1 on NEW
   failures. Test-only; no library change.
 
-### Changed
+### Fixed
 
-- **trnblas >= 0.14 is now a runtime dependency**, for `trnblas.fp64`
-  behind the new reduction modes. trnblas needs only torch and numpy. The
-  dev extra's floor also moves from 0.9 to 0.14.
+- **`subspace_filter_kernel` / `subspace_step_kernel` PSUM accumulation
+  groups now open with a matmul write (trnsci/trnsci#185).** The kernels
+  zeroed PSUM tiles with `nl.zeros(..., buffer=nl.psum)` (a memset) and then
+  accumulated into them with `nisa.nc_matmul(..., accumulate=True)`. The
+  `nc_matmul` docs make that undefined behaviour on NeuronCore-v3 (Trn2):
+  accumulating onto PSUM that a non-matmul instruction initialised is not
+  supported, and the first write must use `accumulate=False`. Device results
+  matched the references so far, but they relied on that behaviour. The five
+  sites (the on-chip `X Q` fold, the F-apply, the residual-norm reduction,
+  the Gram blocks and `E = Y - X M`) pass `accumulate=(j > 0)` over their
+  static loops, and their PSUM tiles are plain `nl.ndarray`s, so the
+  redundant memsets are gone. The two `matmul_kernel` variants in
+  `nki/dispatch.py` already wrote with `accumulate=False` and are unchanged.
+  Simulator outputs are bitwise equal to 0.23.0 at the test shapes. A new
+  static lint (`tests/test_psum_accumulate_lint.py`) fails when a zeroed
+  PSUM tile is a matmul accumulation target, or when a tile is only ever
+  accumulated into.
 
 ## [0.23.0] — 2026-11-10
 
