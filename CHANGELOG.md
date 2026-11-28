@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.24.0] — 2026-11-28
-
 ### Added
 
 - **`density_purification(F, S, n_occ=...)`: the SCF density without
@@ -53,6 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CPU timing harness and the device bench / hardware gate (n = 512, 1024,
   2048, 3508 against host `eigh`; native fp32 on the device, host fp64 with
   `gemm_fp64` products on the device, and the staged arm).
+
+## [0.24.0] — 2026-11-28
+
+### Added
 
 - **Device conformance runs are signal-only (trnsci/trnsci#35).** On a
   device run (`--backend nki --conformance-device neuron`), the known
