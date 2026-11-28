@@ -74,6 +74,92 @@ In float64 nothing has to be dropped at this size. In FP32 the dropped direction
 
 C20H42/aug-cc-pVDZ (n = 838, smallest eigenvalue 4.1e-7) is milder. At lindep 1e-7 two functions are dropped, and every variant converges in FP32 (26–35 iterations). In float64 the two dropped functions raise the energy by 2.8e-5 Eh against the full basis (canonical −781.9162346 against −781.9162624 Eh for S⁻¹ᐟ², the Cholesky of S, and `cholesky`). The threshold trades that basis-set truncation against FP32 conditioning. Lower it, or use float64, when the truncation matters more.
 
+## `density_purification(F, S=None, *, n_occ, X=None, method="canonical", iters=None, precision=None, bounds=None, ns_iters=None, ns_cond=1e6, ns_polynomial="minimax", transforms="auto")`
+
+The SCF density matrix without eigenvectors (#149): matrix products only, a
+fixed iteration count, fixed shapes, and no host synchronisation inside the
+loop (each step's branch is a `torch.where` on a 0-d tensor). A fixed count
+compiles into one static schedule; the on-device tridiagonalisation (#42) does
+not fit that shape, so `eigh` falls back to the host.
+
+- The orthonormal-basis Fock matrix is `F' = XᵀFX`. With `S` and no `X`,
+  `X = S⁻¹ᐟ²` by `inv_sqrt_spd_ns` with a fixed minimax schedule
+  (`ns_iteration_count(ns_cond, 50 eps)` iterations). Any `X` with
+  `XᵀSX = I` works, including the rectangular `orthogonalizer(S).X`.
+- `method="canonical"`: Palser–Manolopoulos canonical purification (Phys. Rev.
+  B 58, 12704, 1998), two products per iteration, trace-conserving.
+  `method="sp2"`: Niklasson's trace-correcting SP2 (Phys. Rev. B 66, 155115,
+  2002), one product per iteration.
+- Spectral bounds of `F'` are Gershgorin discs unless `bounds=` is given.
+- `transforms=` sets where `X`, `F' = XᵀFX` and `P = X P' Xᵀ` are computed.
+  `"native"`: in F's dtype on F's device. `"host64"`: in float64 on the host,
+  from S / X / F as given; only the purification loop runs in F's dtype on
+  F's device, and the energy is `tr(P'F')` in float64. `result.X` is then the
+  float64 host X; pass it back as `X=` on later SCF iterations of the same
+  geometry to skip Newton–Schulz. `"auto"` (default) takes `"host64"` for
+  float32 F on a device with S or X given, else `"native"`, so CPU and float64
+  runs are unchanged. Trn2, window 8 (one logical core, SDK 2.33.1, synthetic
+  spectra with κ(S) = 1e4, fp64 S and F into the host transforms):
+
+  | n | method | `"native"`: loop (s), E rel | host fp64 transforms: loop (s), E rel | host fp64 `eigh` (s) |
+  |---|---|---|---|---|
+  | 2048 | sp2 | 0.110, 2.4e-6 | 0.093, 5.8e-9 | 2.64 |
+  | 3508 | sp2 | 0.309, 1.6e-6 | 0.225, 5.1e-9 | 11.85 |
+
+  `"native"` loses about 3 digits of energy at these sizes (2.9e-3 to 3.2e-3
+  Ha against 7e-6 to 1e-5 Ha). The times are the loop alone, on a 2-vCPU host
+  for `eigh`. The host transforms add four float64 n³ products per call, plus
+  Newton–Schulz when `X` is not passed. With F already rounded to float32 the
+  energy error is larger than with float64 F (CPU, n = 512, gapped sp2: E rel
+  1.5e-7 from float64 S, 3e-7 from float32 S, against 4e-6 for `"native"`).
+- Compiling: the loop (`matfun._purify_fixed`) traces to one graph under
+  `torch.compile(fullgraph=True)`, but on Trn2 that pays only at n ≤ 1024
+  (sp2, gapped: 0.0165 s compiled at 512; 0.041 s compiled against 0.062–0.068
+  s eager at 1024). At 2048 the compiled loop was slower (0.121 against 0.091 s
+  eager), at 3508 at parity, and the cold compile ran past 19 minutes at both.
+  `density_purification` runs eagerly; compile the loop yourself only for
+  n ≤ 1024.
+- Returns a `PurificationResult`: `P` (the AO projector `X P' Xᵀ`, so
+  `PSP = P`, `tr(PS) = n_occ`; the closed-shell density is `2P`), `P_orth`,
+  `X`, `energy = tr(PF)`, `idempotency_error = ‖P'² − P'‖_F`,
+  `trace_error = |tr P' − n_occ|`, `history` (`tr(P' − P'²)` at the start of
+  each iteration, free of extra products), `iters`, `ns_iters`, `ns_residual`.
+- `iters` defaults to 80. Iterations to `tr(P' − P'²) < 1e-10` in fp64 on the
+  synthetic spectra of `scripts/bench_purification.py` (core levels to −20,
+  valence band, virtuals to +8; n = 64 / 512 / 1024 / 2048):
+
+  | gap | canonical | SP2 |
+  |---|---|---|
+  | 0.5 | 27 / 30 / 32 / 33 | 35 / 39 / 40 / 42 |
+  | 1e-2 | 42 / 57 / 63 / 69 | 55 / 58 / 60 / 62 |
+  | 1e-6 | 66 / 99 / 123 / >150 | 97 / 105 / 108 / 113 |
+
+  SP2 takes about one product per iteration where canonical takes two, and
+  its count barely grows with n.
+
+### `precision=`
+
+Each product goes through a spec, per iteration:
+
+| spec | product |
+|---|---|
+| `None`, `"native"` | `torch.matmul` in the iterate's dtype |
+| `"fp32"` | operands cast to fp32, result cast back |
+| `"fp64"`, `"ozaki1"`, `"ozaki2"` | `trnblas.gemm_fp64(scheme=...)`, result cast back |
+| dict | `trnblas.gemm_fp64(**spec)`, e.g. `{"scheme": "ozaki2", "moduli": 14}` |
+| callable | `(A, B) -> C` |
+| list of the above | entry k for iteration k, the last entry after the end and for the transforms |
+
+The iterate stays in the input dtype: low precision only enters as split
+pieces inside `gemm_fp64`, never as the working precision (trnsci/trnsci#176).
+A staged schedule such as `["fp32"] * 20 + ["ozaki1"]` (the TPU DFT precedent,
+arXiv 2202.01255, ran fp32 iterations, then fp64-emulated ones) restores fp64
+idempotency, but the occupied subspace keeps the O(fp32) rotation of the early
+stage: at gap 0.5 the density error is 4e-6 / 2e-5 / 1e-4 at n = 256 / 1024 /
+2048, while the energy error (second order in the rotation) is 1e-11 / 3e-10
+/ 8e-9 relative. The SCF's own iterations
+remove that rotation; a single purification does not.
+
 ## Backend notes
 
 Householder tridiagonalization is n − 2 dependent BLAS-2 steps and leaves the Tensor Engine idle (#48). A parallel-ordered Jacobi step rotates n/2 disjoint pairs at once, so a batch of matrices advances in lockstep with no long dependency chain. In the kernel the Tensor Engine applies the step's partner permutation (an exact matmul shared by every tile) and the Vector Engine applies the rotations. For measurements see #48; the fair CPU baseline splits the batch across the same threads, which is 1.6–5.8× faster than one batched `torch.linalg.eigh` call (#54, v0.19.0).
