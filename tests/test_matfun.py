@@ -393,6 +393,85 @@ def test_purification_errors():
 
 
 # ----------------------------------------------------------------------
+# transforms=: host fp64 S^{-1/2} and basis transforms (window 8, PR #154)
+# ----------------------------------------------------------------------
+
+
+def test_transforms_auto_resolution():
+    r = matfun._resolve_transforms
+    dev32 = torch.empty(4, 4, device="meta")  # stands in for a device tensor
+    assert r("auto", dev32, True) == "host64"
+    assert r("auto", dev32, False) == "native"  # no basis to transform
+    assert r("auto", torch.empty(4, 4, device="meta", dtype=F64), True) == "native"
+    assert r("auto", torch.empty(4, 4, device="meta", dtype=torch.bfloat16), True) == "native"
+    assert r("auto", torch.empty(4, 4), True) == "native"  # fp32 on the CPU
+    assert r("auto", torch.empty(4, 4, dtype=F64), True) == "native"
+    for m in ("native", "host64"):
+        assert r(m, dev32, True) == m and r(m, torch.empty(4, 4), False) == m
+    with pytest.raises(ValueError, match="transforms"):
+        density_purification(torch.eye(4), n_occ=2, transforms="fp64")
+
+
+def test_transforms_default_on_host_unchanged(problems):
+    F, S, n_occ, *_ = problems(64, "gapped")
+    for dt in (F32, F64):
+        a = density_purification(F.to(dt), S.to(dt), n_occ=n_occ, iters=40)
+        b = density_purification(F.to(dt), S.to(dt), n_occ=n_occ, iters=40, transforms="native")
+        assert a.X.dtype == dt and torch.equal(a.P, b.P) and a.energy == b.energy
+
+
+@pytest.mark.parametrize("method", ["canonical", "sp2"])
+def test_transforms_host64(problems, method):
+    # The fp32orth arm: X and F' in host fp64, the loop in fp32 (F's dtype
+    # and device). On Trn2 at n >= 2048 it kept ~3 more digits of energy.
+    n, case = 1024, "gapped"
+    prob = problems(n, case)
+    F, S, n_occ, _, P_ref, E_ref = prob
+    iters = bp.ITERS[(method, case)]
+    kw = dict(n_occ=n_occ, method=method, iters=iters, ns_cond=1e5)
+    nat = density_purification(F.float(), S.float(), transforms="native", **kw)
+    r = density_purification(F.float(), S, transforms="host64", **kw)
+    assert r.P.dtype == F32 and r.P_orth.dtype == F32 and r.P.shape == (n, n)
+    assert r.X.dtype == F64 and r.X.device.type == "cpu"
+    assert r.ns_iters == ns_iteration_count(1e5, 50 * torch.finfo(F64).eps)
+    assert r.ns_residual < 1e-12
+    _check(r, prob, F32, case)
+    E_rel = abs(r.energy - E_ref) / abs(E_ref)
+    E_nat = abs(nat.energy - E_ref) / abs(E_ref)
+    assert E_rel < 5e-7 and E_rel < E_nat / 10, (E_rel, E_nat)
+    # fp32 S is upcast exactly; the result stays close
+    r32 = density_purification(F.float(), S.float(), transforms="host64", **kw)
+    assert abs(r32.energy - E_ref) / abs(E_ref) < 2e-6
+    # Reusing the host X (a later SCF iteration) skips Newton-Schulz.
+    r2 = density_purification(F.float(), X=r.X, transforms="host64", **kw)
+    assert r2.ns_iters == 0 and r2.ns_residual is None
+    assert torch.equal(r2.P, r.P) and r2.energy == r.energy
+
+
+def test_transforms_host64_rectangular_X_and_precision():
+    F, S, n_occ, eps = bp.synthetic_scf(64, 0.5, cond_s=1e4)
+    T = torch.cat([torch.eye(64, dtype=F64), torch.eye(64, dtype=F64)[:, :4]], 1)
+    S2, F2 = T.T @ S @ T, T.T @ F @ T
+    X = trnsolver.orthogonalizer(S2, method="canonical", lindep=1e-10).X
+    log = []
+    r = density_purification(
+        F2.float(), X=X, n_occ=n_occ, iters=40, transforms="host64", precision=_tagged("p", log)
+    )
+    assert r.P_orth.shape == (64, 64) and r.P.shape == (68, 68) and r.P.dtype == F32
+    assert abs(r.energy - float(eps[:n_occ].sum())) / abs(float(eps[:n_occ].sum())) < 1e-6
+    # precision= routes the loop (2 per canonical iteration) and the final
+    # idempotency check only; the transforms are host fp64 torch.matmul.
+    assert len(log) == 2 * 40 + 1
+    with pytest.raises(ValueError, match="n_occ"):
+        density_purification(F2.float(), X=X, n_occ=65, transforms="host64")
+    with pytest.raises(ValueError, match="S must match"):
+        density_purification(F.float(), torch.eye(3, dtype=F64), n_occ=2, transforms="host64")
+    # No S and no X: nothing to transform, the loop runs on F as given.
+    o = density_purification(F.float() / 2, n_occ=n_occ, iters=40, transforms="host64")
+    assert o.X is None and torch.equal(o.P, o.P_orth)
+
+
+# ----------------------------------------------------------------------
 # static schedule: no host synchronisation, traceable with fullgraph
 # ----------------------------------------------------------------------
 

@@ -18,7 +18,8 @@ S^{-1/2} residual), the purification wall time, and the host eigh time
 
 Arms:
 
-    native        iterate in --dtype on --device, torch.matmul products
+    native        iterate in --dtype on --device, torch.matmul products, and
+                  S^{-1/2} and the transforms there too (transforms="native")
     fp32prod      float64 iterate on the host, fp32 products (emulated stage)
     staged        float64 iterate on the host; the first --stage iterations
                   use fp32 products, the rest (and the transforms) fp64-class
@@ -28,6 +29,11 @@ Arms:
     fp32orth      X = S^{-1/2} and F' = X^T F X once in host fp64, then the fp32
                   purification of F' on --device (the timed part); the fp32
                   error of the native arm is mostly S^{-1/2} and the transforms
+    host64        density_purification(transforms="host64"), the default for
+                  fp32 on a device (the fp32orth arm inside the library):
+                  fp32 F on --device, fp64 S on the host. The first call computes X (host fp64 Newton-Schulz);
+                  the timed calls pass X=result.X, as an SCF iteration would,
+                  so t includes the four host fp64 transforms per call
 
 With --device neuron the native arm keeps F, S and every iterate on the
 device; the staged / ozaki arms move each product's operands to the device
@@ -36,7 +42,7 @@ in torch.compile (backend "neuron" on the device).
 
 CPU:    python scripts/bench_purification.py --n 256 512 1024
 Device: python scripts/bench_purification.py --device neuron --n 512 1024 2048 3508 \\
-            --arms native ozaki staged --out purify_trn2.json
+            --arms native host64 ozaki staged --out purify_trn2.json
 """
 
 from __future__ import annotations
@@ -176,22 +182,36 @@ def run_one(args, n, case, method, arm, prob, ref):
         )
         Fo = (X_host.T @ F64 @ X_host).to(args.device, dt)
         args_in, kw = (Fo,), dict(n_occ=n_occ, method=method, iters=iters)
+    elif arm == "host64":
+        dt, prec = torch.float32, None
+        args_in = (F64.to(args.device, dt), S64)
+        kw = dict(
+            n_occ=n_occ, method=method, iters=iters, ns_cond=args.ns_cond, transforms="host64"
+        )
     else:
         dt = getattr(torch, args.dtype) if arm == "native" else torch.float64
         dev = args.device if arm == "native" else "cpu"
         prec = precision_for(arm, args.device, args.stage, args.scheme)
         args_in = (F64.to(dev, dt), S64.to(dev, dt))
         kw = dict(n_occ=n_occ, method=method, iters=iters, precision=prec, ns_cond=args.ns_cond)
+        if arm == "native":
+            kw["transforms"] = "native"
 
     t0 = time.perf_counter()
     r = density_purification(*args_in, **kw)  # warm-up (compiles on the device)
     _sync(args.device)
     t_first = time.perf_counter() - t0
+    ns_first = None
+    if arm == "host64":
+        # Later SCF iterations of the same geometry reuse the host fp64 X.
+        ns_first = (r.ns_iters, r.ns_residual)
+        args_in, kw = (args_in[0],), dict(kw, X=r.X)
     t_loop = t_compile = compile_error = None
     if args.compile:
         gemm_k, gemm_last = _precision.schedule(prec)
         F_in = args_in[0]
-        Fo = F_in if r.X is None else (r.X.mT @ F_in @ r.X).contiguous()
+        X_r = r.X
+        Fo = F_in if X_r is None else (X_r.mT @ F_in.to(X_r) @ X_r).to(F_in).contiguous()
 
         def loop(Fo):
             return _purify_fixed(Fo, n_occ, method, iters, gemm_k, gemm_last)
@@ -226,6 +246,8 @@ def run_one(args, n, case, method, arm, prob, ref):
         r.ns_iters, r.ns_residual = k, ns_res_host
     else:
         P = r.P.double().cpu()
+    if ns_first is not None:
+        r.ns_iters, r.ns_residual = ns_first
     gemms_per = 2 if method == "canonical" else 1
     thr = 1e-10 if dt == torch.float64 else 1e-3
     return {
@@ -287,7 +309,7 @@ def main(argv=None) -> int:
         "--arms",
         nargs="+",
         default=["native"],
-        choices=["native", "fp32orth", "fp32prod", "staged", "ozaki"],
+        choices=["native", "fp32orth", "host64", "fp32prod", "staged", "ozaki"],
     )
     ap.add_argument("--dtype", default="float64", choices=["float32", "float64"])
     ap.add_argument("--device", default="cpu")

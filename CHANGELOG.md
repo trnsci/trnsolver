@@ -47,10 +47,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   purification: at n = 1024, gap 0.5, `tr(PF)` is off by 7e-3 (1e-5
   relative) all-fp32, and by 1e-5 to 2e-4 with X and `XᵀFX` in host fp64 and
   only the purification in fp32 (bench arm `fp32orth`).
+- **`transforms=` for `density_purification`; float32 on a device defaults
+  to host fp64 transforms (#149, window 8).** `"host64"` computes
+  `X = S⁻¹ᐟ²` (or takes the given X), `F' = XᵀFX` and `P = X P' Xᵀ` in
+  float64 on the host and runs only the purification loop in F's dtype on
+  F's device; the energy is `tr(P'F')` in float64, and `result.X` is the
+  float64 host X to pass back as `X=` on later SCF iterations. `"native"`
+  keeps everything in F's dtype on F's device. `"auto"` (the default) takes
+  `"host64"` for float32 F on a device with S or X given, else `"native"`, so
+  CPU and float64 results are unchanged. On Trn2 at n = 2048 / 3508 (sp2,
+  gapped) `"native"` lost about 3 digits of energy: E rel 2.4e-6 / 1.6e-6
+  against 5.8e-9 / 5.1e-9 with host fp64 transforms, and the device loop was
+  0.110 / 0.309 s against 0.093 / 0.225 s. Those times are the loop alone;
+  the four host fp64 n³ transforms per call come on top.
+- **Compiling the purification loop pays only at n ≤ 1024 on Trn2.**
+  Compiled sp2 took 0.0165 s at n = 512 and 0.041 s at 1024 (0.062–0.068 s
+  eager). At 2048 it was 0.121 s against 0.091 s eager, at 3508 at parity,
+  and the cold compile ran past 19 minutes at both. `density_purification`
+  stays eager; the docstring and `docs/api/eigen.md` say when to compile.
 - **`scripts/bench_purification.py` and `tests/test_matfun_neuron.py`:** the
   CPU timing harness and the device bench / hardware gate (n = 512, 1024,
   2048, 3508 against host `eigh`; native fp32 on the device, host fp64 with
-  `gemm_fp64` products on the device, and the staged arm).
+  `gemm_fp64` products on the device, and the staged arm). The `native` arm
+  now passes `transforms="native"`, and a `host64` arm times the library
+  default end to end per SCF iteration (fp32 F on the device, fp64 S on the
+  host, X reused, host transforms included).
 
 ## [0.24.0] — 2026-11-28
 

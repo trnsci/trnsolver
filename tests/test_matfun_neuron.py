@@ -51,9 +51,10 @@ def _errs(r, P_ref, E_ref):
     return E_rel, P_rel
 
 
+@pytest.mark.parametrize("transforms", ["auto", "native"])
 @pytest.mark.parametrize("case", ["gapped", "small"])
 @pytest.mark.parametrize("method", ["canonical", "sp2"])
-def test_purification_fp32_on_device(prob, method, case):
+def test_purification_fp32_on_device(prob, method, case, transforms):
     F, S, n_occ, P_ref, E_ref = prob[case]
     r = trnsolver.density_purification(
         F.float().to(DEV),
@@ -62,18 +63,45 @@ def test_purification_fp32_on_device(prob, method, case):
         method=method,
         iters=bp.ITERS[(method, case)],
         ns_cond=1e5,
+        transforms=transforms,
     )
     assert r.P.device.type == DEV and r.P.dtype == torch.float32
+    assert r.P_orth.device.type == DEV and r.P_orth.dtype == torch.float32
+    if transforms == "auto":
+        # fp32 on the device takes host fp64 transforms (window 8, PR #154)
+        assert r.X.device.type == "cpu" and r.X.dtype == torch.float64
+    else:
+        assert r.X.device.type == DEV and r.X.dtype == torch.float32
     E_rel, P_rel = _errs(r, P_ref, E_ref)
     print(
-        f"\n{method} {case} n={N}: E rel {E_rel:.2e}, P rel {P_rel:.2e}, "
+        f"\n{method} {case} {transforms} n={N}: E rel {E_rel:.2e}, P rel {P_rel:.2e}, "
         f"idem {r.idempotency_error:.2e}, trace {r.trace_error:.2e}, NS res {r.ns_residual:.2e}"
     )
-    assert E_rel < 2e-5
+    # CPU at n = 512, gapped sp2: E rel 4e-6 native, 3e-7 host64 from fp32 S.
+    assert E_rel < (2e-6 if transforms == "auto" else 2e-5)
     assert r.idempotency_error < 1e-3
     assert r.trace_error < 1e-3
     if case == "gapped":
         assert P_rel < 3e-2
+
+
+@pytest.mark.parametrize("method", ["canonical", "sp2"])
+def test_purification_default_host_s64_on_device(prob, method):
+    # The SCF shape of the default: fp64 S on the host (X once per geometry),
+    # fp32 F on the device every iteration, X reused.
+    F, S, n_occ, P_ref, E_ref = prob["gapped"]
+    kw = dict(n_occ=n_occ, method=method, iters=bp.ITERS[(method, "gapped")], ns_cond=1e5)
+    r = trnsolver.density_purification(F.float().to(DEV), S, **kw)
+    assert r.X.dtype == torch.float64 and r.X.device.type == "cpu" and r.ns_residual < 1e-12
+    r2 = trnsolver.density_purification(F.float().to(DEV), X=r.X, **kw)
+    assert r2.ns_iters == 0 and r2.P.device.type == DEV
+    nat = trnsolver.density_purification(
+        F.float().to(DEV), S.float().to(DEV), transforms="native", **kw
+    )
+    E_rel, _ = _errs(r2, P_ref, E_ref)
+    E_nat, _ = _errs(nat, P_ref, E_ref)
+    print(f"\n{method} default (S64 host) E rel {E_rel:.2e}; native {E_nat:.2e}")
+    assert E_rel < 1e-6
 
 
 def test_inv_sqrt_ns_fp32_on_device(prob):

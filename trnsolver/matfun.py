@@ -204,7 +204,8 @@ class PurificationResult:
             closed-shell density is ``2 P``.
         P_orth: the purified projector in the orthonormal basis (m, m).
         X: the orthonormalising transform used (``S^{-1/2}`` when computed
-            here), or None without S and X.
+            here), or None without S and X. With ``transforms="host64"`` it is
+            float64 on the host; pass it back as ``X=`` to skip S^{-1/2}.
         energy: ``tr(P F)``, the sum of the occupied orbital energies at
             convergence (closed shell: ``2 tr(P F)``).
         idempotency_error: ``||P_orth^2 - P_orth||_F`` after the last iteration.
@@ -232,6 +233,27 @@ class PurificationResult:
 
 
 _DEFAULT_ITERS = {"canonical": 80, "sp2": 80}
+_TRANSFORMS = ("auto", "native", "host64")
+
+
+def _resolve_transforms(transforms: str, F: torch.Tensor, has_basis: bool) -> str:
+    """``"auto"`` → ``"host64"`` for float32 F on a device (not the CPU) with
+    S or X given, else ``"native"``.
+
+    Trn2, window 8 (PR #154): with S^{-1/2} and the basis transforms in fp32
+    on the device (``"native"``) the energy error at n = 2048 / 3508 was
+    2.9e-3 to 3.2e-3 Ha (E rel 1.6e-6 to 2.4e-6); with them in host fp64 and
+    only the purification in fp32 (the bench's ``fp32orth`` arm) it was 7e-6
+    to 1e-5 Ha (E rel 5e-9), and the device loop was faster too (0.093
+    against 0.110 s at 2048, 0.225 against 0.309 s at 3508, sp2 gapped).
+    """
+    if transforms not in _TRANSFORMS:
+        raise ValueError(f"transforms must be one of {_TRANSFORMS}; got {transforms!r}")
+    if transforms != "auto":
+        return transforms
+    if has_basis and F.dtype == torch.float32 and F.device.type != "cpu":
+        return "host64"
+    return "native"
 
 
 def _gershgorin(F: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -339,6 +361,7 @@ def density_purification(
     ns_iters: int | None = None,
     ns_cond: float = 1e6,
     ns_polynomial: str = "minimax",
+    transforms: str = "auto",
 ) -> PurificationResult:
     """SCF density matrix from the Fock matrix, without eigenvectors.
 
@@ -374,11 +397,37 @@ def density_purification(
         ns_cond: assumed bound on ``s / lambda_min(S)`` for the S^{-1/2}
             schedule (``s`` the norm-bound scaling).
         ns_polynomial: ``"minimax"`` (default) or ``"newton"``.
+        transforms: where ``X``, ``F' = X^T F X`` and ``P = X P' X^T`` are
+            computed.
+
+            - ``"native"``: in F's dtype on F's device, through
+              ``precision``'s last entry.
+            - ``"host64"``: in float64 on the host, from S / X / F as given
+              (pass S or X in float64 to keep their precision). Only the
+              purification loop and its idempotency check run in F's dtype
+              on F's device, and the energy is ``tr(P' F')`` in float64.
+              ``result.X`` is then the float64 host X: pass it back as
+              ``X=`` on later SCF iterations of the same geometry to skip the
+              Newton–Schulz iteration. ``precision=`` routes only the loop.
+            - ``"auto"`` (default): ``"host64"`` for float32 F on a device
+              with S or X given, else ``"native"``. On Trn2 at n = 2048 and
+              3508, ``"native"`` lost about 3 digits of energy (E err 2.9e-3
+              to 3.2e-3 Ha against 7e-6 to 1e-5 Ha for host64 transforms).
+              The device timings behind that measured the loop alone: the
+              four host fp64 n^3 products per call (and the Newton–Schulz
+              iteration when X is not passed) come on top.
 
     Returns:
         :class:`PurificationResult` with the density, the convergence report
         (idempotency and trace errors, per-iteration ``tr(P' - P'^2)``) and
         the iteration counts.
+
+    Compiling: the loop (``matfun._purify_fixed``) traces to one graph with
+    ``torch.compile(fullgraph=True)``. On Trn2 (window 8, sp2, gapped) that
+    paid only at n ≤ 1024: 0.041 s compiled against 0.062–0.068 s eager at
+    1024 (0.0165 s compiled at 512), but 0.121 against 0.091 s at 2048 and
+    parity at 3508, where the cold compile also ran past 19 minutes. Run it
+    eagerly (as this function does) above n ≈ 1024.
     """
     if F.is_complex():
         raise NotImplementedError("density_purification: complex F is not supported")
@@ -389,6 +438,22 @@ def density_purification(
             raise ValueError(f"method must be 'canonical' or 'sp2'; got {method!r}")
         iters = _DEFAULT_ITERS[method]
     gemm_k, gemm_last = _precision.schedule(precision)
+    transforms = _resolve_transforms(transforms, F, X is not None or S is not None)
+    if transforms == "host64" and (X is not None or S is not None):
+        return _purify_host64(
+            F,
+            S,
+            X,
+            n_occ,
+            method,
+            iters,
+            gemm_k,
+            gemm_last,
+            bounds,
+            ns_iters,
+            ns_cond,
+            ns_polynomial,
+        )
 
     ns_res = None
     n_ns = 0
@@ -428,4 +493,51 @@ def density_purification(
         history=history,
         ns_iters=n_ns,
         ns_residual=None if ns_res is None else float(ns_res),
+    )
+
+
+def _purify_host64(
+    F, S, X, n_occ, method, iters, gemm_k, gemm_last, bounds, ns_iters, ns_cond, ns_polynomial
+):
+    """``transforms="host64"``: X, F' and P = X P' X^T in host float64; the
+    loop in F's dtype on F's device (the bench's ``fp32orth`` arm)."""
+    host, f64 = torch.device("cpu"), torch.float64
+    ns_res = None
+    n_ns = 0
+    if X is None:
+        if S.shape != F.shape:
+            raise ValueError(f"S must match F's shape {tuple(F.shape)}; got {tuple(S.shape)}")
+        S64 = S.to(host, f64)
+        if ns_iters is None:
+            ns_iters = ns_iteration_count(ns_cond, 50.0 * torch.finfo(f64).eps, ns_polynomial)
+        n_ns = ns_iters
+        coeffs = ns_coefficients(ns_iters, ns_polynomial, ns_cond)
+        X64, ns_res_t = _ns_fixed(
+            S64, coeffs, _ns_scale(S64, "bound"), lambda k: torch.matmul, torch.matmul
+        )
+        ns_res = float(ns_res_t)
+    else:
+        X64 = X.to(host, f64)
+    m = X64.shape[-1]
+    if not 0 <= n_occ <= m:
+        raise ValueError(f"n_occ must be in [0, {m}]; got {n_occ}")
+    Fo64 = _sym(X64.mT @ F.to(host, f64) @ X64)
+    Fo = Fo64.to(F.device, F.dtype)
+
+    P, history, idem, trace = _purify_fixed(Fo, n_occ, method, iters, gemm_k, gemm_last, bounds)
+    P64 = P.to(host, f64)
+    P_ao = _sym(X64 @ P64 @ X64.mT).to(F.device, F.dtype)
+    energy = (P64 * Fo64).sum()  # tr(P' F') = tr(P F), in float64
+    return PurificationResult(
+        P=P_ao,
+        P_orth=P,
+        X=X64,
+        energy=float(energy),
+        idempotency_error=float(idem),
+        trace_error=float(trace),
+        iters=iters,
+        method=method,
+        history=history,
+        ns_iters=n_ns,
+        ns_residual=ns_res,
     )
