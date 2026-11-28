@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     exact host finish.
   - `"exact"`: the integer-limb arm, whose result is the exactly rounded
     dot.
-  - `"auto"`: `"host64"` below 5e5 rows, `"ff"` from there.
+  - `"auto"`: `"host64"` below 3e5 rows, `"ff"` from there.
     `TRNSOLVER_REDUCTION_FF_MIN_N` moves the threshold, and `cg_block`
     reports the mode it used in `info["reduction"]`.
 
@@ -36,7 +36,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     tensors give the device's bits.
   - The projected preconditioner's Qᵀ V keeps the pairwise blocked product
     under these modes.
-  - The default stays `"pairwise"`.
 
   Applications: the GP exemplar's `cg_block` (trnsci/trnsci#109) and
   preconditioned solves. `scripts/bench_cg_reduction_ff.py` times each
@@ -46,6 +45,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`cg` and `gmres` default to `reduction="auto"` (trnsci/trnsci#169).**
+  The default was `"pairwise"`. This changes the solution bits of existing
+  runs; `reduction="pairwise"` or `TRNSOLVER_CG_REDUCTION=pairwise`
+  (`TRNSOLVER_GMRES_REDUCTION` for gmres) restores them. On Trn2 in
+  window 8, `cg` took the same 89 iterations in every mode, and `"auto"`
+  was at or below `"pairwise"` per iteration at every measured n, with
+  44–53 correct bits in the inner products against 17–25:
+
+  | n | `pairwise` | `host64` | `"ff"` | `"auto"` |
+  |---|---|---|---|---|
+  | 1e5 | 10.33 | 7.53 | 7.96 | 7.48 (`host64`) |
+  | 3e5 | 17.39 | 14.78 | 14.78 | `"ff"` |
+  | 1e6 | 37.67 | 36.87 | 35.60 | 35.60 (`"ff"`) |
+
+  (ms per iteration.) `gmres` goes through the same reduction code and
+  takes the same default; it has not been timed on the device yet.
+- **`cg_block` (and the projected preconditioner) keep `"pairwise"` as the
+  default.** `"auto"` launches one trnblas reduction per column, and at
+  R = 33 it was 28% slower per iteration than `"pairwise"` at n = 1e5
+  (68.0 against 53.2 ms) and 16% slower at 1e6 (553 against 477 ms). The
+  default will be re-timed when column-batched reductions (trnblas#142)
+  land.
+- **`"auto"` threshold: 3e5 rows** (`TRNSOLVER_REDUCTION_FF_MIN_N`
+  default 300000). Window 7's per-call timings had put the crossover near
+  5e5; per `cg` iteration in window 8, `host64` and `"ff"` reach parity at
+  3e5 (14.78 ms each). `"ff"` is faster above that, and `host64` is
+  0.2–0.4 ms faster below.
 - **trnblas >= 0.14 is now a runtime dependency**, for `trnblas.fp64`
   behind the new reduction modes. trnblas needs only torch and numpy. The
   dev extra's floor also moves from 0.9 to 0.14.

@@ -88,23 +88,38 @@ def _as_block_op(A, dtype) -> Callable[[torch.Tensor], torch.Tensor]:
 # - ``"device"``: the previous device reductions (fastest; LNC-dependent).
 #   Kept for performance comparison.
 #
-# ``reduction=None`` reads ``TRNSOLVER_CG_REDUCTION`` (default "pairwise").
+# ``reduction=None`` reads ``TRNSOLVER_CG_REDUCTION``; unset, ``cg_block``
+# and the preconditioner take ``"pairwise"`` and ``cg`` / ``gmres`` take
+# ``"auto"`` (``iterative._CG_DEFAULT`` / ``_GMRES_DEFAULT``).
 # The pairwise / host64 / ff / exact results are a few-element host
 # reduction, so every call is one small D2H (a host sync) and one (R,) upload.
 _REDUCTIONS = ("pairwise", "host64", "device", "ff", "exact", "auto")
 _FOLD_LEAF = 64  # fold until at most this many rows remain (then host fp64)
 _QTV_BLOCK = 128  # rows per block of the blocked Qᵀ V (one 128-row contraction)
 
-# "auto" threshold (trnsci/trnsci#169, Trn2 window 7, one vector, ms median
-# per ``_inner``): host64 0.33 / 1.80 / 38.9 and fp64.dot accurate 0.57 /
-# 1.37 / 2.57 at n = 1e5 / 1e6 / 1e7. host64 wins below about 5e5 rows, ff
-# above. ``TRNSOLVER_REDUCTION_FF_MIN_N`` overrides it (read per solve).
-_FF_AUTO_MIN_N = 500_000
+# "auto" threshold (trnsci/trnsci#169). Trn2 window 8, ``cg`` ms per
+# iteration (89 iterations in every mode), host64 / ff: 7.53 / 7.96 at 1e5,
+# 10.64 / 10.86 at 2e5, 14.78 / 14.78 at 3e5, 22.21 / 22.05 at 5e5, 36.87 /
+# 35.60 at 1e6. Parity is at 3e5; ff is faster above, host64 0.2-0.4 ms
+# faster below. (Window 7, per ``_inner`` call, had put the crossover near
+# 5e5.) ff also gives about 2x host64's correct bits at every n (44-53
+# against 18-29 on fp32 CG vectors). ``TRNSOLVER_REDUCTION_FF_MIN_N``
+# overrides it (read per solve).
+_FF_AUTO_MIN_N = 300_000
 _FF_MIN_N_ENV = "TRNSOLVER_REDUCTION_FF_MIN_N"
+
+# ``cg_block``'s default stays "pairwise" until trnblas#142 (column-batched
+# ``dot_cols`` / ``nrm2_cols``) lands. "auto" launches one trnblas reduction
+# per column, and on Trn2 in window 8 (R = 33, ms per iteration) it was +28%
+# against pairwise at n = 1e5 (68.0 vs 53.2, host64) and +16% at 1e6 (553
+# vs 477, ff). Re-time once trnblas#142 is in, then revisit.
+_CG_BLOCK_DEFAULT = "pairwise"
 
 
 def _reduction_mode(
-    reduction: str | None, env: str = "TRNSOLVER_CG_REDUCTION", default: str = "pairwise"
+    reduction: str | None,
+    env: str = "TRNSOLVER_CG_REDUCTION",
+    default: str = _CG_BLOCK_DEFAULT,
 ) -> str:
     """Resolve ``reduction=...``; ``None`` reads the ``env`` variable (else ``default``)."""
     if reduction is None:
@@ -115,7 +130,7 @@ def _reduction_mode(
 
 
 def _ff_min_n() -> int:
-    """Rows from which ``reduction="auto"`` takes ``"ff"`` (env override, else 5e5)."""
+    """Rows from which ``reduction="auto"`` takes ``"ff"`` (env override, else 3e5)."""
     v = os.environ.get(_FF_MIN_N_ENV, "").strip()
     if not v:
         return _FF_AUTO_MIN_N
@@ -124,7 +139,7 @@ def _ff_min_n() -> int:
     except ValueError:
         f = -1.0
     if not (math.isfinite(f) and f >= 0 and f == int(f)):
-        raise ValueError(f"{_FF_MIN_N_ENV} must be a non-negative integer (e.g. 5e5); got {v!r}")
+        raise ValueError(f"{_FF_MIN_N_ENV} must be a non-negative integer (e.g. 3e5); got {v!r}")
     return int(f)
 
 
@@ -417,7 +432,11 @@ def cg_block(
             ``"pairwise"`` (default): a fixed pairwise tree of elementwise
             adds on the device, finished in float64 on the host, so the
             result does not depend on the device's LNC split (bitwise equal
-            at LNC=1 and LNC=2). ``"host64"``: the whole (n, R) product is
+            at LNC=1 and LNC=2). :func:`cg` defaults to ``"auto"``, but here
+            ``"auto"`` launches one trnblas reduction per column and was 28%
+            (n = 1e5) and 16% (n = 1e6) slower per iteration than
+            ``"pairwise"`` at R = 33 on Trn2, so the default stays until
+            trnblas#142 batches the columns. ``"host64"``: the whole (n, R) product is
             copied to the host and reduced in float64 (on the device its
             accuracy is set by the fp32 product; one (n, R) D2H per
             reduction). ``"device"``: plain device sums (the
@@ -428,7 +447,7 @@ def cg_block(
             kernels' fixed order (trnsci/trnsci#169). ``"exact"``: the
             exactly rounded dot from trnblas.fp64's integer arm (measured
             at no more than 1.5x ``"ff"``'s cost through n = 1e6, 3.1x at
-            1e7). ``"auto"``: ``"host64"`` below 5e5 rows, ``"ff"`` from
+            1e7). ``"auto"``: ``"host64"`` below 3e5 rows, ``"ff"`` from
             there (``TRNSOLVER_REDUCTION_FF_MIN_N`` moves the threshold).
             ``"ff"`` / ``"exact"`` / ``"auto"`` need trnblas >= 0.14.
             ``None`` reads ``TRNSOLVER_CG_REDUCTION``.
@@ -475,7 +494,7 @@ def cg_block(
     if check_every < 1:
         raise ValueError(f"cg_block: check_every must be >= 1, got {check_every}")
     n, R = B.shape
-    red = _resolve_reduction(_reduction_mode(reduction), n)
+    red = _resolve_reduction(_reduction_mode(reduction, default=_CG_BLOCK_DEFAULT), n)
     if maxiter is None:
         maxiter = 10 * n
     dtype, device = B.dtype, B.device

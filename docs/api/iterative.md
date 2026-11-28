@@ -10,7 +10,16 @@ Conjugate Gradient for SPD `A`. `A` may be a tensor or a callable `A(x) → A @ 
 - **`tol`** — relative residual tolerance
 - **`maxiter`** — iteration cap
 - **`M`** — optional preconditioner (tensor or callable applying `M⁻¹`)
-- **`reduction`** — how `rᴴz`, `pᴴAp` and `‖r‖` reduce over n (#128): `"pairwise"` (default), `"host64"`, `"ff"`, `"exact"`, `"auto"` or `"device"`, as in [`cg_block`](#cg_blocka-b-mnone--tol1e-6-maxiternone-check_every10-x0none-return_coeffsfalse-reductionnone) (see [fp64-class reductions](#fp64-class-reductions-ff-exact-auto) for the last three). `None` reads `TRNSOLVER_CG_REDUCTION`. In the `pairwise` / `host64` / `device` modes, host tensors are multiplied in float64, as before; on the device the product is in the working dtype, then folded and finished in float64 on the host. `"ff"` / `"exact"` take the working dtype on both sides, so the host gives the device's bits.
+- **`reduction`** — how `rᴴz`, `pᴴAp` and `‖r‖` reduce over n (#128): `"auto"` (default), `"pairwise"`, `"host64"`, `"ff"`, `"exact"` or `"device"`, as in [`cg_block`](#cg_blocka-b-mnone--tol1e-6-maxiternone-check_every10-x0none-return_coeffsfalse-reductionnone) (see [fp64-class reductions](#fp64-class-reductions-ff-exact-auto) for `"ff"`, `"exact"` and `"auto"`). `None` reads `TRNSOLVER_CG_REDUCTION`. In the `pairwise` / `host64` / `device` modes, host tensors are multiplied in float64, as before; on the device the product is in the working dtype, then folded and finished in float64 on the host. `"ff"` / `"exact"` take the working dtype on both sides, so the host gives the device's bits.
+
+`"auto"` takes `"host64"` below 3e5 rows and `"ff"` from there. It is the default because on Trn2 it was at or below `"pairwise"` per iteration at every measured n, with the same iteration count and about twice the correct bits (window 8, ms per iteration, 89 iterations in every mode; trnsci/trnsci#169):
+
+| n | `pairwise` | `host64` | `"ff"` | `"auto"` takes |
+|---|---|---|---|---|
+| 1e5 | 10.33 | 7.53 | 7.96 | `host64` |
+| 3e5 | 17.39 | 14.78 | 14.78 | `"ff"` |
+| 1e6 | 37.67 | 36.87 | 35.60 | `"ff"` |
+| correct bits | 17–25 | 18–29 | 44–53 | |
 
 Returns `(x, iters, residual)`.
 
@@ -22,7 +31,7 @@ x, iters, residual = trnsolver.cg(A_spd, b, tol=1e-8)
 
 GMRES for general (non-symmetric) systems. Same calling convention as `cg`. `restart` controls the Krylov subspace size before restart.
 
-`reduction` (#128) applies to the modified Gram-Schmidt inner products and the norms: `"pairwise"` (default), `"host64"`, `"ff"`, `"exact"`, `"auto"` or `"device"`. In every mode but `"device"`, the update `x + V y` is formed as fixed-order axpys instead of a matmul. `None` reads `TRNSOLVER_GMRES_REDUCTION`.
+`reduction` (#128) applies to the modified Gram-Schmidt inner products and the norms: `"auto"` (default), `"pairwise"`, `"host64"`, `"ff"`, `"exact"` or `"device"`. gmres shares `cg`'s reduction code and default; it has not been timed on the device. In every mode but `"device"`, the update `x + V y` is formed as fixed-order axpys instead of a matmul. `None` reads `TRNSOLVER_GMRES_REDUCTION`.
 
 Cost on Trn2 (LNC=2, one logical core, n = 1e5, the GP exemplar's `KernelOperator` applied to one vector, 289 ms per call, 60 iterations):
 
@@ -54,7 +63,7 @@ Raises `ValueError` if any diagonal entry is within `1e-15` of zero. More-capabl
 
 Column-batched preconditioned CG for SPD `A` with an `(n, R)` right-hand side (or `(n,)`). `A` and `M` are callables on `(n, R)` blocks, or tensors. Each iteration makes **one** call `A(P)` on the whole block. Converged columns freeze, but the full block is still passed in, so every call has the same shape. Convergence is per column, `‖rⱼ‖ ≤ tol·‖bⱼ‖`. The stopping test reads back to the host only every `check_every` iterations.
 
-`reduction` sets how the inner products and norms reduce over n (#128). `None` reads `TRNSOLVER_CG_REDUCTION`.
+`reduction` sets how the inner products and norms reduce over n (#128). `None` reads `TRNSOLVER_CG_REDUCTION`. The default stays `"pairwise"` here, unlike `cg`: `"auto"` launches one trnblas reduction per column, and at R = 33 on Trn2 it was 28% slower per iteration at n = 1e5 (68.0 against 53.2 ms) and 16% slower at 1e6 (553 against 477 ms). The default will be re-timed once trnblas#142 batches the columns.
 
 | `reduction` | How | LNC=1 vs LNC=2 | Cost |
 |---|---|---|---|
@@ -62,7 +71,7 @@ Column-batched preconditioned CG for SPD `A` with an `(n, R)` right-hand side (o
 | `"host64"` | the whole (n, R) product is copied to the host and reduced in float64 | bitwise equal | one (n, R) D2H per reduction |
 | `"ff"` | trnblas.fp64 double-word `dot` / `nrm2`, one per column (below) | bitwise equal | one small D2H per column and reduction |
 | `"exact"` | trnblas.fp64 exactly rounded `dot` (below) | bitwise equal | as `"ff"`, 1.3–1.5× its cost through n = 1e6 |
-| `"auto"` | `"host64"` below 5e5 rows, `"ff"` from there (below) | bitwise equal | |
+| `"auto"` | `"host64"` below 3e5 rows, `"ff"` from there (below); `cg` / `gmres` default | bitwise equal | |
 | `"device"` | device `sum` / `vector_norm` (the previous behaviour) | differs (5e-4 relative at n = 1e5) | fastest; for comparison |
 
 Device reductions over n add in an order that depends on how the compiler splits the work across logical cores. Elementwise ops do not. So every mode but `"device"` gives the same bits at any LNC, provided the operator `A` (and `M`) does too.
@@ -73,7 +82,7 @@ These modes (trnsci/trnsci#169) hand the working-dtype vectors to [`trnblas.fp64
 
 - **`"ff"`**: `fp64.dot(accumulate="accurate")` and `fp64.nrm2`. Products are exact (Dekker TwoProd), the lanes accumulate in double-word fp32 (AccurateDWPlusDW), and the 1024 fp32 chunk partials are summed exactly on the host. The order depends on n only, so the result is the same at LNC=1 and LNC=2. The trnblas CPU reference issues the kernels' fp32 operations one for one, so a host tensor gives the device's bits. `nrm2` scales each chunk by a power of two, so the norm does not overflow where fp32 squares would.
 - **`"exact"`**: `fp64.dot(accumulate="exact")`, the integer-limb arm. The result is the exactly rounded Σ xᵢ yᵢ of the fp32 data, which is unique, so it is the same on every backend and LNC. Terms outside the device's 126-bit window, and products outside the fp32 range, take an exact host path. Norms are √(exact Σ xᵢ²).
-- **`"auto"`**: `"host64"` for n < 5e5 rows, else `"ff"`. The policy depends on n only, not on the device. Set `TRNSOLVER_REDUCTION_FF_MIN_N` to move the threshold (`0` always takes `"ff"`). `cg_block` reports the mode it used in `info["reduction"]`.
+- **`"auto"`**: `"host64"` for n < 3e5 rows, else `"ff"`. The policy depends on n only, not on the device. Set `TRNSOLVER_REDUCTION_FF_MIN_N` to move the threshold (`0` always takes `"ff"`). `cg_block` reports the mode it used in `info["reduction"]`.
 
 Float-float error grows like 2⁻⁴⁸ · cond, where cond = Σ|xᵢ yᵢ| / |x·y|. CG's `rᴴz`, `pᴴAp` and norms are well conditioned. For a near-orthogonal dot, such as a late Gram-Schmidt coefficient in `gmres`, only `"exact"` stays exact. float64 / complex128 data (host only) is already float64: there `"ff"` reduces in float64 as `"host64"` does, and `"exact"` uses `fp64.exact_dot`. A complex vector is reduced as its (re, im) pairs, in one reduction of length 2n.
 
@@ -85,7 +94,7 @@ Measured on Trn2 (window 7, one logical core at LNC=2; trnsci/trnsci#169). Each 
 | 1e6 | 1.95 (30.7 b) | 1.80 (35.0 b) | 1.37 (53 b) | 2.05 (53 b) |
 | 1e7 | 2.10 (27.8 b) | 38.9 (38.0 b) | 2.57 (53 b) | 7.90 (53 b) |
 
-`host64` on the device is limited by the fp32 product it copies back (about 32–38 bits); `"ff"` and `"exact"` form the products exactly. `"ff"` is cheaper than `host64` from about 5e5 rows (1.37 vs 1.80 ms at 1e6, 2.57 vs 38.9 ms at 1e7), which sets `"auto"`'s threshold. `"exact"` costs 1.3–1.5× `"ff"` through n = 1e6 and 3.1× at 1e7, so `"auto"` does not pick it. Use it where a reduction must be exact, at n ≤ 1e6.
+`host64` on the device is limited by the fp32 product it copies back (about 32–38 bits); `"ff"` and `"exact"` form the products exactly. `"ff"` is cheaper than `host64` per call from about 5e5 rows (1.37 vs 1.80 ms at 1e6, 2.57 vs 38.9 ms at 1e7). Per `cg` iteration (window 8), the two reach parity at 3e5 (14.78 ms each), which sets `"auto"`'s threshold; `host64` is 0.2–0.4 ms faster below it. `"exact"` costs 1.3–1.5× `"ff"` through n = 1e6 and 3.1× at 1e7, so `"auto"` does not pick it. Use it where a reduction must be exact, at n ≤ 1e6.
 
 `cg_block` runs one trnblas reduction per column. The projected preconditioner's Qᵀ V (k · R dots) keeps the `"pairwise"` blocked product under `"ff"`, `"exact"` and `"auto"`. A preconditioner needs a fixed order, not 53 bits: an error in M slows CG down but does not move the solution. The per-iteration and end-to-end cost in `cg` and `cg_block` is measured by `scripts/bench_cg_reduction_ff.py`, at n = 1e5, 1e6 and 1e7 for each mode.
 

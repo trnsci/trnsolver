@@ -497,6 +497,7 @@ class TestVectorSolvers:
 
     def test_env_and_defaults(self, monkeypatch):
         monkeypatch.delenv("TRNSOLVER_CG_REDUCTION", raising=False)
+        monkeypatch.delenv(block._FF_MIN_N_ENV, raising=False)
         monkeypatch.delenv("TRNSOLVER_GMRES_REDUCTION", raising=False)
         A, b = torch.eye(4) * 2, torch.ones(4)
         calls = []
@@ -507,11 +508,31 @@ class TestVectorSolvers:
             return orig(u, v, reduction)
 
         monkeypatch.setattr(iterative, "_inner", spy)
+        # cg / gmres default to "auto" (trnsci/trnsci#169), which resolves
+        # to "host64" at this n; cg_block keeps "pairwise" (trnblas#142).
+        assert iterative._CG_DEFAULT == "auto"
+        assert iterative._GMRES_DEFAULT == "auto"
+        assert block._CG_BLOCK_DEFAULT == "pairwise"
         trnsolver.cg(A, b)
-        assert set(calls) == {"pairwise"}
+        assert set(calls) == {"host64"}
         calls.clear()
         trnsolver.gmres(A, b)
-        assert set(calls) == {iterative._GMRES_DEFAULT}
+        assert set(calls) == {"host64"}
+        calls.clear()
+        _, info = trnsolver.cg_block(A, b)
+        assert info["reduction"] == "pairwise"
+        monkeypatch.setenv(block._FF_MIN_N_ENV, "4")
+        trnsolver.cg(A, b)
+        assert set(calls) == {"ff"}
+        calls.clear()
+        trnsolver.gmres(A, b)
+        assert set(calls) == {"ff"}
+        calls.clear()
+        _, info = trnsolver.cg_block(A, b)
+        assert info["reduction"] == "pairwise"
+        monkeypatch.delenv(block._FF_MIN_N_ENV)
+        trnsolver.cg(A, b, reduction="pairwise")
+        assert set(calls) == {"pairwise"}
         calls.clear()
         monkeypatch.setenv("TRNSOLVER_CG_REDUCTION", "host64")
         monkeypatch.setenv("TRNSOLVER_GMRES_REDUCTION", "device")

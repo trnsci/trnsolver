@@ -105,9 +105,14 @@ def test_cg_device_repeat_and_convergence(red):
 
 def test_auto_resolves_by_n():
     assert block._resolve_reduction("auto", 100_000) == "host64"
+    assert block._resolve_reduction("auto", 299_999) == "host64"
+    assert block._resolve_reduction("auto", 300_000) == "ff"
     assert block._resolve_reduction("auto", 1_000_000) == "ff"
     _, info = trnsolver.cg_block(_banded(1000), _vec(1000, 5).to(DEV), reduction="auto")
     assert info["reduction"] == "host64"
+    # cg_block's default stays "pairwise" until trnblas#142 (window 8).
+    _, info = trnsolver.cg_block(_banded(1000), _vec(1000, 5).to(DEV))
+    assert info["reduction"] == "pairwise"
 
 
 def _bench(lnc, cores, out):

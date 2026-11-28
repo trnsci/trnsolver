@@ -150,7 +150,7 @@ def ssor_preconditioner(
 
 # Reductions over n in cg / gmres (#128). Device ``vdot`` / ``norm`` add in
 # an order that depends on the LNC split (see the note in ``block.py``), so
-# with ``reduction="pairwise"`` (cg's default) the products are formed
+# with ``reduction="pairwise"`` the products are formed
 # elementwise and summed by ``block._fold_host64``'s fixed tree, finished in
 # float64 on the host; ``"host64"`` copies the product to the host.
 # ``"device"`` is the previous code. Host (CPU) tensors are multiplied in
@@ -161,9 +161,18 @@ def ssor_preconditioner(
 # reference is the device kernel bit for bit, and its products are exact
 # (TwoProd), so host and device give the same bits. ``"auto"`` resolves to
 # ``"host64"`` or ``"ff"`` by n (``block._resolve_reduction``).
+#
+# ``"auto"`` is the default for cg (trnsci/trnsci#169, Trn2 window 8): with
+# the same 89 iterations in every mode it was at or below pairwise at every
+# measured n (7.48 against 10.33 ms per iteration at 1e5, 35.6 against 37.7
+# at 1e6), and its inner products carry 44-53 correct bits against
+# pairwise's 17-25. gmres goes through the same ``_inner`` / ``_norm`` /
+# ``_resolve_reduction`` path and takes the same default; it was not timed
+# on the device. ``cg_block`` keeps "pairwise" (``block._CG_BLOCK_DEFAULT``).
 
 
-_GMRES_DEFAULT = "pairwise"
+_CG_DEFAULT = "auto"
+_GMRES_DEFAULT = "auto"
 
 
 def _wide(u: torch.Tensor, v: torch.Tensor):
@@ -263,20 +272,23 @@ def cg(
             (interpreted as the already-inverted preconditioner applied as M@r).
             Use `jacobi_preconditioner(A)` for the common diagonal case.
         reduction: How the inner products and norms reduce over n (#128),
-            as in :func:`cg_block`. ``"pairwise"`` (default): elementwise
-            products on the device, a fixed pairwise tree of elementwise
-            adds, then float64 on the host, so the result does not depend
-            on the LNC split. ``"host64"``: the product is copied to the
-            host and summed in float64. ``"device"``: ``vdot`` / ``norm`` on
-            the device (the previous behaviour; LNC-dependent). ``"ff"``:
+            as in :func:`cg_block`. ``"auto"`` (default): ``"host64"`` for
+            n < 3e5, else ``"ff"`` (``TRNSOLVER_REDUCTION_FF_MIN_N`` moves
+            the threshold). On Trn2 it was at or below ``"pairwise"`` per
+            iteration at every measured n (7.48 against 10.33 ms at 1e5,
+            35.6 against 37.7 ms at 1e6), with about twice the correct bits
+            (trnsci/trnsci#169). ``"pairwise"``: elementwise products on the
+            device, a fixed pairwise tree of elementwise adds, then float64
+            on the host. ``"host64"``: the product is copied to the host and
+            summed in float64. ``"device"``: ``vdot`` / ``norm`` on the
+            device (the previous behaviour; LNC-dependent). ``"ff"``:
             trnblas.fp64's double-word ``dot`` / ``nrm2`` (52-53 bits, the
-            same bits at any LNC and on the host; trnsci/trnsci#169).
-            ``"exact"``: the exactly rounded dot (trnblas.fp64's integer
-            arm; at most 1.5x ``"ff"``'s cost through n = 1e6). ``"auto"``:
-            ``"host64"`` for n < 5e5, else ``"ff"``
-            (``TRNSOLVER_REDUCTION_FF_MIN_N`` moves the threshold). The
-            last three need trnblas >= 0.14. ``None`` reads
-            ``TRNSOLVER_CG_REDUCTION``. Host tensors are multiplied in
+            same bits at any LNC and on the host). ``"exact"``: the exactly
+            rounded dot (trnblas.fp64's integer arm; at most 1.5x ``"ff"``'s
+            cost through n = 1e6). Every mode but ``"device"`` gives the
+            same result at any LNC split. ``"ff"``, ``"exact"`` and
+            ``"auto"`` use trnblas >= 0.14 (a runtime dependency). ``None``
+            reads ``TRNSOLVER_CG_REDUCTION``. Host tensors are multiplied in
             float64 in the pairwise / host64 / device modes; ``"ff"`` /
             ``"exact"`` take the working dtype on both sides.
 
@@ -302,7 +314,7 @@ def cg(
     parameters the callable closes over.
     """
     b, orig = _to_fp32(b)
-    red = _resolve_reduction(_reduction_mode(reduction), b.shape[0])
+    red = _resolve_reduction(_reduction_mode(reduction, default=_CG_DEFAULT), b.shape[0])
     if not callable(A):
         if A.is_complex() and not b.is_complex():
             # A complex A with a real b has a complex solution; casting A to
@@ -406,9 +418,10 @@ def gmres(
         maxiter: Maximum outer iterations (restarts)
         restart: Krylov subspace size before restart
         reduction: How the Gram-Schmidt inner products and the norms reduce
-            over n (#128), as in :func:`cg`: ``"pairwise"`` (default),
-            ``"host64"``, ``"ff"``, ``"exact"``, ``"auto"`` or ``"device"``
-            (the previous behaviour). In every mode but ``"device"`` the
+            over n (#128), as in :func:`cg`: ``"auto"`` (default, as in
+            :func:`cg`; not yet timed on the device for gmres),
+            ``"pairwise"``, ``"host64"``, ``"ff"``, ``"exact"`` or
+            ``"device"`` (the previous behaviour). In every mode but ``"device"`` the
             update ``x + V y`` is also formed as fixed-order axpys instead
             of a matmul. ``None`` reads ``TRNSOLVER_GMRES_REDUCTION``.
 

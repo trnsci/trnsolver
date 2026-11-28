@@ -264,10 +264,12 @@ class TestConvergence:
 class TestAuto:
     def test_threshold(self, monkeypatch):
         monkeypatch.delenv(block._FF_MIN_N_ENV, raising=False)
-        assert block._FF_AUTO_MIN_N == 500_000
+        assert block._FF_AUTO_MIN_N == 300_000
+        assert block._ff_min_n() == 300_000
         r = block._resolve_reduction
         assert r("auto", 1) == "host64"
-        assert r("auto", 499_999) == "host64"
+        assert r("auto", 299_999) == "host64"
+        assert r("auto", 300_000) == "ff"
         assert r("auto", 500_000) == "ff"
         assert r("auto", 10_000_000) == "ff"
         for m in ("pairwise", "host64", "device", "ff", "exact"):
