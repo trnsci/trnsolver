@@ -28,10 +28,12 @@ Also here:
 
 from __future__ import annotations
 
+import importlib
 import math
 import os
 from collections.abc import Callable
 
+import numpy as np
 import torch
 
 from .factor import _restore, _to_fp32
@@ -67,22 +69,57 @@ def _as_block_op(A, dtype) -> Callable[[torch.Tensor], torch.Tensor]:
 #   depends on n, then D2H the (m, R) leaves and sum them in float64 on the
 #   host. About 2x more accurate than the device sum.
 # - ``"host64"``: D2H the whole (n, R) elementwise product (or X itself for a
-#   norm) and reduce in float64 on the host. The most accurate (rel 3e-8 for a
-#   dot, set by the fp32 product; 1e-10 for a norm), also LNC-invariant, but
-#   one full (n, R) D2H per reduction.
+#   norm) and reduce in float64 on the host. More accurate than pairwise
+#   (rel 3e-8 for a dot, set by the fp32 product; 1e-10 for a norm), also
+#   LNC-invariant, but one full (n, R) D2H per reduction.
+# - ``"ff"`` (trnsci/trnsci#169): trnblas.fp64's double-word (float-float)
+#   reductions, ``fp64.dot(accumulate="accurate")`` and ``fp64.nrm2``: exact
+#   TwoProd products, AccurateDWPlusDW lanes on the device in a fixed order
+#   that depends on n only, then an exactly rounded host sum of the 1024 fp32
+#   chunk partials. 52-53 bits on CG vectors at n = 1e5 to 1e7 on Trn2 (the
+#   fp32 product of host64 caps it near 30-38 bits), and LNC-invariant by the
+#   kernels' construction. The trnblas CPU reference issues the kernels' fp32
+#   operations one for one, so host and device give the same bits.
+# - ``"exact"``: trnblas.fp64's integer-limb arm, ``dot(accumulate="exact")``:
+#   the exactly rounded value of Σ xᵢ yᵢ (unique, so the same bits on any
+#   backend and LNC), with an exact host fallback for terms outside the
+#   device's 126-bit window. Norms are √(exact Σ xᵢ²).
+# - ``"auto"``: ``"host64"`` for n < ``_FF_AUTO_MIN_N`` rows, else ``"ff"``.
 # - ``"device"``: the previous device reductions (fastest; LNC-dependent).
 #   Kept for performance comparison.
 #
-# ``reduction=None`` reads ``TRNSOLVER_CG_REDUCTION`` (default "pairwise").
-# The pairwise / host64 results are a few-element host reduction, so every
-# call is one small D2H (a host sync) and one (R,) upload.
-_REDUCTIONS = ("pairwise", "host64", "device")
+# ``reduction=None`` reads ``TRNSOLVER_CG_REDUCTION``; unset, ``cg_block``
+# and the preconditioner take ``"pairwise"`` and ``cg`` / ``gmres`` take
+# ``"auto"`` (``iterative._CG_DEFAULT`` / ``_GMRES_DEFAULT``).
+# The pairwise / host64 / ff / exact results are a few-element host
+# reduction, so every call is one small D2H (a host sync) and one (R,) upload.
+_REDUCTIONS = ("pairwise", "host64", "device", "ff", "exact", "auto")
 _FOLD_LEAF = 64  # fold until at most this many rows remain (then host fp64)
 _QTV_BLOCK = 128  # rows per block of the blocked Qᵀ V (one 128-row contraction)
 
+# "auto" threshold (trnsci/trnsci#169). Trn2 window 8, ``cg`` ms per
+# iteration (89 iterations in every mode), host64 / ff: 7.53 / 7.96 at 1e5,
+# 10.64 / 10.86 at 2e5, 14.78 / 14.78 at 3e5, 22.21 / 22.05 at 5e5, 36.87 /
+# 35.60 at 1e6. Parity is at 3e5; ff is faster above, host64 0.2-0.4 ms
+# faster below. (Window 7, per ``_inner`` call, had put the crossover near
+# 5e5.) ff also gives about 2x host64's correct bits at every n (44-53
+# against 18-29 on fp32 CG vectors). ``TRNSOLVER_REDUCTION_FF_MIN_N``
+# overrides it (read per solve).
+_FF_AUTO_MIN_N = 300_000
+_FF_MIN_N_ENV = "TRNSOLVER_REDUCTION_FF_MIN_N"
+
+# ``cg_block``'s default stays "pairwise" until trnblas#142 (column-batched
+# ``dot_cols`` / ``nrm2_cols``) lands. "auto" launches one trnblas reduction
+# per column, and on Trn2 in window 8 (R = 33, ms per iteration) it was +28%
+# against pairwise at n = 1e5 (68.0 vs 53.2, host64) and +16% at 1e6 (553
+# vs 477, ff). Re-time once trnblas#142 is in, then revisit.
+_CG_BLOCK_DEFAULT = "pairwise"
+
 
 def _reduction_mode(
-    reduction: str | None, env: str = "TRNSOLVER_CG_REDUCTION", default: str = "pairwise"
+    reduction: str | None,
+    env: str = "TRNSOLVER_CG_REDUCTION",
+    default: str = _CG_BLOCK_DEFAULT,
 ) -> str:
     """Resolve ``reduction=...``; ``None`` reads the ``env`` variable (else ``default``)."""
     if reduction is None:
@@ -90,6 +127,140 @@ def _reduction_mode(
     if reduction not in _REDUCTIONS:
         raise ValueError(f"reduction must be one of {_REDUCTIONS}; got {reduction!r}")
     return reduction
+
+
+def _ff_min_n() -> int:
+    """Rows from which ``reduction="auto"`` takes ``"ff"`` (env override, else 3e5)."""
+    v = os.environ.get(_FF_MIN_N_ENV, "").strip()
+    if not v:
+        return _FF_AUTO_MIN_N
+    try:
+        f = float(v)
+    except ValueError:
+        f = -1.0
+    if not (math.isfinite(f) and f >= 0 and f == int(f)):
+        raise ValueError(f"{_FF_MIN_N_ENV} must be a non-negative integer (e.g. 3e5); got {v!r}")
+    return int(f)
+
+
+def _resolve_reduction(reduction: str, n: int) -> str:
+    """``"auto"`` → ``"host64"`` for n < ``_ff_min_n()`` rows, else ``"ff"``.
+
+    The policy depends on n only (not on the device), so a given n takes
+    the same mode on the host and on the device. Other modes pass through.
+    """
+    if reduction != "auto":
+        return reduction
+    return "ff" if n >= _ff_min_n() else "host64"
+
+
+def _qtv_mode(reduction: str) -> str:
+    """The mode of the projected preconditioner's Qᵀ V for a ``reduction``.
+
+    Qᵀ V is k · R dots (33,792 at the GP exemplar's k = 1024, R = 33), and
+    a preconditioner needs a fixed order, not 53 bits: an error in M slows
+    CG down but does not move the solution it converges to. So ``"ff"``,
+    ``"exact"`` and ``"auto"`` take the ``"pairwise"`` blocked product, which
+    is LNC-invariant too.
+    """
+    return reduction if reduction in ("pairwise", "host64", "device") else "pairwise"
+
+
+# ── fp64-class reductions from trnblas.fp64 (trnsci/trnsci#169) ──────────────
+
+
+def _fp64_module():
+    try:
+        fp64 = importlib.import_module("trnblas.fp64")
+    except ImportError as exc:  # trnblas < 0.14 has no fp64 module
+        raise ImportError(
+            'reduction="ff" / "exact" / "auto" need trnblas >= 0.14 (trnblas.fp64); '
+            "pip install 'trnblas>=0.14'"
+        ) from exc
+    return fp64
+
+
+def _flat_real(u: torch.Tensor) -> torch.Tensor:
+    """u as a 1-D real vector: complex entries as (re, im) pairs."""
+    if u.is_complex():
+        return torch.view_as_real(u.contiguous()).reshape(-1)
+    return u.reshape(-1)
+
+
+def _is_wide(u: torch.Tensor) -> bool:
+    return u.dtype in (torch.float64, torch.complex128)
+
+
+def _ff_dot(u: torch.Tensor, v: torch.Tensor, exact: bool = False) -> float:
+    """Re(uᴴ v) by ``trnblas.fp64.dot`` (``"ff"``; ``exact``: the integer arm).
+
+    float32 / complex64 operands (the device's working dtypes) go to the
+    trnblas kernels on the device, or to their bit-for-bit CPU reference on
+    the host. A complex pair is the real dot of the (re, im) pairs, one
+    reduction of length 2n. float64 / complex128 operands (host only: device
+    float64 is moved to the host by the fp64 policy) are already float64
+    data, for which float-float would lose about 5 bits, so ``"ff"`` reduces
+    them in float64 as ``"host64"`` does and ``"exact"`` takes
+    ``trnblas.fp64.exact_dot`` (exactly rounded).
+    """
+    fp64 = _fp64_module()
+    ur, vr = _flat_real(u), _flat_real(v)
+    if not exact:
+        if _is_wide(u) or _is_wide(v):
+            u64 = ur.to(device=_HOST, dtype=torch.float64)
+            return float((u64 * vr.to(device=_HOST, dtype=torch.float64)).sum())
+        return float(fp64.dot(ur, vr, accumulate="accurate"))
+    try:
+        if not (_is_wide(u) or _is_wide(v)):
+            try:
+                # An out-of-range product makes the reference's limb split
+                # warn before it raises; the fallback below handles it.
+                with np.errstate(invalid="ignore", over="ignore"):
+                    return float(fp64.dot(ur, vr, accumulate="exact"))
+            except OverflowError:
+                # A product beyond the fp32 TwoProd range (|uᵢ vᵢ| ~ 2^128):
+                # the same exactly rounded value from the float64 data.
+                pass
+        return float(
+            fp64.exact_dot(
+                ur.to(device=_HOST, dtype=torch.float64), vr.to(device=_HOST, dtype=torch.float64)
+            )
+        )
+    except ValueError:
+        # The exact path refuses inf / nan input; as in the float-float
+        # reductions, inf or nan in gives nan out.
+        if bool(torch.isfinite(ur).all()) and bool(torch.isfinite(vr).all()):
+            raise
+        return math.nan
+
+
+def _ff_norm(u: torch.Tensor, exact: bool = False) -> float:
+    """‖u‖₂: ``trnblas.fp64.nrm2`` (``"ff"``; power-of-two scaled per chunk,
+    so no overflow) or √(exact Σ uᵢ²) (``exact``). float64 data as in ``_ff_dot``."""
+    if exact:
+        try:
+            return math.sqrt(_ff_dot(u, u, True))
+        except OverflowError:  # Σ uᵢ² beyond float64 (float64 data only)
+            return math.inf
+    if _is_wide(u):
+        w = torch.complex128 if u.is_complex() else torch.float64
+        return float(torch.linalg.vector_norm(u.reshape(-1).to(device=_HOST, dtype=w)))
+    return float(_fp64_module().nrm2(_flat_real(u)))
+
+
+def _ff_cols(X: torch.Tensor, Y: torch.Tensor | None, exact: bool) -> torch.Tensor:
+    """Per-column ``_ff_dot(X[:, j], Y[:, j])`` (or ``_ff_norm(X[:, j])`` for
+    Y None) as a float64 host (R,) tensor. One transposing copy makes the
+    columns contiguous (a copy is exact); then one trnblas reduction per
+    column, each in the fixed order of its own n."""
+    Xt = X.T.contiguous()
+    Yt = None if Y is None else Y.T.contiguous()
+    R = Xt.shape[0]
+    if Yt is None:
+        vals = [_ff_norm(Xt[j], exact) for j in range(R)]
+    else:
+        vals = [_ff_dot(Xt[j], Yt[j], exact) for j in range(R)]
+    return torch.tensor(vals, dtype=torch.float64)
 
 
 def _fold_plan(n: int, leaf: int = _FOLD_LEAF) -> tuple[int, int]:
@@ -127,6 +298,10 @@ def _real_prod(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
 
 def _cdot(X: torch.Tensor, Y: torch.Tensor, reduction: str = "pairwise") -> torch.Tensor:
     """Column-wise inner products Re(xⱼᴴ yⱼ), shape (R,), on X's device."""
+    reduction = _resolve_reduction(reduction, X.shape[0])
+    if reduction in ("ff", "exact"):
+        rdtype = X.real.dtype if X.is_complex() else X.dtype
+        return _ff_cols(X, Y, reduction == "exact").to(device=X.device, dtype=rdtype)
     if reduction == "device":
         s = (X.conj() * Y).sum(dim=0) if X.is_complex() else (X * Y).sum(dim=0)
         return s.real if s.is_complex() else s
@@ -140,9 +315,12 @@ def _cdot(X: torch.Tensor, Y: torch.Tensor, reduction: str = "pairwise") -> torc
 
 def _col_norm(X: torch.Tensor, reduction: str = "pairwise") -> torch.Tensor:
     """Column 2-norms ‖xⱼ‖, shape (R,), real dtype, on X's device."""
+    reduction = _resolve_reduction(reduction, X.shape[0])
     if reduction == "device":
         return torch.linalg.vector_norm(X, dim=0)
     rdtype = X.real.dtype if X.is_complex() else X.dtype
+    if reduction in ("ff", "exact"):
+        return _ff_cols(X, None, reduction == "exact").to(device=X.device, dtype=rdtype)
     if reduction == "host64":
         X64 = X.to(device=_HOST, dtype=torch.complex128 if X.is_complex() else torch.float64)
         s = torch.linalg.vector_norm(X64, dim=0)
@@ -164,6 +342,7 @@ def _cdot_and_norm(X: torch.Tensor, Y: torch.Tensor, reduction: str = "pairwise"
     The two products share one fold and one D2H; each column's result is
     the same as from the separate calls (the fold is column-wise).
     """
+    reduction = _resolve_reduction(reduction, X.shape[0])
     if reduction != "pairwise":
         return _cdot(X, Y, reduction), _col_norm(X, reduction)
     R = X.shape[1]
@@ -192,9 +371,11 @@ def _tmatmul(
     - ``"host64"``: Qᵀ V in float64 on the host (``Q64``: Q as float64 on the
       host, if at hand); one (n, R) D2H.
     - ``"device"``: ``Q.T @ V``.
+    - ``"ff"``, ``"exact"``, ``"auto"``: as ``"pairwise"`` (see ``_qtv_mode``).
 
     The result is (k, R), in V's dtype on V's device.
     """
+    reduction = _qtv_mode(reduction)
     if reduction == "device":
         return Q.T @ V
     if reduction == "host64":
@@ -251,12 +432,25 @@ def cg_block(
             ``"pairwise"`` (default): a fixed pairwise tree of elementwise
             adds on the device, finished in float64 on the host, so the
             result does not depend on the device's LNC split (bitwise equal
-            at LNC=1 and LNC=2). ``"host64"``: the whole (n, R) product is
-            copied to the host and reduced in float64 (most accurate; one
-            (n, R) D2H per reduction). ``"device"``: plain device sums (the
+            at LNC=1 and LNC=2). :func:`cg` defaults to ``"auto"``, but here
+            ``"auto"`` launches one trnblas reduction per column and was 28%
+            (n = 1e5) and 16% (n = 1e6) slower per iteration than
+            ``"pairwise"`` at R = 33 on Trn2, so the default stays until
+            trnblas#142 batches the columns. ``"host64"``: the whole (n, R) product is
+            copied to the host and reduced in float64 (on the device its
+            accuracy is set by the fp32 product; one (n, R) D2H per
+            reduction). ``"device"``: plain device sums (the
             previous behaviour; fastest, but at n = 1e5 the sums differ
-            between LNC=1 and LNC=2 by about 5e-4). ``None`` reads
-            ``TRNSOLVER_CG_REDUCTION``.
+            between LNC=1 and LNC=2 by about 5e-4). ``"ff"``: trnblas.fp64's
+            double-word reductions (``fp64.dot`` / ``fp64.nrm2``, one per
+            column), 52-53 bits on CG vectors and LNC-invariant by the
+            kernels' fixed order (trnsci/trnsci#169). ``"exact"``: the
+            exactly rounded dot from trnblas.fp64's integer arm (measured
+            at no more than 1.5x ``"ff"``'s cost through n = 1e6, 3.1x at
+            1e7). ``"auto"``: ``"host64"`` below 3e5 rows, ``"ff"`` from
+            there (``TRNSOLVER_REDUCTION_FF_MIN_N`` moves the threshold).
+            ``"ff"`` / ``"exact"`` / ``"auto"`` need trnblas >= 0.14.
+            ``None`` reads ``TRNSOLVER_CG_REDUCTION``.
 
     Returns:
         X: Solution, shape and dtype of B (bf16/fp16 computed in fp32).
@@ -273,6 +467,8 @@ def cg_block(
           drifts below the true one, so report both.
         - ``"breakdown"`` (bool tensor (R,)): pᵀAp ≤ 0 was hit (A not SPD
           for that column, or exhausted precision); the column froze.
+        - ``"reduction"`` (str): the reduction mode used (``"auto"``
+          resolved to ``"host64"`` or ``"ff"``).
         - with ``return_coeffs``: ``"alpha"``, ``"beta"`` (tensors
           (iterations, R); entries after a column froze are 0, so use the
           first ``col_iterations[j]`` rows of column j) and ``"rz0"``
@@ -284,8 +480,9 @@ def cg_block(
 
     Inner products: elementwise products in the working dtype on B's device
     (no float64 on device), reduced as ``reduction`` says. With
-    ``"pairwise"`` / ``"host64"`` each reduction reads a few values back to
-    the host (two small syncs per iteration). Eager-only
+    ``"pairwise"`` / ``"host64"`` / ``"ff"`` / ``"exact"`` each reduction
+    reads a few values back to the host (two small syncs per iteration;
+    ``"ff"`` / ``"exact"`` launch one trnblas reduction per column). Eager-only
     (``torch.compiler.disable``); see :func:`cg` (#41).
     """
     B, orig = _to_fp32(B)
@@ -297,7 +494,7 @@ def cg_block(
     if check_every < 1:
         raise ValueError(f"cg_block: check_every must be >= 1, got {check_every}")
     n, R = B.shape
-    red = _reduction_mode(reduction)
+    red = _resolve_reduction(_reduction_mode(reduction, default=_CG_BLOCK_DEFAULT), n)
     if maxiter is None:
         maxiter = 10 * n
     dtype, device = B.dtype, B.device
@@ -363,6 +560,7 @@ def cg_block(
         "residual": res,
         "true_residual": true_res,
         "breakdown": breakdown,
+        "reduction": red,
     }
     if return_coeffs:
         empty = torch.zeros(0, R, dtype=rdtype, device=device)
@@ -713,7 +911,9 @@ class PivotedLowRankPreconditioner:
       reductions over n follow ``reduction`` (as in ``cg_block``; default
       ``"pairwise"``: blocked 128-row products, folded in a fixed order and
       finished in float64 on the host, so the apply does not depend on the
-      LNC split, #128); the products by Q contract over k only.
+      LNC split, #128); the products by Q contract over k only. Under
+      ``"ff"``, ``"exact"`` and ``"auto"`` the Qᵀ V products are
+      ``"pairwise"``: a preconditioner needs a fixed order, not 53 bits.
     - ``"auto"`` (default): ``"native"`` for float64 L, else ``"host64"``.
       A float64 L on the neuron device takes ``"host64"`` under backend
       ``"auto"`` (device aten computes float64 at fp32 precision; one
@@ -775,7 +975,7 @@ class PivotedLowRankPreconditioner:
         self._Qpad = self._Q64 = None
         if apply == "projected":
             Q, lam = _gram_basis(L64, G, shift)
-            if self.reduction == "pairwise":
+            if _qtv_mode(self.reduction) == "pairwise":
                 # Q zero-padded to whole row blocks for the fixed-order Qᵀ V;
                 # .Q is a view of it (no second copy).
                 self._Qpad = _pad_rows(Q).to(device=L.device, dtype=L.dtype)

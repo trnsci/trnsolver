@@ -22,6 +22,10 @@ classifiers = [
 dependencies = [
     "torch>=2.1",
     "numpy>=1.24",
+    # trnblas.fp64 (first in 0.14.0): the float-float and exact reductions
+    # behind cg / gmres / cg_block reduction="ff" / "exact" / "auto"
+    # (trnsci/trnsci#169). trnblas needs only torch and numpy.
+    "trnblas>=0.14",
 ]
 
 [project.optional-dependencies]
@@ -57,8 +61,9 @@ dev = [
     "pytest-cov>=4.0",
     "ruff==0.17.3",
     "scipy>=1.11",
-    # examples/scf_df_rhf.py (tests/test_scf_df_rhf.py) composes the suite.
-    "trnblas>=0.9",
+    # examples/scf_df_rhf.py (tests/test_scf_df_rhf.py) composes the suite;
+    # trnblas.fp64 (0.14) backs reduction="ff" / "exact".
+    "trnblas>=0.14",
     # trntensor.AuxStream (trntensor#102) streams the DF integrals; first
     # released in trntensor 0.24.0.
     "trntensor>=0.24",

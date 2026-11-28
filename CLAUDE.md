@@ -82,9 +82,11 @@ idle; batched on device it still lost to CPU LAPACK (#48).
   The Jacobi method is chosen because it's embarrassingly parallel (rotations
   on disjoint pairs can run concurrently) and maps cleanly to NKI tiles.
 
-- **CG/GMRES are pure PyTorch.** The inner products and matvecs would
-  benefit from NKI Level 1/2 kernels in trnblas, but the iteration logic
-  stays on the host.
+- **CG/GMRES iteration logic stays on the host.** The matvec is the
+  caller's. Reductions over n follow `reduction=`; `"ff"` / `"exact"` /
+  `"auto"` run trnblas.fp64's NKI kernels (double-word and exact dots),
+  which are LNC-invariant and bitwise equal to their CPU reference
+  (trnsci/trnsci#169).
 
 - **inv_sqrt_spd uses eigendecomposition.** The all-GEMM Newton-Schulz
   variant is `inv_sqrt_spd_ns` (GEMMs via `trnblas.gemm` when installed).
@@ -93,6 +95,7 @@ idle; batched on device it still lost to CPU LAPACK (#48).
 
 - `torch>=2.1` — tensor operations and CPU fallback
 - `numpy>=1.24` — test reference
+- `trnblas>=0.14` — `trnblas.fp64` for `reduction="ff"` / `"exact"` / `"auto"`
 - `neuronxcc` — NKI kernels (optional, only on Neuron hardware)
 
 ## Development
